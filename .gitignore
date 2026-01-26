@@ -1,0 +1,8 @@
+Drivers/*
+Debug/*
+Release/*
+firmware.bin
+.settings/*
+.project
+.DS_Store
+.cproject
