@@ -155,7 +155,7 @@ g_pfnVectors:
   .word	EXTI2_3_IRQHandler            			/* EXTI Line[3:2] interrupts                             */
   .word	EXTI4_15_IRQHandler           			/* EXTI Line15 and EXTI4 interrupts                      */
   .word	0                             			/* Reserved                                              */
-  .word	DMA1_Ch1_IRQHandler           			/* DMA1 channel 1 interrupt                              */
+  .word	DMA1_CH1_IRQHandler           			/* DMA1 channel 1 interrupt                              */
   .word	DMA1_CH2_3_IRQHandler         			/* DMA1 channel 2 and 3 interrupt                        */
   .word	DMA1_CH4_5_IRQHandler         			/* DMA1 channel 4 and 5 interrupt                        */
   .word	ADC_IRQHandler                			/* ADC interrupt                                         */
@@ -227,8 +227,8 @@ g_pfnVectors:
 	.weak	EXTI4_15_IRQHandler
 	.thumb_set EXTI4_15_IRQHandler,Default_Handler
 
-	.weak	DMA1_Ch1_IRQHandler
-	.thumb_set DMA1_Ch1_IRQHandler,Default_Handler
+	.weak	DMA1_CH1_IRQHandler
+	.thumb_set DMA1_CH1_IRQHandler,Default_Handler
 
 	.weak	DMA1_CH2_3_IRQHandler
 	.thumb_set DMA1_CH2_3_IRQHandler,Default_Handler

@@ -41,12 +41,16 @@
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ADC_Init(void);
+static void MX_DMA_Init(void);
 
 void StorRegValue(void);
 void GetRegValue(void);
 uint32_t GetUptimeSeconds(void);
 /* Everything below needs to be mapped to registers */
-__IO uint16_t aADCxConvertedData[6];
+
+#define ADC_CONVERTED_DATA_BUFFER_SIZE 6
+
+__IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
 __IO uint32_t uADCTicks = 0;
 
 __IO uint16_t uPIVCCVolt;
@@ -124,6 +128,7 @@ int main(void)
     SystemClock_Config();
 
     MX_GPIO_Init();
+    MX_DMA_Init();
     MX_ADC_Init();
     MX_I2C1_Slave_Init();
 
@@ -141,26 +146,6 @@ int main(void)
         {
             uVBATProtect = 3600;
         }
-
-        if (MustRefreshVDD)
-        {
-            uAVDDVolt = (__LL_ADC_CALC_VREFANALOG_VOLTAGE(aADCxConvertedData[5],
-                                                          LL_ADC_RESOLUTION_12B) +
-                         uAVDDVolt) /
-                        2;
-            MustRefreshVDD = 0;
-        }
-
-        uPIVCCVolt = __LL_ADC_CALC_DATA_TO_VOLTAGE(
-            uAVDDVolt * 2, aADCxConvertedData[0], LL_ADC_RESOLUTION_12B);
-        uVBATVolt = __LL_ADC_CALC_DATA_TO_VOLTAGE(
-            uAVDDVolt * 2, aADCxConvertedData[1], LL_ADC_RESOLUTION_12B);
-        uVBUSVolt = __LL_ADC_CALC_DATA_TO_VOLTAGE(
-            uAVDDVolt * 4, aADCxConvertedData[2], LL_ADC_RESOLUTION_12B);
-        uUSBINVolt = __LL_ADC_CALC_DATA_TO_VOLTAGE(
-            uAVDDVolt * 4, aADCxConvertedData[3], LL_ADC_RESOLUTION_12B);
-        uADCdegC = __LL_ADC_CALC_TEMPERATURE(uAVDDVolt, aADCxConvertedData[4],
-                                             LL_ADC_RESOLUTION_12B);
 
         if (uVBATProtect != (aReceiveBuffer[17] | aReceiveBuffer[18] << 8))
         {
@@ -503,7 +488,7 @@ void SystemClock_Config(void)
     LL_RCC_SetI2CClockSource(LL_RCC_I2C1_CLKSOURCE_HSI);
 }
 
-void DMA1_Ch1_IRQHandler(void)
+void DMA1_CH1_IRQHandler(void)
 {
     if (LL_DMA_IsActiveFlag_TC1(DMA1))
     {
@@ -527,6 +512,13 @@ void DMA1_Ch1_IRQHandler(void)
         uADCdegC = __LL_ADC_CALC_TEMPERATURE(uAVDDVolt, aADCxConvertedData[4],
                                              LL_ADC_RESOLUTION_12B);
         LL_DMA_ClearFlag_TC1(DMA1);
+    }
+
+    /* Check whether DMA transfer error caused the DMA interruption */
+    if(LL_DMA_IsActiveFlag_TE1(DMA1) == 1)
+    {
+        /* Clear flag DMA transfer error */
+        LL_DMA_ClearFlag_TE1(DMA1);
     }
 }
 
@@ -747,8 +739,6 @@ static void MX_ADC_Init(void)
     LL_GPIO_InitTypeDef GPIO_InitStruct;
 
     LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_ADC1);
-    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_TIM1);
-    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_DMA1);
 
     LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
     GPIO_InitStruct.Pin = PI_VCC_SENSE;
@@ -770,25 +760,6 @@ static void MX_ADC_Init(void)
     GPIO_InitStruct.Mode = LL_GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
     LL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-    LL_DMA_SetDataTransferDirection(DMA1, LL_DMA_CHANNEL_1,
-                                    LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
-    LL_DMA_SetChannelPriorityLevel(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PRIORITY_LOW);
-    LL_DMA_SetMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MODE_CIRCULAR);
-    LL_DMA_SetPeriphIncMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PERIPH_NOINCREMENT);
-    LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MEMORY_INCREMENT);
-    LL_DMA_SetPeriphSize(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PDATAALIGN_HALFWORD);
-    LL_DMA_SetMemorySize(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MDATAALIGN_HALFWORD);
-
-    LL_DMA_ConfigAddresses(
-        DMA1, LL_DMA_CHANNEL_1,
-        LL_ADC_DMA_GetRegAddr(ADC1, LL_ADC_DMA_REG_REGULAR_DATA),
-        (uint32_t)&aADCxConvertedData, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
-
-    LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_1, 6);
-
-    //LL_DMA_EnableIT_TC(DMA1,LL_DMA_CHANNEL_1);
-    //NVIC_EnableIRQ(DMA1_Ch1_IRQn);
 
     LL_ADC_REG_SetSequencerChAdd(ADC1, LL_ADC_CHANNEL_0);
     LL_ADC_REG_SetSequencerChAdd(ADC1, LL_ADC_CHANNEL_1);
@@ -822,7 +793,8 @@ static void MX_ADC_Init(void)
     };
     LL_ADC_Enable(ADC1);
     LL_ADC_REG_StartConversion(ADC1);
-    LL_DMA_EnableChannel(DMA1, LL_DMA_CHANNEL_1);
+
+    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_TIM1);
 
     LL_TIM_SetPrescaler(TIM1, __LL_TIM_CALC_PSC(SystemCoreClock, 10000));
     /* Set the frequency to 100 Hz. */
@@ -838,6 +810,44 @@ static void MX_ADC_Init(void)
     LL_TIM_GenerateEvent_UPDATE(TIM1);
 }
 
+/**
+  * Enable DMA controller and interrupt
+  * This is used to update the values in the aADCxConvertedData buffer
+  * once the ADC conversion is complete.
+  */
+ static void MX_DMA_Init(void)
+ {
+    /* Init with LL driver */
+    /* DMA controller clock enable */
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_DMA1);
+
+    /* DMA interrupt init */
+    NVIC_SetPriority(DMA1_Channel1_IRQn, 3);
+    NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+    LL_DMA_DisableChannel(DMA1, LL_DMA_CHANNEL_1);
+
+    LL_DMA_SetDataTransferDirection(DMA1, LL_DMA_CHANNEL_1, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
+    LL_DMA_SetChannelPriorityLevel(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PRIORITY_LOW);
+    LL_DMA_SetMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MODE_CIRCULAR);
+    LL_DMA_SetPeriphIncMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PERIPH_NOINCREMENT);
+    LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MEMORY_INCREMENT);
+    LL_DMA_SetPeriphSize(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PDATAALIGN_HALFWORD);
+    LL_DMA_SetMemorySize(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MDATAALIGN_HALFWORD);
+
+    LL_DMA_ConfigAddresses(
+        DMA1, LL_DMA_CHANNEL_1,
+        LL_ADC_DMA_GetRegAddr(ADC1, LL_ADC_DMA_REG_REGULAR_DATA),
+        (uint32_t)&aADCxConvertedData, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
+
+    LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_1, ADC_CONVERTED_DATA_BUFFER_SIZE);
+
+    /* Enable DMA interrupt and channel BEFORE enabling ADC and starting conversion */
+    LL_DMA_EnableIT_TC(DMA1,LL_DMA_CHANNEL_1); // Enable DMA transfer complete interrupt
+    LL_DMA_EnableIT_TE(DMA1,LL_DMA_CHANNEL_1); // Enable DMA transfer error interrupt
+
+    LL_DMA_EnableChannel(DMA1, LL_DMA_CHANNEL_1);
+}
 /**
  * @brief GPIO Initialization Function
  * @param None
