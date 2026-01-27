@@ -11,7 +11,7 @@ extern "C" {
 #define USB_IN_SENSE LL_GPIO_PIN_3
 #define OTA_DETECT LL_GPIO_PIN_4
 #define IP_EN LL_GPIO_PIN_5 // IP = Input Power Enable
-#define MT_EN LL_GPIO_PIN_6 //
+#define MT_EN LL_GPIO_PIN_6 // MT = RPi Power Enable
 #define PWR_EN LL_GPIO_PIN_7
 
 
