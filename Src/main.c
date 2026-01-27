@@ -46,6 +46,7 @@ static void MX_DMA_Init(void);
 void StorRegValue(void);
 void GetRegValue(void);
 uint32_t GetUptimeSeconds(void);
+void UpdateBatteryPercentage(void);
 /* Everything below needs to be mapped to registers */
 
 #define ADC_CONVERTED_DATA_BUFFER_SIZE 6
@@ -61,8 +62,8 @@ __IO uint16_t uADCdegC;
 __IO uint16_t uAVDDVolt = 3300;
 
 __IO uint16_t uVBATMax = 3000;
-__IO uint16_t uVBATMin = 4200;
-__IO uint16_t uVBATProtect = 3600;
+__IO uint16_t uVBATMin = 4200; // Minimum voltage required to power the RPi
+__IO uint16_t uVBATProtect = 3600; // Absolute minimum voltage to prevent damage to the battery
 __IO uint16_t uVBATPrecent;
 __IO uint16_t uVBATPrecentReal;
 
@@ -233,11 +234,6 @@ int main(void)
             sIPRefreshTime = 2;
         }
 
-        if (uVBATMin < uVBATProtect)
-        {
-            uVBATMin = uVBATProtect;
-        }
-
         if (FixedVbat != 0)
         {
             if (uVBATMax != (aReceiveBuffer[13] | aReceiveBuffer[14] << 8))
@@ -273,8 +269,11 @@ int main(void)
 
         aReceiveBuffer[17] = uVBATProtect & 0xFF;
         aReceiveBuffer[18] = (uVBATProtect >> 8) & 0xFF;
+
+        UpdateBatteryPercentage();
         aReceiveBuffer[19] = uVBATPrecentReal & 0xFF;
         aReceiveBuffer[20] = (uVBATPrecentReal >> 8) & 0xFF;
+
         aReceiveBuffer[21] = sIPRefreshTime & 0xFF;
         aReceiveBuffer[22] = (sIPRefreshTime >> 8) & 0xFF;
         aReceiveBuffer[23] = sIPEnable;
@@ -488,10 +487,52 @@ void SystemClock_Config(void)
     LL_RCC_SetI2CClockSource(LL_RCC_I2C1_CLKSOURCE_HSI);
 }
 
+void UpdateBatteryMinMax(void)
+{
+    // Clip the voltage to the min and max values if user has provided Max/Min values.
+    if (FixedVbat == 1)
+    {
+        if (uVBATVolt > uVBATMax)
+            uVBATVolt = uVBATMax;
+        if (uVBATMin > uVBATVolt)
+            uVBATVolt = uVBATMin;
+    }
+    else
+    {
+        if (uVBATVolt > uVBATMax)
+            uVBATMax = uVBATVolt;
+        else if (uVBATMin > uVBATVolt && uVBATVolt > uVBATProtect)
+            uVBATMin = uVBATVolt;
+    }
+    if (uVBATMin < uVBATProtect)
+    {
+        uVBATMin = uVBATProtect;
+    }
+}
+
+void UpdateBatteryPercentage(void) {
+
+   uVBATPrecent = ((uVBATVolt - uVBATMin) * 100) / (uVBATMax - uVBATMin);
+   if (uVBATPrecent > 0 && uVBATPrecent < 100)
+   {
+       // If we are charging the battery, only update if the percentage is higher
+       if ((uUSBINVolt > 4000 || uVBUSVolt > 4000) && 
+           uVBATPrecent > uVBATPrecentReal)
+           uVBATPrecentReal = uVBATPrecent;
+       // If we are discharging the battery, only update if the percentage is lower
+       else if ((uUSBINVolt < 4000 && uVBUSVolt < 4000) && 
+                uVBATPrecent < uVBATPrecentReal)
+           uVBATPrecentReal = uVBATPrecent;
+       else if (uVBATPrecentReal == 0)
+           uVBATPrecentReal = uVBATPrecent;
+   }
+}
+
 void DMA1_CH1_IRQHandler(void)
 {
     if (LL_DMA_IsActiveFlag_TC1(DMA1))
     {
+        LL_DMA_ClearFlag_TC1(DMA1);
         if (MustRefreshVDD)
         {
             uAVDDVolt = (__LL_ADC_CALC_VREFANALOG_VOLTAGE(aADCxConvertedData[5],
@@ -511,7 +552,9 @@ void DMA1_CH1_IRQHandler(void)
             uAVDDVolt * 4, aADCxConvertedData[3], LL_ADC_RESOLUTION_12B);
         uADCdegC = __LL_ADC_CALC_TEMPERATURE(uAVDDVolt, aADCxConvertedData[4],
                                              LL_ADC_RESOLUTION_12B);
-        LL_DMA_ClearFlag_TC1(DMA1);
+
+        // Clip battery numbers if needed
+        UpdateBatteryMinMax();
     }
 
     /* Check whether DMA transfer error caused the DMA interruption */
@@ -550,40 +593,6 @@ void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
     if (LL_TIM_IsActiveFlag_UPDATE(TIM1) == 1)
     {
         LL_TIM_ClearFlag_UPDATE(TIM1);
-
-        if (FixedVbat == 1)
-        {
-            if (uVBATVolt > uVBATMax)
-                uVBATVolt = uVBATMax;
-            if (uVBATMin > uVBATVolt)
-                uVBATVolt = uVBATMin;
-
-            uVBATPrecent = ((uVBATVolt - uVBATMin) * 100) / (uVBATMax - uVBATMin);
-        }
-        else
-        {
-            if (uVBATVolt > uVBATMax)
-                uVBATMax = uVBATVolt;
-            else if (uVBATMin > uVBATVolt && uVBATVolt > uVBATProtect)
-                uVBATMin = uVBATVolt;
-
-            uVBATPrecent = ((uVBATVolt - uVBATMin) * 100) / (uVBATMax - uVBATMin);
-        }
-
-        /* 
-        * Update the battery percentage real time.
-        */
-        if (uVBATPrecent > 0 && uVBATPrecent < 100)
-        {
-            if ((uUSBINVolt > 4000 || uVBUSVolt > 4000) &&
-                uVBATPrecent > uVBATPrecentReal)
-                uVBATPrecentReal = uVBATPrecent;
-            else if ((uUSBINVolt < 4000 && uVBUSVolt < 4000) &&
-                     uVBATPrecent < uVBATPrecentReal)
-                uVBATPrecentReal = uVBATPrecent;
-            else if (uVBATPrecentReal == 0)
-                uVBATPrecentReal = uVBATPrecent;
-        }
 
         if (uVBATVolt > 1000 && (uUSBINVolt + uVBUSVolt) < 4000)
         {
