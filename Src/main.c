@@ -83,7 +83,6 @@ __IO uint8_t CountDownRebootTicks = 0;
 __IO uint64_t RuntimeOnetime = 0;
 __IO uint64_t RuntimePowerOn = 0;
 __IO uint64_t RuntimeAtAll = 0;
-__IO uint8_t RuntimeTick = 0;
 
 __IO uint32_t uUptimeSeconds = 0; /* System uptime in seconds */
 __IO uint16_t uUptimeMsCounter = 0; /* Counter for milliseconds (0-999) */
@@ -498,6 +497,7 @@ void SystemClock_Config(void)
     {
     }
     LL_Init1msTick(48000000);
+    LL_SYSTICK_EnableIT();
     LL_SetSystemCoreClock(48000000);
     LL_RCC_HSI14_EnableADCControl();
     LL_RCC_SetI2CClockSource(LL_RCC_I2C1_CLKSOURCE_HSI);
@@ -540,15 +540,15 @@ void DMA1_Ch1_IRQHandler(void)
    if (uUptimeMsCounter >= 1000)
    {
      uUptimeMsCounter = 0;
-     RuntimeTick++;
+     RuntimeAtAll++;  /* Always increment total runtime */
      if (sIPEnable)
      {
-         RuntimePowerOn++;
-         RuntimeOnetime++;
+         RuntimePowerOn++; // Charging time
+         RuntimeOnetime++; // Current runtime of RPi
      }
      else
      {
-         RuntimeOnetime = 0;
+         RuntimeOnetime = 0; //When not powering RPi, reset the runtime
      }
    }
  }
