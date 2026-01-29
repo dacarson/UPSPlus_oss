@@ -43,19 +43,18 @@ void CheckPowerOnConditions(void);
 
 /* Phase 2: Raw ADC buffer; DMA fills, main loop processes into state */
 __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
-__IO uint32_t uADCTicks = 0;
 
 /* Phase 2: Timing/button helpers (TIM1/SysTick/EXTI). Authoritative state is state/sys_state only;
  * no shadow globals (uXXXVolt, counters, mode flags) remain as authoritative. */
 __IO uint8_t sKeyFlag = 0;
 __IO uint8_t sKeyClick = 0;        /* 1 = short press, 2 = long press */
-__IO uint16_t sIPTicks = 0;
 __IO uint16_t sIPIdleTicks = 0;
 __IO uint8_t sHoldTime = 0;       /* 10 ms units */
 __IO uint8_t MustRefreshVDD = 1;
-__IO uint8_t CountDownPowerOffTicks = 0;   /* Timing only: 10ms ticks toward 1s; real countdown in state */
-__IO uint8_t CountDownRebootTicks = 0;
-__IO uint16_t uUptimeMsCounter = 0;
+/* Phase 3: Countdowns decremented in main loop on tick_1s (removed from ISR) */
+/* Free-running ms since boot (uint32_t, overflows ~49 days). Not "ms within current second";
+ * document/use consistently. Phase 3: no longer reset for tick_1s. */
+__IO uint32_t uUptimeMsCounter = 0;
 __IO uint8_t OTAShot = 0;
 
 #define BL_START_ADDRESS 0x8000000
@@ -80,15 +79,23 @@ volatile uint8_t active_reg_image = 0;
 volatile uint8_t adc_ready = 0;
 volatile uint32_t adc_sample_seq = 0;
 
-/* 1s tick pending: SysTick sets; main loop updates runtime counters from state */
-static volatile uint8_t tick_1s_pending = 0;
-/* Flash save requested by TIM1 (e.g. protection shutdown); main loop does Snapshot_Update then StorRegValue */
+/* Phase 3: Canonical scheduler - TIM1 sets flags only; main loop runs all tasks.
+ * Flag race: small chance of losing an event if ISR sets a flag between main's check and clear.
+ * For coarse 100ms/500ms tasks usually acceptable; for never-miss semantics consider
+ * counters (increment in ISR) or copy+clear in one short critical section in main. */
+static scheduler_flags_t sched_flags;
+static scheduler_counters_t sched_counters;
+/* Main loop derives tick_1s from tick_100ms (10 pulses = 1s) */
+static uint8_t tick_100ms_count = 0;
+
+/* Flash save requested (e.g. protection shutdown); main loop does Snapshot_Update then StorRegValue */
 static volatile uint8_t flash_save_requested = 0;
 /* OTA requested via I2C write 127 to register 0x32 (50) */
 static volatile uint8_t ota_triggered = 0;
 
 static void InitAuthoritativeStateFromDefaults(void);
 static void ProcessI2CPendingWrite(void);
+static void Scheduler_Tick10ms(void);
 
 /*===========================================================================*/
 /* Phase 2: Validation functions (register bounds, RO enforcement in apply)  */
@@ -239,6 +246,7 @@ void Snapshot_Init(void)
 
 void Snapshot_Update(void)
 {
+    state.snapshot_tick = sched_flags.tick_counter;  /* Phase 3: canonical TIM1 tick */
     uint8_t inactive = (uint8_t)(1u - active_reg_image);
     StateToRegisterBuffer(&state, &sys_state, reg_image[inactive]);  /* never aReceiveBuffer */
     active_reg_image = inactive;
@@ -456,6 +464,74 @@ int main(void)
 
     while (1)
     {
+        /* Phase 3: Canonical scheduler - run tasks from TIM1 flags, then clear flags */
+        if (sched_flags.tick_10ms)
+        {
+            Scheduler_Tick10ms();
+            sched_flags.tick_10ms = 0;
+        }
+        if (sched_flags.tick_100ms)
+        {
+            tick_100ms_count++;
+            if (tick_100ms_count >= 10u)
+            {
+                sched_flags.tick_1s = 1;
+                tick_100ms_count = 0;
+            }
+            Snapshot_Update();  /* Phase 3: 100ms periodic snapshot (ensures freshness) */
+            sched_flags.tick_100ms = 0;
+        }
+        if (sched_flags.tick_500ms)
+        {
+            if (!adc_ready)
+                LL_ADC_REG_StartConversion(ADC1);
+            sched_flags.tick_500ms = 0;
+        }
+        if (sched_flags.tick_1s)
+        {
+            state.cumulative_runtime_sec++;
+            if (sys_state.power_state == POWER_STATE_RPI_ON)
+            {
+                state.current_runtime_sec++;
+                if (state.usbc_voltage_mv > 4000 || state.microusb_voltage_mv > 4000)
+                    state.charging_time_sec++;
+            }
+            else
+            {
+                state.current_runtime_sec = 0;
+            }
+            /* Countdowns: check actions first, then decrement (so == 1 is never skipped) */
+            if (state.shutdown_countdown_sec == 1)
+            {
+                sys_state.power_state = POWER_STATE_RPI_OFF;
+                state.shutdown_countdown_sec = 0;
+            }
+            else if (state.shutdown_countdown_sec > 1)
+                state.shutdown_countdown_sec--;
+            /* Restart: when countdown reaches 1, power cycle RPi (MT_EN low 5s then high) and clear.
+             * Risk: __disable_irq() for full 5s stalls TIM1, I2C; Phase 4: make non-blocking. */
+            if (state.restart_countdown_sec == 1)
+            {
+                __disable_irq();
+                LL_GPIO_ResetOutputPin(GPIOA, MT_EN);
+                LL_mDelay(5000);
+                LL_GPIO_SetOutputPin(GPIOA, MT_EN);
+                sys_state.power_state = POWER_STATE_RPI_ON;
+                state.restart_countdown_sec = 0;
+                __enable_irq();
+            }
+            else if (state.restart_countdown_sec > 1)
+                state.restart_countdown_sec--;
+            if (state.load_on_delay_remaining_sec != 0)
+            {
+                state.load_on_delay_remaining_sec--;
+                if (state.load_on_delay_remaining_sec == 0 && state.battery_percent > state.low_battery_percent)
+                    sys_state.power_state = POWER_STATE_RPI_ON;
+            }
+            Snapshot_Update();
+            sched_flags.tick_1s = 0;
+        }
+
         /* Phase 2: Apply I2C writes to authoritative state (RO rejected, bounds checked) */
         ProcessI2CPendingWrite();
 
@@ -473,33 +549,6 @@ int main(void)
             Snapshot_Update();
             StorRegValue();
             sys_state.factory_reset_requested = 0;
-        }
-
-        /* Shutdown countdown reached 1: power off RPi (TIM1 decrements; we react here) */
-        if (state.shutdown_countdown_sec == 1)
-        {
-            sys_state.power_state = POWER_STATE_RPI_OFF;
-            state.shutdown_countdown_sec = 0;
-            Snapshot_Update();
-        }
-
-        /* Restart countdown: 5 = power cycle 5s; 1 = power on */
-        if (state.restart_countdown_sec == 5)
-        {
-            __disable_irq();
-            LL_GPIO_ResetOutputPin(GPIOA, MT_EN);
-            LL_mDelay(5000);
-            LL_GPIO_SetOutputPin(GPIOA, MT_EN);
-            sys_state.power_state = POWER_STATE_RPI_ON;
-            state.restart_countdown_sec = 0;
-            __enable_irq();
-            Snapshot_Update();
-        }
-        else if (state.restart_countdown_sec == 1)
-        {
-            sys_state.power_state = POWER_STATE_RPI_ON;
-            state.restart_countdown_sec = 0;
-            Snapshot_Update();
         }
 
         /* Sample period clamp */
@@ -526,30 +575,6 @@ int main(void)
             Snapshot_Update();
             adc_sample_seq++;
             adc_ready = 0;
-        }
-
-        /* 1s tick: update runtime counters (SysTick sets tick_1s_pending) */
-        if (tick_1s_pending)
-        {
-            tick_1s_pending = 0;
-            state.cumulative_runtime_sec++;
-            if (sys_state.power_state == POWER_STATE_RPI_ON)
-            {
-                state.current_runtime_sec++;
-                if (state.usbc_voltage_mv > 4000 || state.microusb_voltage_mv > 4000)
-                    state.charging_time_sec++;
-            }
-            else
-            {
-                state.current_runtime_sec = 0;
-            }
-            if (state.load_on_delay_remaining_sec != 0)
-            {
-                state.load_on_delay_remaining_sec--;
-                if (state.load_on_delay_remaining_sec == 0 && state.battery_percent > state.low_battery_percent)
-                    sys_state.power_state = POWER_STATE_RPI_ON;
-            }
-            Snapshot_Update();
         }
 
         if (state.auto_power_on)
@@ -779,77 +804,80 @@ void DMA1_CH1_IRQHandler(void)
     }
 }
 
-/* Phase 2: SysTick sets tick_1s_pending; main loop updates state.cumulative_runtime_sec etc. */
+/* Phase 3: SysTick is uptime only. 1s timing comes from TIM1 (tick_1s derived in main). */
 void SysTick_Handler(void)
 {
     uUptimeMsCounter++;
-    if (uUptimeMsCounter >= 1000)
-    {
-        uUptimeMsCounter = 0;
-        tick_1s_pending = 1;
-    }
 }
 
+/* Phase 3: TIM1 ISR is flag-only. All timing logic runs in main loop. */
 void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
 {
     if (LL_TIM_IsActiveFlag_UPDATE(TIM1) == 1)
     {
         LL_TIM_ClearFlag_UPDATE(TIM1);
+        sched_flags.tick_counter++;
+        sched_flags.tick_10ms = 1;
+        /* Modulo is acceptable at 100Hz; for higher tick rate or more periodicities consider
+         * downcounters or accumulated tick counters to avoid % in ISR. */
+        if ((sched_flags.tick_counter % TICKS_PER_100MS) == 0u)
+            sched_flags.tick_100ms = 1;
+        if ((sched_flags.tick_counter % TICKS_PER_500MS) == 0u)
+            sched_flags.tick_500ms = 1;
+    }
+}
 
-        if (state.battery_voltage_mv > 1000 && (state.microusb_voltage_mv + state.usbc_voltage_mv) < 4000)
+/* Phase 3: Scheduler tasks (run from main loop when flags set). Called when sched_flags.tick_10ms.
+ * Measurement window: one active flag + sched_counters.measurement_window_ticks; keep non-nested
+ * / non-retriggered when moving to explicit state machine (Phase 4+). */
+#define SAMPLE_PERIOD_TICKS_PER_MIN  (6000u)  /* 10ms ticks per minute: 60 * TICKS_PER_1S */
+static uint8_t measurement_window_active = 0;
+
+static void Scheduler_Tick10ms(void)
+{
+    /* Protection check */
+    if (state.battery_voltage_mv > 1000 && (state.microusb_voltage_mv + state.usbc_voltage_mv) < 4000)
+    {
+        if (state.battery_voltage_mv < state.protection_voltage_mv)
         {
-            if (state.battery_voltage_mv < state.protection_voltage_mv)
+            if (sys_state.power_state == POWER_STATE_RPI_ON)
+                flash_save_requested = 1;
+            sys_state.power_state = POWER_STATE_RPI_OFF;
+        }
+    }
+    if (sys_state.power_state == POWER_STATE_RPI_ON)
+        LL_GPIO_SetOutputPin(GPIOA, MT_EN);
+    else
+        LL_GPIO_ResetOutputPin(GPIOA, MT_EN);
+
+    /* Measurement window and sample period (IP_EN) */
+    if (state.usbc_voltage_mv > 3000 || state.microusb_voltage_mv > 3000 || sys_state.power_state == POWER_STATE_RPI_ON)
+    {
+        sIPIdleTicks = 0;
+        if (measurement_window_active)
+        {
+            sched_counters.measurement_window_ticks++;
+            LL_GPIO_ResetOutputPin(GPIOA, IP_EN);
+            if (sched_counters.measurement_window_ticks >= MEASUREMENT_WINDOW_TICKS)
             {
-                if (sys_state.power_state == POWER_STATE_RPI_ON)
-                    flash_save_requested = 1;
-                sys_state.power_state = POWER_STATE_RPI_OFF;
+                measurement_window_active = 0;
+                sched_counters.sample_period_elapsed_ticks = 0;
+                LL_GPIO_SetOutputPin(GPIOA, IP_EN);
+                flash_save_requested = 1;
+                MustRefreshVDD = 1;
             }
         }
-
-        if (state.shutdown_countdown_sec > 0)
-        {
-            if (CountDownPowerOffTicks > 100)
-            {
-                state.shutdown_countdown_sec--;
-                CountDownPowerOffTicks = 0;
-            }
-            else
-            {
-                CountDownPowerOffTicks++;
-            }
-        }
-
-        if (state.restart_countdown_sec > 0)
-        {
-            if (CountDownRebootTicks > 100)
-            {
-                state.restart_countdown_sec--;
-                CountDownRebootTicks = 0;
-            }
-            else
-            {
-                CountDownRebootTicks++;
-            }
-        }
-
-        if (sys_state.power_state == POWER_STATE_RPI_ON)
-            LL_GPIO_SetOutputPin(GPIOA, MT_EN);
         else
-            LL_GPIO_ResetOutputPin(GPIOA, MT_EN);
-
-        /* Refresh power interruption */
-        if (state.usbc_voltage_mv > 3000 || state.microusb_voltage_mv > 3000 || sys_state.power_state == POWER_STATE_RPI_ON)
         {
-            sIPIdleTicks = 0;
-            sIPTicks++;
-            if (sIPTicks > 0 && sIPTicks < 12000) // If we just started up, check every 5.23 secs
+            sched_counters.sample_period_elapsed_ticks++;
+            if (sched_counters.sample_period_elapsed_ticks > 0 && sched_counters.sample_period_elapsed_ticks < 12000u)
             {
                 /* 523 is a prime number; every time interval of this length, re-trigger the button. */
-                if (((sIPTicks + 520) % 523) == 0)
+                if (((sched_counters.sample_period_elapsed_ticks + 520) % 523) == 0)
                 {
                     LL_GPIO_ResetOutputPin(GPIOA, IP_EN);
                 }
-                else if (((sIPTicks + 520) % 523) == 20)
+                else if (((sched_counters.sample_period_elapsed_ticks + 520) % 523) == 20)
                 {
                     LL_GPIO_SetOutputPin(GPIOA, IP_EN);
                 }
@@ -857,80 +885,67 @@ void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
             /*
             * Periodically perform a brief power interruption for 1.5seconds
             */
-            else if (sIPTicks > (6000u * (uint32_t)state.sample_period_minutes) &&
-                     sIPTicks < ((6000u * (uint32_t)state.sample_period_minutes) + 1500u))
+            else if (sched_counters.sample_period_elapsed_ticks >= SAMPLE_PERIOD_TICKS_PER_MIN * (uint32_t)state.sample_period_minutes &&
+                     sched_counters.sample_period_elapsed_ticks < (SAMPLE_PERIOD_TICKS_PER_MIN * (uint32_t)state.sample_period_minutes) + MEASUREMENT_WINDOW_TICKS)
             {
+                if (!measurement_window_active)
+                {
+                    measurement_window_active = 1;
+                    sched_counters.measurement_window_ticks = 0;
+                }
                 LL_GPIO_ResetOutputPin(GPIOA, IP_EN);
             }
-            else if (sIPTicks > ((6000u * (uint32_t)state.sample_period_minutes) + 1500u))
+            else if (sched_counters.sample_period_elapsed_ticks >= (SAMPLE_PERIOD_TICKS_PER_MIN * (uint32_t)state.sample_period_minutes) + MEASUREMENT_WINDOW_TICKS)
             {
-                sIPTicks = 0;
+                sched_counters.sample_period_elapsed_ticks = 0;
                 LL_GPIO_SetOutputPin(GPIOA, IP_EN);
                 // At this time, also save the registers while we’re at it.
                 flash_save_requested = 1;
                 MustRefreshVDD = 1;
             }
         }
-        else
+    }  /* end if (charger present or RPi on) */
+    else
+    {
+        sched_counters.sample_period_elapsed_ticks = 0;
+        sIPIdleTicks++;
+        if (sIPIdleTicks > 0x1000)
         {
-            sIPTicks = 0;
-            sIPIdleTicks++;
-            if (sIPIdleTicks > 0x1000)
+            sIPIdleTicks = 0;
+            MustRefreshVDD = 1;
+        }
+    }
+
+    /* Button debounce (tick_10ms) - still inside Scheduler_Tick10ms() */
+    if (sKeyFlag)
+    {
+        if (!LL_GPIO_IsInputPinSet(GPIOB, LL_GPIO_PIN_1))
+        {
+            if (sHoldTime < 200)
+                sHoldTime++;
+            else
             {
-                sIPIdleTicks = 0;
-                // StorRegValue();
-                // At the same time, refresh/update the VDD voltage.
-                MustRefreshVDD = 1;
+                sHoldTime = 0;
+                sKeyClick = 2;
+                sKeyFlag = 0;
             }
         }
-
-        /* Refresh ADC readings 
-        * ADC sampling every 500 ms to monitor voltages and temperature.
-        */
-        if (uADCTicks > 50)
-        {
-            uADCTicks = 0;
-            LL_ADC_REG_StartConversion(ADC1);
-        }
         else
         {
-            uADCTicks++;
-        }
-
-        /* Button Pressed */
-        if (sKeyFlag)
-        {
-            if (!LL_GPIO_IsInputPinSet(GPIOB, LL_GPIO_PIN_1))
+            if (sHoldTime > 5)
             {
-                if (sHoldTime < 200)
-                {
-                    sHoldTime++;
-                }
-                else
-                {
-                    /* If 2 seconds is reached, treat it as a long press. */
-                    sHoldTime = 0;
-                    sKeyClick = 2;
-                    sKeyFlag = 0;
-                }
+                sHoldTime = 0;
+                sKeyClick = 1;
+                sKeyFlag = 0;
             }
             else
             {
-                if (sHoldTime > 5)
-                {
-                    sHoldTime = 0;
-                    sKeyClick = 1;
-                    sKeyFlag = 0;
-                }
-                else
-                {
-                    sHoldTime = 0;
-                    sKeyFlag = 0;
-                }
+                sHoldTime = 0;
+                sKeyFlag = 0;
             }
         }
     }
-}
+}  /* end Scheduler_Tick10ms() */
 
 /**
  * @brief ADC Initialization Function

@@ -536,42 +536,29 @@ STATIC_ASSERT(sizeof(flash_persistent_data_t) <= FLASH_SLOT_SIZE,
 /*===========================================================================*/
 
 /**
- * @brief Scheduler Flags - Set by TIM1 ISR, cleared by main loop
- * 
- * Canonical Scheduler Rule:
- * - tick_counter is the ONLY source of truth for timing (monotonic, never cleared)
- * - ALL timing MUST use tick_counter deltas: (tick_counter - last_tick) >= threshold
- * - tick_10ms is a convenience flag for 10ms task scheduling (set every 10ms, cleared by main loop)
- * - Debug pulse counters (dbg_tick_*_pulses) track missed cycles for debugging ONLY
- * - NEVER use flags or debug counters for precise timing; use tick_counter deltas only
- * 
- * Example: For 1-second timing, check (tick_counter - last_tick) >= TICKS_PER_1S,
- * NOT "dbg_tick_1s_pulses was incremented" (which may have been incremented multiple times).
+ * @brief Scheduler Flags - Set by TIM1 ISR, cleared by main loop (Phase 3 canonical scheduler)
+ *
+ * TIM1 ISR sets tick_10ms every 10ms, tick_100ms every 100ms, tick_500ms every 500ms.
+ * Main loop derives tick_1s from tick_100ms (10 pulses = 1 second) and clears all flags after processing.
+ * tick_counter is monotonic (never cleared); use it for precise timing deltas when needed.
  */
 typedef struct {
-    /* Convenience flag: set every TIM1 interrupt (canonical 10ms tick), cleared by main loop.
-     * Use tick_counter deltas for precise timing, not this flag. */
-    volatile uint8_t tick_10ms;
-    /* Debug pulse counters: track missed cycles for debugging ONLY.
-     * NEVER use these for timing logic - use tick_counter deltas instead. */
-    volatile uint8_t dbg_tick_100ms_pulses; /* Debug: pulse count (can miss cycles) - DO NOT USE FOR TIMING */
-    volatile uint8_t dbg_tick_500ms_pulses; /* Debug: pulse count (can miss cycles) - DO NOT USE FOR TIMING */
-    volatile uint8_t dbg_tick_1s_pulses;    /* Debug: pulse count (can miss cycles) - DO NOT USE FOR TIMING */
-    /* CANONICAL: Free-running 10ms tick counter (monotonic, never cleared).
-     * This is the ONLY source of truth for timing. */
-    volatile uint32_t tick_counter;
+    volatile uint8_t tick_10ms;    /* Set every 10ms, cleared by main loop */
+    volatile uint8_t tick_100ms;   /* Set every 100ms, cleared by main loop */
+    volatile uint8_t tick_500ms;    /* Set every 500ms, cleared by main loop */
+    volatile uint8_t tick_1s;      /* Derived by main from tick_100ms (10 pulses = 1s), cleared by main loop */
+    volatile uint32_t tick_counter; /* Free-running 10ms counter (monotonic, never cleared) */
 } scheduler_flags_t;
 
 /**
- * @brief Scheduler Counters - For periodic task timing
- * 
- * Canonical derivation: All timing derives from tick_counter (see TICK_PERIOD_MS block).
- * These counters track additional state beyond the tick_counter (e.g., sample period timing).
+ * @brief Scheduler Counters - For periodic task timing (Phase 3)
+ *
+ * Used by main loop for measurement window (1.5s), sample period, and related timing.
  */
 typedef struct {
-    /* Sample period tracking: elapsed ticks since last measurement window */
-    uint32_t sample_period_elapsed_ticks;  /* TIM1 ticks (10ms) elapsed since last window */
-    uint32_t last_flash_write_tick;        /* Last flash write tick (for rate limiting) */
+    uint32_t sample_period_elapsed_ticks;  /* TIM1 ticks (10ms) since last measurement window ended */
+    uint32_t measurement_window_ticks;    /* Ticks elapsed in current window (0..MEASUREMENT_WINDOW_TICKS) */
+    uint32_t last_flash_write_tick;       /* Last flash write tick (for rate limiting) */
 } scheduler_counters_t;
 
 /*===========================================================================*/

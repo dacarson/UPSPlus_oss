@@ -406,8 +406,7 @@ Special registers have specific write semantics beyond simple bounds checking:
 - Write 0: Cancels any active countdown immediately (register reads back as 0)
 - Write 10-255: Starts countdown from that value (seconds), or updates if already running
 - Write 1-9: Ignored (invalid, minimum is 10)
-- When countdown reaches 5: Power cycle RPi (MT_EN LOW for 5s, then HIGH)
-- When countdown reaches 1: Power on RPi if off, then register reads back as 0
+- When countdown reaches 1: Power cycle RPi (MT_EN LOW for 5s, then HIGH), then register reads back as 0
 
 **0x1B - Reset to Factory Defaults**:
 - Write 0: No action (normal operation)
@@ -1443,19 +1442,27 @@ Created `Inc/ups_state.h` containing:
 - **I2C semantics**: First byte of write sets both `uI2CRegIndex` and `i2c_pending_write.reg_addr` (write-then-repeated-start-read works). STOP sets `i2c_pending_write.pending` only when `length > 0` (pointer-only writes do not pend). Overwrite protection: if `pending != 0` on ADDR+WRITE, set `ignore_write` and drop bytes until STOP. `i2c_pending_write_t` fields and `active_reg_image`/`latched_reg_image` are `volatile` where shared with ISR.
 - **Init**: `InitAuthoritativeStateFromDefaults()`, `InitAuthoritativeStateFromBuffer()` (from `aReceiveBuffer` after flash load), `Snapshot_Init()` (both `reg_image` buffers + snapshot).
 
-### Phase 3: Timing and Scheduling
+### Phase 3: Timing and Scheduling ✓
 **Goal**: Consolidate timing to TIM1 canonical scheduler
 
-1. **Scheduler Refactoring**
+1. **Scheduler Refactoring** ✓
    - Move timing logic to main-loop scheduler driven by TIM1 flags; keep TIM1 ISR flag-only
    - Remove scheduling from SysTick (keep only uptime counter)
    - Implement scheduler counters structure
 
-2. **Periodic Tasks**
+2. **Periodic Tasks** ✓
    - ADC trigger (500ms)
    - Measurement window (1.5s)
    - Sample period timing
    - Countdown timers
+
+**Implementation Notes (Phase 3)**:
+- **TIM1 ISR** (`main.c`): Flag-only. Sets `tick_10ms`, `tick_100ms`, `tick_500ms`, increments `tick_counter`; no state machine, GPIO, or countdown logic in ISR.
+- **SysTick**: Uptime only (`uUptimeMsCounter`, `uint32_t`, free-running ms). 1s timing derived from TIM1 in main (tick_1s from 10× tick_100ms).
+- **Scheduler** (`scheduler_flags_t`, `scheduler_counters_t` in `ups_state.h`): Main loop checks flags, runs `Scheduler_Tick10ms()` on tick_10ms; ADC trigger on tick_500ms; runtime/countdowns/snapshot on tick_1s; Snapshot_Update on tick_100ms.
+- **Scheduler_Tick10ms()**: Protection check, MT_EN from power state, measurement window + sample period (IP_EN, `sched_counters`, `measurement_window_active`), button debounce. All timing logic in main.
+- **Countdowns**: Shutdown and restart actions + decrements handled in tick_1s block only; restart power-cycle (MT_EN low 5s then high) triggers when countdown reaches 1 (see 0x1A semantics).
+- **Risks documented in code**: Long IRQ disable during restart power-cycle (Phase 4: make non-blocking); flag race / missed tick (counters or copy+clear if needed); modulo in TIM1 ISR (downcounters if tick rate increases); `uUptimeMsCounter` semantics (free-running ms, not “ms within second”).
 
 ### Phase 4: State Machine Implementation
 **Goal**: Implement explicit state machine
