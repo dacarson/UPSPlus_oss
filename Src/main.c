@@ -1,26 +1,4 @@
 #include "pindef.h"
-/*
- * Development Environment setup:
- * Install STM32CubeIDE
- * Confirm UPSPlus MCU is STM32F030F4P6
- * Create a new project and select the STM32F030F4P6 MCU
- * 
- * git clone https://github.com/STMicroelectronics/STM32CubeF0.git
- * mv STM32CubeF0/Drivers Drivers
- * rm -rf STM32CubeF0
- *
- * git clone https://github.com/STMicroelectronics/stm32f0xx-hal-driver.git Drivers/STM32F0xx_HAL_Driver
- * git clone https://github.com/STMicroelectronics/cmsis-device-f0.git Drivers/CMSIS/Device/ST/STM32F0xx
- * git clone https://github.com/ARM-software/CMSIS_5.git Drivers/CMSIS
- * 
- * Add drivers to source path (Src & Inc)
- *
- * 	1.	Right-click the project → Properties
-	2.	C/C++ Build → Settings
-	3.	MCU GCC Compiler → Preprocessor
-	4.  Add STM32F030x6
-	5.  Add USE_FULL_LL_DRIVER
- */
 
 #include "stm32f0xx_ll_adc.h"
 #include "stm32f0xx_ll_bus.h"
@@ -47,6 +25,16 @@ void StorRegValue(void);
 void GetRegValue(void);
 uint32_t GetUptimeSeconds(void);
 void UpdateBatteryPercentage(void);
+void FactoryReset(void);
+void CheckPowerOnConditions(void);
+
+#define VBAT_PROTECT_VOLTAGE 2800
+#define VBAT_LOW_PERCENT 10
+#define LOAD_ON_DELAY_TIME 60
+#define VBAT_MAX_VOLTAGE 3000
+#define VBAT_MIN_VOLTAGE 4200
+#define IP_REFRESH_TIME 2
+
 /* Everything below needs to be mapped to registers */
 
 #define ADC_CONVERTED_DATA_BUFFER_SIZE 6
@@ -61,11 +49,16 @@ __IO uint16_t uUSBINVolt;
 __IO uint16_t uADCdegC;
 __IO uint16_t uAVDDVolt = 3300;
 
-__IO uint16_t uVBATMax = 3000;
-__IO uint16_t uVBATMin = 4200; // Minimum voltage required to power the RPi
-__IO uint16_t uVBATProtect = 3600; // Absolute minimum voltage to prevent damage to the battery
+__IO uint16_t uVBATMax = VBAT_MAX_VOLTAGE;
+__IO uint16_t uVBATMin = VBAT_MIN_VOLTAGE; // Minimum voltage required to power the RPi
+__IO uint16_t uVBATProtect = VBAT_PROTECT_VOLTAGE; // Absolute minimum voltage to prevent damage to the battery
 __IO uint16_t uVBATPrecent;
 __IO uint16_t uVBATPrecentReal;
+
+__IO uint16_t uVBATLowPercent = VBAT_LOW_PERCENT;
+__IO uint16_t sLoadOnDelayTime = LOAD_ON_DELAY_TIME; // Delay time in seconds to power on the load
+
+__IO uint32_t LoadOnCountDown = 0;
 
 __IO uint8_t sKeyFlag = 0;
 __IO uint8_t sKeyClick = 0;        /* Normal press is 1, long press is 2. */
@@ -74,7 +67,7 @@ __IO uint8_t sLowPowerRequest = 0; /* Interrupted due to low battery */
 __IO uint8_t sIPEnable = 0; /* Power is on (1) or off (0) to the RPi */
 __IO uint16_t sIPTicks = 0;
 __IO uint16_t sIPIdleTicks = 0;
-__IO uint16_t sIPRefreshTime = 2;
+__IO uint16_t sIPRefreshTime = IP_REFRESH_TIME;
 
 __IO uint8_t sHoldTime = 0; /* Note: this variable is in units of 10 ms */
 __IO uint8_t MustRefreshVDD = 1;
@@ -89,7 +82,6 @@ __IO uint64_t RuntimeOnetime = 0;
 __IO uint64_t RuntimePowerOn = 0;
 __IO uint64_t RuntimeAtAll = 0;
 
-__IO uint32_t uUptimeSeconds = 0; /* System uptime in seconds */
 __IO uint16_t uUptimeMsCounter = 0; /* Counter for milliseconds (0-999) */
 
 __IO uint8_t OTAShot = 0;
@@ -143,14 +135,16 @@ int main(void)
 
     while (1)
     {
-        if (uVBATProtect == 0)
-        {
-            uVBATProtect = 3600;
-        }
 
         if (uVBATProtect != (aReceiveBuffer[17] | aReceiveBuffer[18] << 8))
         {
             uVBATProtect = (aReceiveBuffer[17] | aReceiveBuffer[18] << 8);
+        }
+
+        // If the battery protection voltage is not set, set it to 3.6V
+        if (uVBATProtect == 0)
+        {
+            uVBATProtect = VBAT_PROTECT_VOLTAGE;
         }
 
         if ((sIPRefreshTime != (aReceiveBuffer[21] | aReceiveBuffer[22] << 8)) && ((aReceiveBuffer[21] | aReceiveBuffer[22] << 8) != 0))
@@ -223,15 +217,13 @@ int main(void)
 
         if (aReceiveBuffer[27] /* FactoryReset */ == 1)
         {
-            uVBATMax = 3000;
-            uVBATMin = 4200;
-            uVBATProtect = 3600;
-            sIPRefreshTime = 2;
+            FactoryReset();
+            // Call StorRegValue() to update the factory reset values in flash once aReceiveBuffer variables are updated
         }
 
-        if (sIPRefreshTime < 2)
+        if (sIPRefreshTime < IP_REFRESH_TIME)
         {
-            sIPRefreshTime = 2;
+            sIPRefreshTime = IP_REFRESH_TIME;
         }
 
         if (FixedVbat != 0)
@@ -303,6 +295,20 @@ int main(void)
             FixedVbat = aReceiveBuffer[42];
         }
 
+        aReceiveBuffer[43] = uVBATLowPercent;
+
+        if (LoadOnCountDown != 0)
+        {
+            uint16_t remainingTime = LoadOnCountDown - GetUptimeSeconds()+5;
+            aReceiveBuffer[44] = remainingTime & 0xFF;
+            aReceiveBuffer[45] = (remainingTime >> 8) & 0xFF;
+        }
+        else
+        {
+            aReceiveBuffer[44] = sLoadOnDelayTime & 0xFF;
+            aReceiveBuffer[45] = (sLoadOnDelayTime >> 8) & 0xFF;
+        }
+
         aReceiveBuffer[240] = LL_GetUID_Word0() & 0xFF;
         aReceiveBuffer[241] = (LL_GetUID_Word0() >> 8) & 0xFF;
         aReceiveBuffer[242] = (LL_GetUID_Word0() >> 16) & 0xFF;
@@ -326,13 +332,7 @@ int main(void)
 
         if (aReceiveBuffer[25] /* AutoPowerOn */ == 1)
         {
-            if (uUSBINVolt > 4000 || uVBUSVolt > 4000)
-            {
-                LL_mDelay(2000);
-                sIPEnable = 1;
-                // CountDownPowerOff = 0;
-                // CountDownRebootTicks = 0;
-            }
+            CheckPowerOnConditions();
         }
 
         if (aReceiveBuffer[50] /* OTA */ == 127 && OTAShot == 0)
@@ -351,6 +351,61 @@ int main(void)
             /* TODO: implement a feature here to record the previous state. */
         }
     }
+}
+
+void CheckPowerOnConditions(void)
+{
+    // Check if we are charging (USB power connected)
+    uint8_t isCharging = (uUSBINVolt > 4000 || uVBUSVolt > 4000);
+
+    // Check if battery percentage is above threshold
+    uint8_t batteryOk = (uVBATPrecentReal > uVBATLowPercent);
+
+    // If countdown is active, check if it has elapsed (even if conditions temporarily changed)
+    if (LoadOnCountDown != 0)
+    {
+        if (GetUptimeSeconds() >= LoadOnCountDown)
+        {
+            // Countdown completed - power on if conditions are still met
+            if (batteryOk)
+            {
+                sIPEnable = 1;
+                LoadOnCountDown = 0;
+                // Reset countdown timers
+                CountDownPowerOff = 0;
+                CountDownRebootTicks = 0;
+            }
+            else
+            {
+                // Conditions no longer met, reset countdown
+                LoadOnCountDown = 0;
+            }
+        }
+        else
+        {
+            // Countdown still active - reset only if charging stopped AND battery dropped below threshold
+            if (!isCharging && !batteryOk)
+            {
+                LoadOnCountDown = 0;
+            }
+        }
+    }
+    // If we are charging the battery and the battery percentage is greater than the low percentage and the load is not already on
+    else if (isCharging && !sIPEnable && batteryOk) 
+    {
+        // Start our power on countdown
+        LoadOnCountDown = GetUptimeSeconds() + sLoadOnDelayTime;
+    } 
+}
+
+void FactoryReset(void)
+{
+    uVBATMax = VBAT_MAX_VOLTAGE;
+    uVBATMin = VBAT_MIN_VOLTAGE;
+    uVBATProtect = VBAT_PROTECT_VOLTAGE;
+    sIPRefreshTime = IP_REFRESH_TIME;
+    uVBATLowPercent = VBAT_LOW_PERCENT;
+    sLoadOnDelayTime = LOAD_ON_DELAY_TIME;
 }
 
 void StorRegValue(void)
@@ -425,10 +480,7 @@ void GetRegValue(void)
     }
     else
     {
-        uVBATMax = 3000;
-        uVBATMin = 4200;
-        uVBATProtect = 3600;
-        sIPRefreshTime = 2;
+        FactoryReset();
     }
 }
 
@@ -438,7 +490,7 @@ void GetRegValue(void)
  */
 uint32_t GetUptimeSeconds(void)
 {
-    return uUptimeSeconds;
+    return RuntimeAtAll;
 }
 
 /**
@@ -512,19 +564,19 @@ void UpdateBatteryMinMax(void)
 
 void UpdateBatteryPercentage(void) {
 
-   uVBATPrecent = ((uVBATVolt - uVBATMin) * 100) / (uVBATMax - uVBATMin);
-   if (uVBATPrecent > 0 && uVBATPrecent < 100)
+   uint16_t percentage = ((uVBATVolt - uVBATMin) * 100) / (uVBATMax - uVBATMin);
+   if (percentage > 0 && percentage < 100)
    {
        // If we are charging the battery, only update if the percentage is higher
        if ((uUSBINVolt > 4000 || uVBUSVolt > 4000) && 
-           uVBATPrecent > uVBATPrecentReal)
-           uVBATPrecentReal = uVBATPrecent;
+        percentage > uVBATPrecentReal)
+           uVBATPrecentReal = percentage;
        // If we are discharging the battery, only update if the percentage is lower
        else if ((uUSBINVolt < 4000 && uVBUSVolt < 4000) && 
-                uVBATPrecent < uVBATPrecentReal)
-           uVBATPrecentReal = uVBATPrecent;
+                percentage < uVBATPrecentReal)
+           uVBATPrecentReal = percentage;
        else if (uVBATPrecentReal == 0)
-           uVBATPrecentReal = uVBATPrecent;
+           uVBATPrecentReal = percentage;
    }
 }
 
@@ -578,12 +630,16 @@ void DMA1_CH1_IRQHandler(void)
      RuntimeAtAll++;  /* Always increment total runtime */
      if (sIPEnable)
      {
-         RuntimePowerOn++; // Charging time
-         RuntimeOnetime++; // Current runtime of RPi
+        RuntimeOnetime++; // Current runtime of RPi
+        // We can only be charging when there is power connected to the Raspberry Pi
+        if (uUSBINVolt > 4000 || uVBUSVolt > 4000)
+        {
+            RuntimePowerOn++; // Charging time
+        }
      }
      else
      {
-         RuntimeOnetime = 0; //When not powering RPi, reset the runtime
+        RuntimeOnetime = 0; //When not powering RPi, reset the runtime
      }
    }
  }
@@ -598,6 +654,11 @@ void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
         {
             if (uVBATVolt < uVBATProtect)
             {
+                // Store our state if we are shutting down
+                if (sIPEnable)
+                {
+                    StorRegValue();
+                }
                 sIPEnable = 0;
                 sLowPowerRequest = 1;
             }
