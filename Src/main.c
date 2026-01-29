@@ -170,20 +170,9 @@ int main(void)
         if (CountDownPowerOff == 1)
         {
             sIPEnable = 0;
-            __disable_irq();
-            LL_GPIO_ResetOutputPin(GPIOA, MT_EN);
-            LL_mDelay(5000);
-
-            if (aReceiveBuffer[25] /* AutoPowerOn */ == 1)
-            {
-                if (uUSBINVolt > 4000 || uVBUSVolt > 4000)
-                {
-                    LL_GPIO_SetOutputPin(GPIOA, MT_EN);
-                    sIPEnable = 1;
-                }
-            }
-            __enable_irq();
+            // Let the TIM_BRK_UP_TRG_COM_IRQHandler handle the power off
             CountDownPowerOff = 0;
+            // RPi will power back ON based on AutoPowerOn and the conditions set in CheckPowerOnConditions()
         }
 
         if (0 != aReceiveBuffer[26] && CountDownReboot == 0)
