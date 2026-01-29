@@ -589,9 +589,9 @@ typedef struct {
  * modifies authoritative state.
  */
 typedef struct {
-    uint8_t reg_addr;                  /* Starting register address */
-    uint8_t data[I2C_PENDING_WRITE_MAX_LEN];  /* Write data buffer */
-    uint8_t length;                    /* Number of bytes received (max I2C_PENDING_WRITE_MAX_LEN) */
+    volatile uint8_t reg_addr;         /* Starting register address (ISR writes, main reads) */
+    volatile uint8_t data[I2C_PENDING_WRITE_MAX_LEN];  /* Write data buffer */
+    volatile uint8_t length;           /* Number of data bytes (ISR writes, main reads) */
     volatile uint8_t pending;          /* Flag: 1 = pending write to process */
 } i2c_pending_write_t;
 

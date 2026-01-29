@@ -7,11 +7,17 @@
 #include "stm32f0xx_ll_cortex.h"
 #include "stm32f0xx.h"
 
-/* I2C slave receive buffer - 256 bytes to support indices 0-255 */
+/* I2C slave receive buffer - 256 bytes; used for flash load (GetRegValue) only. I2C reads use reg_image[]. */
 volatile uint8_t aReceiveBuffer[256];
 
+/* Phase 2: Pending write - ISR stores here; main loop applies to authoritative state */
+i2c_pending_write_t i2c_pending_write = {0};
+
 /* I2C Slave state variables */
-static uint8_t uI2CRegIndex = 0;  /* Current register index being accessed */
+static uint8_t uI2CRegIndex = 0;             /* Register pointer: set by first byte of write; used for READ */
+static uint8_t write_byte_index = 0;         /* 0 = expect reg ptr, 1+ = data bytes */
+static uint8_t ignore_write = 0;             /* 1 = pending already set, drop this write until STOP */
+static volatile uint8_t latched_reg_image = 0;  /* Latched at ADDR+READ; TX uses reg_image[latched_reg_image] for whole transaction */
 
 /**
  * @brief I2C1 Slave Initialization Function
@@ -79,9 +85,12 @@ void MX_I2C1_Slave_Init(void)
  * This handler is automatically registered by the linker, which overrides the weak
  * definition in the startup file (startup_stm32f030f4px.s). No explicit registration needed.
  *
- * This handler implements a register map where:
- * - Write: [SlaveAddr+W] [RegisterIndex] [Data1] [Data2] ... → writes to aReceiveBuffer[RegisterIndex++]
- * - Read: [SlaveAddr+R] [Data1] [Data2] ... → reads from aReceiveBuffer[currentIndex++]
+ * Register map:
+ * - Write: [SlaveAddr+W] [RegIndex] [Data1] [Data2] ... First byte = register pointer (uI2CRegIndex).
+ *   Data bytes go to i2c_pending_write; main loop applies. Pending set only if length > 0.
+ *   If pending already set, ignore this write until STOP.
+ * - Read: [SlaveAddr+R] [Data1] [Data2] ... Transmit from reg_image[latched_reg_image], starting
+ *   at uI2CRegIndex. Latch active_reg_image on ADDR for READ; use that buffer for whole transaction.
  */
 void I2C1_IRQHandler(void)
 {
@@ -93,14 +102,19 @@ void I2C1_IRQHandler(void)
         uint32_t addr_match = LL_I2C_GetAddressMatchCode(I2C1);
         if (addr_match == (0x17 << 1)) {
             if (LL_I2C_GetTransferDirection(I2C1) == LL_I2C_DIRECTION_READ) {
-                /* Read transfer: prepare to transmit */
+                /* Read: latch which reg_image buffer to use for whole transaction */
+                latched_reg_image = active_reg_image;
                 LL_I2C_ClearFlag_ADDR(I2C1);
                 LL_I2C_ClearFlag_TXE(I2C1);
                 LL_I2C_EnableIT_TX(I2C1);
             }
             else {
-                /* Write transfer: prepare to receive */
-                uI2CRegIndex = 0;
+                /* Write: first byte = reg pointer. Overwrite protection: if pending != 0, ignore until STOP. */
+                write_byte_index = 0;
+                ignore_write = (i2c_pending_write.pending != 0) ? 1 : 0;
+                if (!ignore_write) {
+                    i2c_pending_write.length = 0;
+                }
                 LL_I2C_ClearFlag_ADDR(I2C1);
                 LL_I2C_EnableIT_RX(I2C1);
             }
@@ -141,29 +155,41 @@ void I2C1_IRQHandler(void)
         LL_I2C_ClearFlag_NACK(I2C1);
     }
     
-    /* 4. TXIS: Transmit interrupt - data register empty, ready to send */
+    /* 4. TXIS: Transmit interrupt - send from latched reg_image buffer */
     if (LL_I2C_IsActiveFlag_TXIS(I2C1)) {
-        LL_I2C_TransmitData8(I2C1, aReceiveBuffer[uI2CRegIndex++]);
+        LL_I2C_TransmitData8(I2C1, reg_image[latched_reg_image][uI2CRegIndex++]);
     }
-    
-    /* 5. RXNE: Receive interrupt - data available to read */
+
+    /* 5. RXNE: Receive interrupt. First byte = register pointer; then data bytes → pending. */
     if (LL_I2C_IsActiveFlag_RXNE(I2C1)) {
-        if (uI2CRegIndex == 0) {
-            /* First byte is the register index */
-            uI2CRegIndex = LL_I2C_ReceiveData8(I2C1);
+        uint8_t byte = LL_I2C_ReceiveData8(I2C1);
+        if (ignore_write) {
+            (void)byte; /* Drop; read already done to clear RXNE */
         }
-        else {
-            /* Subsequent bytes are data */
-            aReceiveBuffer[uI2CRegIndex++] = LL_I2C_ReceiveData8(I2C1);
-            aReceiveBuffer[0] |= 1U;
+        else if (write_byte_index == 0) {
+            /* First byte = register pointer. Set both so "write [reg] then repeated-start read" works. */
+            uI2CRegIndex = byte;
+            i2c_pending_write.reg_addr = byte;
+            i2c_pending_write.length = 0;
+            write_byte_index = 1;
+        } else {
+            if (i2c_pending_write.length < I2C_PENDING_WRITE_MAX_LEN) {
+                i2c_pending_write.data[i2c_pending_write.length++] = byte;
+            }
         }
     }
-    
-    /* 6. STOP: Stop condition detected */
+
+    /* 6. STOP: Pending only if length > 0 (data bytes). Pointer-only writes must not set pending. */
     if (LL_I2C_IsActiveFlag_STOP(I2C1)) {
         LL_I2C_ClearFlag_STOP(I2C1);
         LL_I2C_DisableIT_RX(I2C1);
         LL_I2C_DisableIT_TX(I2C1);
+        if (ignore_write) {
+            ignore_write = 0;
+        } else if (i2c_pending_write.length > 0) {
+            i2c_pending_write.pending = 1;
+        }
+        write_byte_index = 0;
     }
 }
 

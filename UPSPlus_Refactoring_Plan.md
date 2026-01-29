@@ -1416,24 +1416,32 @@ Created `Inc/ups_state.h` containing:
 - Pin behavior truth table as documentation comment
 - Function prototypes for later phases
 
-### Phase 2: Core Infrastructure
+### Phase 2: Core Infrastructure ✓ COMPLETE
 **Goal**: Implement data structures and snapshot mechanism
 
-1. **Authoritative State**
+1. **Authoritative State** ✓
    - Create authoritative_state_t structure
    - Migrate all state variables to structure
    - Update all code to use structure
 
-2. **Snapshot Mechanism**
+2. **Snapshot Mechanism** ✓
    - Implement double-buffered snapshot
    - Implement atomic snapshot update
    - Test snapshot coherence
 
-3. **I2C Register Map**
+3. **I2C Register Map** ✓
    - Implement register validation functions
    - Implement bounds checking
    - Implement RO register enforcement
    - Update I2C handler to use snapshot
+
+**Implementation Notes (Phase 2)**:
+- **Authoritative state** (`main.c`): `state` (`authoritative_state_t`) and `sys_state` (`system_state_t`) are the single source of truth. All former globals (uXXXVolt, counters, mode flags) removed as authoritative; only timing helpers remain (`CountDownPowerOffTicks`, `CountDownRebootTicks`, `sKeyFlag`, etc.) with comments that real countdown/state lives in `state`/`sys_state`.
+- **Snapshot mechanism**: Double-buffered register image `reg_image[2][256]` and `volatile uint8_t active_reg_image`. `Snapshot_Update()` builds into `reg_image[inactive]` via `StateToRegisterBuffer()`, then atomically flips `active_reg_image`. `aReceiveBuffer` is used for flash load (`GetRegValue`) only; I2C reads use `reg_image` only. `Snapshot_Update()` is called only on state changes (ADC processed, 1s tick, I2C write applied, flash save, factory reset, OTA, countdown actions, button toggle)—no unconditional per-loop update.
+- **I2C coherence**: In `I2C_Slave.c`, on ADDR+READ the ISR latches `latched_reg_image = active_reg_image`; TX transmits from `reg_image[latched_reg_image][uI2CRegIndex++]` for the whole transaction, ensuring coherent multi-byte reads.
+- **I2C register map**: `StateToRegisterBuffer()` maps `state`/`sys_state` to the 256-byte register image; validation helpers (`Validate_FullVoltage`, etc.) and `ProcessI2CPendingWrite()` apply and validate writes. RO registers enforced in `ProcessI2CPendingWrite()` (writes to RO/Reserved discarded).
+- **I2C semantics**: First byte of write sets both `uI2CRegIndex` and `i2c_pending_write.reg_addr` (write-then-repeated-start-read works). STOP sets `i2c_pending_write.pending` only when `length > 0` (pointer-only writes do not pend). Overwrite protection: if `pending != 0` on ADDR+WRITE, set `ignore_write` and drop bytes until STOP. `i2c_pending_write_t` fields and `active_reg_image`/`latched_reg_image` are `volatile` where shared with ISR.
+- **Init**: `InitAuthoritativeStateFromDefaults()`, `InitAuthoritativeStateFromBuffer()` (from `aReceiveBuffer` after flash load), `Snapshot_Init()` (both `reg_image` buffers + snapshot).
 
 ### Phase 3: Timing and Scheduling
 **Goal**: Consolidate timing to TIM1 canonical scheduler
