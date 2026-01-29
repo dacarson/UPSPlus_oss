@@ -15,6 +15,7 @@
 #include "stm32f0xx_ll_utils.h"
 
 #include "I2C_Slave.h"
+#include "ups_state.h"
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);

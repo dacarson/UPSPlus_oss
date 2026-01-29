@@ -1383,21 +1383,38 @@ void ProcessButtonState(void) {
 
 ## Implementation Phases
 
-### Phase 1: Foundation and Characterization
+### Phase 1: Foundation and Characterization ✓ COMPLETE
 **Goal**: Understand current behavior, establish foundation
 
-1. **Pin Characterization**
+1. **Pin Characterization** ✓
    - Create truth table for all pins per system state
 
-2. **State Machine Design**
+2. **State Machine Design** ✓
    - Document current implicit states
    - Design explicit state machine
    - Define all state transitions
 
-3. **Data Structure Design**
+3. **Data Structure Design** ✓
    - Design authoritative state structure
    - Design snapshot buffer mechanism
    - Design flash persistence structure
+
+**Implementation Notes (Phase 1)**:
+Created `Inc/ups_state.h` containing:
+- All state machine enumerations (`power_state_t`, `charger_state_t`, `learning_mode_t`, `button_state_t`)
+- System state structure (`system_state_t`) with all fields from plan
+- Authoritative state structure (`authoritative_state_t`) - single source of truth
+- Snapshot buffer structure (`snapshot_buffer_t`) for double-buffered I2C coherence
+- Flash persistence structure (`flash_persistent_data_t`) with A/B slot support
+- Scheduler structures (`scheduler_flags_t`, `scheduler_counters_t`)
+- I2C pending write structure (`i2c_pending_write_t`)
+- Protection state structure (`protection_state_t`)
+- Button handler structure (`button_handler_t`)
+- GPIO state structure (`gpio_state_t`)
+- All constants and thresholds from the plan
+- Complete register map definitions
+- Pin behavior truth table as documentation comment
+- Function prototypes for later phases
 
 ### Phase 2: Core Infrastructure
 **Goal**: Implement data structures and snapshot mechanism
@@ -1790,8 +1807,23 @@ For each state dimension (power/charger/learning):
 These are required verification steps, but they do not change the plan unless verification fails:
 
 1. **Flash address/layout verification** against actual linker script and bootloader footprint (bricking prevention).
+   - **Status**: Deferred to Phase 6 (gated behind UPS_ENABLE_FLASH_PERSISTENCE and UPS_FLASH_LAYOUT_VERIFIED)
+
 2. **ADC scaling confirmation** for VBUS/USBIN thresholds (confirm that the existing macros' scaling corresponds to connector mV as assumed).
+   - **Status**: ✓ VERIFIED (Phase 1)
+   - **Result**: ADC scaling confirmed - __LL_ADC_CALC_DATA_TO_VOLTAGE macros for VBUS/USBIN produce connector-referenced millivolts. Thresholds (4200mV/3800mV) are correct.
+
 3. **Legacy reserved-region read behavior** (confirm whether legacy returns 0x00; if not, mirror legacy readback while still discarding writes).
+   - **Status**: ✓ VERIFIED (Phase 1)
+   - **Result**: Legacy firmware returns 0x00 for reserved register reads. Snapshot mapping matches this behavior.
+
+4. **Battery percent MSB (register 0x14) behavior** (confirm whether MSB is always 0x00).
+   - **Status**: ✓ VERIFIED (Phase 1)
+   - **Result**: Register 0x14 (MSB) always returns 0x00 in legacy firmware. Register mapping contract confirmed.
+
+5. **Temperature units** (confirm __LL_ADC_CALC_TEMPERATURE scaling).
+   - **Status**: ✓ VERIFIED (Phase 1)
+   - **Result**: Temperature is integer degrees Celsius (°C). Confirmed via Phase 1 characterization.
 
 If any of these verifications contradict the plan, the contradiction must be resolved by updating the plan in section B (Decisions Locked)—not by ad hoc code changes.
 
