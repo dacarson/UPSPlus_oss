@@ -1652,6 +1652,14 @@ Created `Inc/ups_state.h` containing:
    - Expose state machine values in 0xFC-0xFF when Factory Testing enabled
    - Keep 0xFC-0xFF returning 0x00 when Factory Testing disabled
 
+**Implementation Notes (Phase 8)**:
+- Factory Testing selector is stored in runtime-only state (`factory_test_selector`), resets to 0 on boot and factory reset.
+- I2C write to `0xFC` updates selector; writes to `0xFD-0xFF` are ACK'd and ignored. Extra bytes after selector are ignored.
+- When selector is 0, reads of `0xFC-0xFF` return `0x00` (legacy-compatible).
+- When selector is non-zero, `0xFC` returns selector and `0xFD-0xFF` return the selected page values.
+- Factory Testing page mapping implemented as specified (0x01 state, 0x02 button, 0x03 window/charger, 0x04 protection).
+- Snapshot formatting uses local copies of button/charger/window/protection structures to keep per-snapshot coherence.
+
 2. **Testing**
    - Test all state transitions
    - Test I2C read/write operations

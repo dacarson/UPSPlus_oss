@@ -306,6 +306,9 @@ typedef struct {
     
     /* Factory reset flag (temporary, not persistent) */
     uint8_t factory_reset_requested;
+
+    /* Factory testing selector (0 = disabled, runtime-only, not persistent) */
+    uint8_t factory_test_selector;
     
     /* Pending power cut (for protection shutdown ordering) */
     /* Deterministic Protection Cut Ordering Invariant:

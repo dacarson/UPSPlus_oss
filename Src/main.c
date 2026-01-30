@@ -190,6 +190,11 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
     uint16_t u16;
     uint32_t u32;
     uint16_t i;
+    /* Snapshot local copies for debug/diagnostic pages (main-loop owned state). */
+    const button_handler_t button_snapshot = button_handler;
+    const charger_physical_state_t charger_snapshot = charger_physical;
+    const window_manager_state_t window_snapshot = window_mgr;
+    const protection_state_t protection_snapshot = prot_state;
 
     buf[REG_MCU_VOLTAGE_L]       = (uint8_t)(auth->mcu_voltage_mv & 0xFFu);
     buf[REG_MCU_VOLTAGE_H]       = (uint8_t)((auth->mcu_voltage_mv >> 8) & 0xFFu);
@@ -256,6 +261,34 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
     buf[REG_SERIAL_START + 11] = (uint8_t)((LL_GetUID_Word2() >> 24) & 0xFFu);
     for (i = REG_FACTORY_TEST_START; i <= REG_FACTORY_TEST_END; i++)
         buf[i] = 0x00u;
+    if (sys->factory_test_selector != 0u) {
+        uint8_t selector = sys->factory_test_selector;
+        buf[REG_FACTORY_TEST_START] = selector;
+        switch (selector) {
+        case 0x01u:
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)sys->power_state;
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)sys->charger_state;
+            buf[REG_FACTORY_TEST_START + 3] = (uint8_t)sys->learning_mode;
+            break;
+        case 0x02u:
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)button_snapshot.state;
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)button_snapshot.pending_click;
+            buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(button_snapshot.hold_ticks & 0xFFu);
+            break;
+        case 0x03u:
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(charger_snapshot.charger_physically_present != 0u);
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)(window_snapshot.window_active != 0u);
+            buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(window_snapshot.window_due != 0u);
+            break;
+        case 0x04u:
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(protection_snapshot.protection_active != 0u);
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)protection_snapshot.below_threshold_count;
+            buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(sys->pending_power_cut != 0u);
+            break;
+        default:
+            break;
+        }
+    }
 }
 
 uint8_t Snapshot_ReadRegister(uint8_t reg_addr)
@@ -334,7 +367,7 @@ static void ProcessI2CPendingWrite(void)
         ota_triggered = 1;
 
     /* Reserved: ACK but discard */
-    if (IS_RESERVED_REG(reg) || IS_FACTORY_TEST_REG(reg)) {
+    if (IS_RESERVED_REG(reg) || (IS_FACTORY_TEST_REG(reg) && reg != REG_FACTORY_TEST_START)) {
         i2c_pending_write.pending = 0;
         return;
     }
@@ -433,6 +466,16 @@ static void ProcessI2CPendingWrite(void)
     case REG_FACTORY_RESET:
         if (len >= 1 && i2c_pending_write.data[0] == 1) sys_state.factory_reset_requested = 1;
         break;
+    case REG_FACTORY_TEST_START:
+        if (len >= 1) {
+            /* Selector only; ignore any extra data bytes. */
+            u8 = i2c_pending_write.data[0];
+            if (sys_state.factory_test_selector != u8) {
+                sys_state.factory_test_selector = u8;
+                changed = 1;
+            }
+        }
+        break;
     case REG_BATTERY_SELF_PROG:
         if (len >= 1) {
             uint8_t new_value = (i2c_pending_write.data[0] != 0) ? 1u : 0u;
@@ -513,6 +556,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     sys_state.power_state_entry_ticks = 0;
     sys_state.charger_state_entry_ticks = 0;
     sys_state.factory_reset_requested = 0;
+    sys_state.factory_test_selector = 0;
     sys_state.pending_power_cut = 0;
 
     /* Phase 4: State machine runtime */
@@ -838,6 +882,7 @@ void FactoryReset(void)
     state.last_true_vbat_sample_tick = 0;
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.learning_mode = LEARNING_ACTIVE;
+    sys_state.factory_test_selector = 0;
 
     /* Phase 4: Reset runtime/state-machine variables so FSM is in known-safe state */
     sys_state.charger_state = CHARGER_STATE_ABSENT;
