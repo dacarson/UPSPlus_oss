@@ -323,7 +323,75 @@ All registers must be implemented according to the specification table. Key requ
 
 **Reserved**
 - 0x2E-0xEF: Reserved (RW but no defined function)
-- 0xFC-0xFF: Factory Testing (RW)
+
+**Factory Testing (RW selector, RO values)**
+- 0xFC: Factory Testing selector/control (RW)
+- 0xFD-0xFF: Factory Testing data window (RO, meaning depends on selector)
+
+**Factory Testing data ABI**:
+- Values returned in 0xFD-0xFF are raw numeric enum values (not bitfields)
+- Enum ordering is part of the debug ABI and must remain stable across firmware versions
+- Do not renumber; only append new enum values at the end; never reuse removed values
+
+**Factory Testing enum numeric mappings (locked ABI)**:
+- Factory Testing page meanings and enum numeric values are tied to the firmware Version register (0x28–0x29). Factory tooling must branch on Version if needed.
+- power_state_t:
+  - POWER_STATE_RPI_OFF = 0
+  - POWER_STATE_RPI_ON = 1
+  - POWER_STATE_PROTECTION_LATCHED = 2
+  - POWER_STATE_LOAD_ON_DELAY = 3
+- charger_state_t:
+  - CHARGER_STATE_ABSENT = 0
+  - CHARGER_STATE_PRESENT = 1
+  - CHARGER_STATE_FORCED_OFF_WINDOW = 2
+- learning_mode_t:
+  - LEARNING_INACTIVE = 0
+  - LEARNING_ACTIVE = 1
+- button_state_t:
+  - BUTTON_IDLE = 0
+  - BUTTON_PRESSED = 1
+  - BUTTON_HELD = 2
+  - BUTTON_RELEASED_SHORT = 3
+  - BUTTON_RELEASED_LONG = 4
+- button_click_t:
+  - BUTTON_CLICK_NONE = 0
+  - BUTTON_CLICK_SHORT = 1
+  - BUTTON_CLICK_LONG = 2
+
+**Factory Testing selector pages** (example pages; update as needed):
+- Selector = 0x01: State machine page
+  - 0xFD: Power State (power_state_t)
+  - 0xFE: Charger State (charger_state_t)
+  - 0xFF: Learning Mode (learning_mode_t)
+- Selector = 0x02: Button page
+  - 0xFD: Button State (button_state_t)
+  - 0xFE: Button Click (button_click_t or pending action)
+  - 0xFF: Button Hold Ticks (LSB, low 8 bits)
+- Selector = 0x03: Charger/Window page
+  - 0xFD: charger_physically_present (0/1)
+  - 0xFE: window_active (0/1)
+  - 0xFF: window_due (0/1)
+- Selector = 0x04: Protection page
+  - 0xFD: protection_active (0/1)
+  - 0xFE: below_threshold_count
+  - 0xFF: pending_power_cut (0/1)
+
+**Factory Testing enable/disable behavior**:
+- Write selector 0x00 to 0xFC to disable Factory Testing
+- Write any non-zero selector value to 0xFC to enable Factory Testing and select a page
+- When disabled, reads of 0xFC-0xFF return 0x00 (legacy-compatible)
+- Writes to 0xFD-0xFF are always ignored (ACK but no storage), regardless of selector
+- Unknown selector values are accepted and read back, but 0xFD-0xFF return 0x00
+- When enabled, reads of 0xFC return the current selector value
+- Factory tools should use 0x28-0x29 (firmware version) to branch selector-page interpretation if needed
+
+**Factory Testing timing semantics**:
+- Selector writes take effect when processed in the main loop
+- The new selector is visible in the next snapshot (typically ≤100ms)
+- Factory Testing values reflect the most recent snapshot (same freshness guarantees as other status registers)
+- Selector changes do not affect an in-flight I2C read transaction
+- Selector is runtime-only (not persisted) and resets to 0 on any boot/reset
+- Factory reset forces selector to 0 (disabled)
 
 **I2C reserved regions write behavior**: If accepting writes to reserved regions, decide:
 - Do they go into a scratch buffer?
@@ -1580,6 +1648,9 @@ Created `Inc/ups_state.h` containing:
    - Integrate all components
    - Verify state machine transitions
    - Verify I2C register map
+   - Add Factory Testing enable/disable semantics in I2C write path
+   - Expose state machine values in 0xFC-0xFF when Factory Testing enabled
+   - Keep 0xFC-0xFF returning 0x00 when Factory Testing disabled
 
 2. **Testing**
    - Test all state transitions
@@ -1588,6 +1659,7 @@ Created `Inc/ups_state.h` containing:
    - Test button handling
    - Test battery learning and protection
    - Test measurement window timing
+   - Test Factory Testing enable/disable and state value readback (0xFC-0xFF)
 
 3. **Documentation**
    - Document state machine
