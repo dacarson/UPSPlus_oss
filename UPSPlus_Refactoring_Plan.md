@@ -1319,14 +1319,14 @@ typedef struct {
 - Debounce: Wait 5 ticks (50ms) for stability - presses < 50ms are ignored
 - Release detected: Button released before reaching exactly 1000 ticks (10s)
 - **Boundary**: Exactly 10s (1000 ticks) counts as long press, not short press
-- Action: Toggle RPi power state
+- Action: If RPi is **off**, power on immediately as long as battery is not below protection voltage. If RPi is **on**, no action.
 
 **Long Press** (≥ 10 seconds):
 - Press detected: EXTI interrupt sets flag
 - Hold detected: Button still pressed when hold_time reaches exactly 1000 ticks (10s)
 - **Boundary**: Exactly 10s (1000 ticks) counts as long press
-- Action: Trigger factory reset immediately (same as writing 1 to register 0x1B)
-- Factory reset executes: All parameters reset to defaults, flash updated; **RPi power is forced off on long-press reset**
+- Action: If RPi is **on**, request power off. If RPi is **off**, trigger factory reset immediately (same as writing 1 to register 0x1B).
+- Factory reset executes: All parameters reset to defaults, flash updated; **RPi remains off after long-press reset**
 
 ### Button Handler Implementation
 
@@ -1347,12 +1347,17 @@ void ProcessButtonState(void) {
             // Long press detected (10 seconds) - trigger once
             button_click = LONG_PRESS;
             hold_time++;  // Increment to prevent re-triggering while button still held
-            // Trigger factory reset (updates RAM state, marks flash dirty)
-            FactoryReset();
-            // Request flash write with rate limit bypass (factory reset is critical)
-            flash_write_requested = 1;
-            flash_write_bypass_rate_limit = 1;  // Allow immediate write
-            // Main loop persistence task will perform the actual flash write
+            if (power_state == POWER_STATE_RPI_ON) {
+                // Long press while on -> request power off
+                power_state = POWER_STATE_RPI_OFF;
+            } else if (power_state == POWER_STATE_RPI_OFF) {
+                // Long press while off -> factory reset (updates RAM state, marks flash dirty)
+                FactoryReset();
+                // Request flash write with rate limit bypass (factory reset is critical)
+                flash_write_requested = 1;
+                flash_write_bypass_rate_limit = 1;  // Allow immediate write
+                // Main loop persistence task will perform the actual flash write
+            }
         }
         // Clear EXTI flag if set (edge already processed)
         if (button_activity) {
@@ -1364,10 +1369,8 @@ void ProcessButtonState(void) {
             // Short press (≥ 50ms and < 10 seconds)
             // Exact boundaries: 5 ticks (50ms) minimum, 999 ticks (9.99s) maximum
             button_click = SHORT_PRESS;
-            // Toggle RPi power state
-            if (power_state == POWER_STATE_RPI_ON) {
-                power_state = POWER_STATE_RPI_OFF;
-            } else if (power_state == POWER_STATE_RPI_OFF) {
+            // Short press while off -> request power on; while on -> no action
+            if (power_state == POWER_STATE_RPI_OFF) {
                 // Check conditions before enabling
                 if (CheckPowerOnConditions()) {
                     power_state = POWER_STATE_LOAD_ON_DELAY;
