@@ -75,7 +75,8 @@ typedef enum {
 - `LOAD_ON_DELAY` → `RPI_ON`: Delay elapsed AND conditions still met
 - `LOAD_ON_DELAY` → `RPI_OFF`: Battery % drops below low (cancel is battery-only; charger disconnect does not cancel)
 - `RPI_ON` → `PROTECTION_LATCHED`: Battery voltage ≤ Protection Voltage (with hysteresis, N consecutive samples)
-- `RPI_ON` → `RPI_OFF`: Button short press (toggle)
+- `RPI_ON` → `RPI_OFF`: Button short press (only if not below protection voltage / not protection-latched)
+- `RPI_ON`: Button short press does nothing (no transition)
 - `PROTECTION_LATCHED` → `LOAD_ON_DELAY`: Charger connected AND battery % > threshold AND AutoPowerOn enabled
 - `PROTECTION_LATCHED` → `RPI_OFF`: Charger disconnected or conditions not met
 
@@ -1554,17 +1555,23 @@ Created `Inc/ups_state.h` containing:
 - Failed saves keep `flash_save_requested` asserted and retry with a short backoff.
 - Periodic dirty flush every 60s, plus flush on measurement window completion if dirty.
 
-### Phase 7: Button Handling
+### Phase 7: Button Handling ✓ COMPLETE
 **Goal**: Implement robust button handling
 
-1. **Button State Machine**
-   - Implement debounce logic
-   - Implement short/long press detection
+1. **Button State Machine** ✓
+   - Implement debounce logic (consecutive stable samples)
+   - Implement short/long press detection (10s boundary counts as long press)
    - Document long press behavior
 
-2. **Button Actions**
-   - Implement power toggle
-   - Implement long press action (factory reset)
+2. **Button Actions** ✓
+   - Short press: If RPi is OFF, power ON immediately (only if battery is not below protection voltage / not protection-latched). If RPi is ON, no action.
+   - Long press (>= 10s): If RPi is ON, request power OFF. If RPi is OFF, trigger factory reset immediately (same as writing 1 to register 0x1B). RPi remains OFF after reset.
+
+**Implementation Notes (Phase 7)**:
+- EXTI only signals activity (sets `sKeyFlag`); all timing/decisions occur in the 10ms main-loop button FSM.
+- Debounce requires `BUTTON_DEBOUNCE_TICKS` consecutive stable samples of the same level before state changes.
+- Long-press timing is measured from `press_start_tick` (initial edge), so the 10s boundary is consistent with the plan.
+- Short-press power-on is gated by protection state/threshold and true-VBAT freshness when charger influences VBAT.
 
 ### Phase 8: Integration and Testing
 **Goal**: Integrate all components and test

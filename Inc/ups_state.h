@@ -333,7 +333,7 @@ typedef struct {
  */
 typedef struct {
     button_state_t state;
-    uint32_t press_start_tick;         /* TIM1 tick when pressed */
+    uint32_t press_start_tick;         /* TIM1 tick when press first detected */
     uint16_t hold_ticks;                /* Duration held (increments while button pressed).
                                          * Saturates at >BUTTON_LONG_PRESS_TICKS to avoid re-fire. */
     uint8_t long_press_fired;           /* Flag: 1 = long press action already triggered (one-shot guarantee) */
@@ -746,10 +746,6 @@ uint8_t Flash_CanWrite(void);    /* Returns 1 if rate limit allows, 0 if not */
 
 /* ADC Processing */
 void ADC_ProcessSample(void);
-
-/* Button Handling */
-void Button_Init(void);
-void Button_Process(void);
 
 /* Scheduler */
 void Scheduler_Init(void);

@@ -44,10 +44,8 @@ __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
 
 /* Phase 2: Timing/button helpers (TIM1/SysTick/EXTI). Authoritative state is state/sys_state only;
  * no shadow globals (uXXXVolt, counters, mode flags) remain as authoritative. */
-__IO uint8_t sKeyFlag = 0;
-__IO uint8_t sKeyClick = 0;        /* 1 = short press, 2 = long press */
+__IO uint8_t sKeyFlag = 0;         /* Button activity (EXTI edge) */
 __IO uint16_t sIPIdleTicks = 0;
-__IO uint8_t sHoldTime = 0;       /* 10 ms units */
 __IO uint8_t MustRefreshVDD = 1;
 /* Phase 3: Countdowns decremented in main loop on tick_1s (removed from ISR) */
 /* Free-running ms since boot (uint32_t, overflows ~49 days). Not "ms within current second";
@@ -71,6 +69,8 @@ static snapshot_buffer_t snapshot;
 static window_manager_state_t window_mgr;
 static charger_physical_state_t charger_physical;
 static protection_state_t prot_state;
+static button_handler_t button_handler;
+static uint8_t button_last_level = 0; /* 1=pressed, 0=released */
 
 /* Phase 2.2: Double-buffered register image. Snapshot_Update fills reg_image; main copies to aReceiveBuffer for I2C TX. */
 uint8_t reg_image[2][256];
@@ -107,6 +107,9 @@ static void InitAuthoritativeStateFromDefaults(void);
 static void ProcessI2CPendingWrite(void);
 static void Scheduler_Tick10ms(void);
 static void PowerStateMachine_OnTick1s(void);
+static void Button_Init(void);
+static void Button_ProcessTick10ms(void);
+static void Button_DispatchActions(void);
 
 /*===========================================================================*/
 /* Phase 2: Validation functions (register bounds, RO enforcement in apply)  */
@@ -524,6 +527,19 @@ static void InitAuthoritativeStateFromDefaults(void)
     prot_state.protection_active = 0;
     prot_state.last_adc_battery_mv = 0;
     prot_state.last_seen_seq = 0;
+
+    Button_Init();
+}
+
+static void Button_Init(void)
+{
+    button_handler.state = BUTTON_IDLE;
+    button_handler.press_start_tick = 0;
+    button_handler.hold_ticks = 0;
+    button_handler.long_press_fired = 0;
+    button_handler.debounce_counter = 0;
+    button_handler.pending_click = BUTTON_CLICK_NONE;
+    button_last_level = 0;
 }
 
 void NVIC_SetVectorTable(void)
@@ -725,20 +741,8 @@ int main(void)
                 ;
         }
 
-        /* Button short press: toggle RPi power; entry to RPI_ON resets protection count */
-        if (sKeyClick == 1)
-        {
-            sKeyClick = 0;
-            if (sys_state.power_state == POWER_STATE_RPI_ON)
-                sys_state.power_state = POWER_STATE_RPI_OFF;
-            else
-            {
-                sys_state.power_state = POWER_STATE_RPI_ON;
-                sys_state.power_state_entry_ticks = sched_flags.tick_counter;
-                prot_state.below_threshold_count = 0;
-            }
-            Snapshot_UpdateDerived();
-        }
+        /* Button actions (short/long press) */
+        Button_DispatchActions();
     }
 }
 
@@ -1494,36 +1498,167 @@ static void Scheduler_Tick10ms(void)
     /* Single place for GPIO: reflects power state and charger state after both FSM steps */
     ApplyGPIOFromState();
 
-    /* Button debounce (tick_10ms) */
-    if (sKeyFlag)
+    /* Button handling (tick_10ms) */
+    Button_ProcessTick10ms();
+}  /* end Scheduler_Tick10ms() */
+
+static void Button_ProcessTick10ms(void)
+{
+    uint8_t button_pressed = (LL_GPIO_IsInputPinSet(GPIOB, LL_GPIO_PIN_1) == 0u);
+
+    if (button_handler.state == BUTTON_IDLE && sKeyFlag == 0u)
+        return;
+
+    switch (button_handler.state)
     {
-        if (!LL_GPIO_IsInputPinSet(GPIOB, LL_GPIO_PIN_1))
+    case BUTTON_IDLE:
+        button_handler.state = BUTTON_PRESSED;
+        button_handler.debounce_counter = 0;
+        button_handler.hold_ticks = 0;
+        button_handler.long_press_fired = 0;
+        button_handler.pending_click = BUTTON_CLICK_NONE;
+        button_handler.press_start_tick = sched_flags.tick_counter;
+        button_last_level = button_pressed ? 1u : 0u;
+        break;
+
+    case BUTTON_PRESSED:
+        if (button_pressed != button_last_level)
         {
-            if (sHoldTime < 200)
-                sHoldTime++;
-            else
+            button_last_level = button_pressed ? 1u : 0u;
+            button_handler.debounce_counter = 0;
+        }
+        else if (button_handler.debounce_counter < BUTTON_DEBOUNCE_TICKS)
+        {
+            button_handler.debounce_counter++;
+        }
+        if (button_last_level)
+        {
+            if (button_handler.debounce_counter >= BUTTON_DEBOUNCE_TICKS)
             {
-                sHoldTime = 0;
-                sKeyClick = 2;
+                button_handler.state = BUTTON_HELD;
+                button_handler.hold_ticks = 0;
+                button_handler.debounce_counter = 0;
                 sKeyFlag = 0;
             }
         }
         else
         {
-            if (sHoldTime > 5)
+            if (button_handler.debounce_counter >= BUTTON_DEBOUNCE_TICKS)
             {
-                sHoldTime = 0;
-                sKeyClick = 1;
-                sKeyFlag = 0;
-            }
-            else
-            {
-                sHoldTime = 0;
+                button_handler.state = BUTTON_IDLE;
+                button_handler.press_start_tick = 0;
+                button_handler.debounce_counter = 0;
                 sKeyFlag = 0;
             }
         }
+        break;
+
+    case BUTTON_HELD:
+        if (button_pressed)
+        {
+            button_last_level = 1;
+            button_handler.debounce_counter = 0;
+            {
+                uint32_t held = sched_flags.tick_counter - button_handler.press_start_tick;
+                if (held > (uint32_t)(BUTTON_LONG_PRESS_TICKS + 1u))
+                    held = (uint32_t)(BUTTON_LONG_PRESS_TICKS + 1u);
+                button_handler.hold_ticks = (uint16_t)held;
+            }
+            if (!button_handler.long_press_fired &&
+                button_handler.hold_ticks >= BUTTON_LONG_PRESS_TICKS)
+            {
+                button_handler.pending_click = BUTTON_CLICK_LONG;
+                button_handler.long_press_fired = 1;
+            }
+        }
+        else
+        {
+            if (button_last_level != 0u)
+            {
+                button_last_level = 0u;
+                button_handler.debounce_counter = 0;
+            }
+            else if (button_handler.debounce_counter < BUTTON_DEBOUNCE_TICKS)
+            {
+                button_handler.debounce_counter++;
+            }
+            if (button_handler.debounce_counter >= BUTTON_DEBOUNCE_TICKS)
+            {
+                if (!button_handler.long_press_fired &&
+                    button_handler.hold_ticks < BUTTON_LONG_PRESS_TICKS)
+                {
+                    button_handler.pending_click = BUTTON_CLICK_SHORT;
+                }
+                button_handler.press_start_tick = 0;
+                button_handler.hold_ticks = 0;
+                button_handler.long_press_fired = 0;
+                button_handler.debounce_counter = 0;
+                button_handler.state = BUTTON_IDLE;
+                sKeyFlag = 0;
+            }
+        }
+        break;
+
+    default:
+        button_handler.state = BUTTON_IDLE;
+        button_handler.press_start_tick = 0;
+        button_handler.debounce_counter = 0;
+        button_handler.hold_ticks = 0;
+        button_handler.long_press_fired = 0;
+        button_handler.pending_click = BUTTON_CLICK_NONE;
+        sKeyFlag = 0;
+        break;
     }
-}  /* end Scheduler_Tick10ms() */
+}
+
+static void Button_DispatchActions(void)
+{
+    if (button_handler.pending_click == BUTTON_CLICK_NONE)
+        return;
+
+    if (button_handler.pending_click == BUTTON_CLICK_SHORT)
+    {
+        if (sys_state.power_state == POWER_STATE_RPI_OFF)
+        {
+            uint8_t allow_power_on = 1;
+            if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
+                allow_power_on = 0;
+            if (Charger_IsInfluencingVBAT(&sys_state) &&
+                !IsTrueVbatSampleFresh(sched_flags.tick_counter, state.last_true_vbat_sample_tick))
+            {
+                allow_power_on = 0;
+            }
+            if (state.battery_voltage_mv <= state.protection_voltage_mv)
+                allow_power_on = 0;
+            if (allow_power_on)
+            {
+                sys_state.power_state = POWER_STATE_RPI_ON;
+                sys_state.power_state_entry_ticks = sched_flags.tick_counter;
+                prot_state.below_threshold_count = 0;
+                sys_state.pending_power_cut = 0;
+                state.load_on_delay_remaining_sec = 0;
+                Snapshot_UpdateDerived();
+            }
+        }
+    }
+    else if (button_handler.pending_click == BUTTON_CLICK_LONG)
+    {
+        if (sys_state.power_state == POWER_STATE_RPI_ON)
+        {
+            sys_state.power_state = POWER_STATE_RPI_OFF;
+            sys_state.power_state_entry_ticks = sched_flags.tick_counter;
+            sys_state.pending_power_cut = 0;
+            state.load_on_delay_remaining_sec = 0;
+            Snapshot_UpdateDerived();
+        }
+        else if (sys_state.power_state == POWER_STATE_RPI_OFF)
+        {
+            sys_state.factory_reset_requested = 1;
+        }
+    }
+
+    button_handler.pending_click = BUTTON_CLICK_NONE;
+}
 
 /**
  * @brief ADC Initialization Function
