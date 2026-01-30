@@ -1496,7 +1496,7 @@ Created `Inc/ups_state.h` containing:
 **Phase 4 Testing Checklist** (validate on device before moving to Phase 5):
 
 - [ ] **Power state**
-  - [ ] RPI_OFF ↔ RPI_ON via button short press; 0x17 reflects state.
+  - [X] RPI_OFF ↔ RPI_ON via button short press; 0x17 reflects state.
   - [ ] LOAD_ON_DELAY: auto power-on conditions start countdown; cancel if battery drops below low (e.g. disconnect charger and battery % &lt; low).
   - [ ] LOAD_ON_DELAY → RPI_ON when countdown reaches 0 and battery_ok.
   - [ ] PROTECTION_LATCHED: battery below protection (N samples while RPI_ON) → flash save attempted, then MT_EN cut; 0x17 = 0.

@@ -163,11 +163,12 @@ uint8_t IsTrueVbatSampleFresh(uint32_t now_ticks, uint32_t last_true_vbat_sample
 uint8_t GetPowerStatusRegisterValue(const authoritative_state_t *auth_state, const system_state_t *state)
 {
     (void)auth_state;
-    if (state->learning_mode == LEARNING_ACTIVE)
-        return 0x02u; /* Learning/Calibration enabled */
+    uint8_t value = 0x00u;
     if (state->power_state == POWER_STATE_RPI_ON)
-        return 0x01u; /* Power to RPi */
-    return 0x00u;     /* No power to RPi */
+        value |= 0x01u; /* Power to RPi */
+    if (state->learning_mode == LEARNING_ACTIVE)
+        value |= 0x02u; /* Learning/Calibration enabled */
+    return value;
 }
 
 /**
@@ -444,7 +445,7 @@ static void InitAuthoritativeStateFromBuffer(void)
     state.battery_params_self_programmed = (aReceiveBuffer[REG_BATTERY_SELF_PROG] != 0) ? 1u : 0u;
     state.low_battery_percent   = aReceiveBuffer[REG_LOW_BATTERY_PERCENT];
     state.load_on_delay_config_sec = (uint16_t)aReceiveBuffer[REG_LOAD_ON_DELAY_L] | ((uint16_t)aReceiveBuffer[REG_LOAD_ON_DELAY_H] << 8);
-    sys_state.power_state       = (aReceiveBuffer[REG_POWER_STATUS] != 0) ? POWER_STATE_RPI_ON : POWER_STATE_RPI_OFF;
+    sys_state.power_state       = (aReceiveBuffer[REG_POWER_STATUS] & 0x01u) ? POWER_STATE_RPI_ON : POWER_STATE_RPI_OFF;
     sys_state.learning_mode     = (state.battery_params_self_programmed == 0) ? LEARNING_ACTIVE : LEARNING_INACTIVE;
     /* Clamp to valid ranges */
     if (!Validate_FullVoltage(state.full_voltage_mv)) state.full_voltage_mv = DEFAULT_VBAT_FULL_MV;
