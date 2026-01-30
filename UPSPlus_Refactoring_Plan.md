@@ -1712,6 +1712,18 @@ Created `Inc/ups_state.h` containing:
 
 ## Testing Checklist
 
+### Automated I2C Test Script
+- Script: `tools/testing/upsplus_i2c_test.py`
+- Purpose: Non-interactive I2C validation (register map, Factory Testing pages, RO/RW behavior, snapshot coherence checks, and state page monitoring)
+- Requirements (on target host): Python 3, I2C enabled, `smbus2` (or `smbus`)
+- Install dependency: `pip3 install smbus2`
+- Default run: `python3 tools/testing/upsplus_i2c_test.py`
+- Optional flags:
+  - `--allow-power-actions` (auto power on + load on delay write/restore)
+  - `--allow-destructive` (shutdown/restart countdowns, factory reset)
+  - `--state-monitor-seconds <sec>` (default 5.0)
+  - `--state-monitor-interval <sec>` (default 0.2)
+
 ### I2C Testing
 - [ ] All registers readable with correct values
 - [ ] RO registers ignore writes
