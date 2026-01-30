@@ -33,8 +33,6 @@ void CheckPowerOnConditions(void);
 #define VBAT_PROTECT_VOLTAGE 2800
 #define VBAT_LOW_PERCENT 10
 #define LOAD_ON_DELAY_TIME 60
-#define VBAT_MAX_VOLTAGE 3000
-#define VBAT_MIN_VOLTAGE 4200
 #define IP_REFRESH_TIME 2
 
 /* Everything below needs to be mapped to registers */
@@ -64,14 +62,17 @@ __IO pFunction JumpToAplication;
 
 /*===========================================================================*/
 /* Phase 2: Authoritative state, system state, snapshot (single source)     */
+/* Phase 4: State machine runtime - window manager, charger physical,      */
+/*          protection (single place for transitions + entry/exit actions)  */
 /*===========================================================================*/
 static authoritative_state_t state;
 static system_state_t sys_state;
 static snapshot_buffer_t snapshot;
+static window_manager_state_t window_mgr;
+static charger_physical_state_t charger_physical;
+static protection_state_t prot_state;
 
-/* Phase 2.2: Double-buffered register image for coherent I2C multi-byte reads. Snapshot_Update
- * writes into reg_image[inactive], then flips active_reg_image. ISR latches on ADDR+READ and
- * transmits from reg_image[latched]. aReceiveBuffer is used for flash load only, never for I2C reads. */
+/* Phase 2.2: Double-buffered register image. Snapshot_Update fills reg_image; main copies to aReceiveBuffer for I2C TX. */
 uint8_t reg_image[2][256];
 volatile uint8_t active_reg_image = 0;
 
@@ -84,7 +85,6 @@ volatile uint32_t adc_sample_seq = 0;
  * For coarse 100ms/500ms tasks usually acceptable; for never-miss semantics consider
  * counters (increment in ISR) or copy+clear in one short critical section in main. */
 static scheduler_flags_t sched_flags;
-static scheduler_counters_t sched_counters;
 /* Main loop derives tick_1s from tick_100ms (10 pulses = 1s) */
 static uint8_t tick_100ms_count = 0;
 
@@ -93,9 +93,15 @@ static volatile uint8_t flash_save_requested = 0;
 /* OTA requested via I2C write 127 to register 0x32 (50) */
 static volatile uint8_t ota_triggered = 0;
 
+/* Restart power-cycle state machine: MT_EN low for 5s then RPI_ON (non-blocking) */
+#define RESTART_POWER_OFF_TICKS  (5u * TICKS_PER_1S)  /* 5 seconds in 10ms ticks */
+static uint8_t restart_phase = 0;       /* 0=idle, 1=MT_EN low, counting down */
+static uint16_t restart_remaining_ticks = 0;
+
 static void InitAuthoritativeStateFromDefaults(void);
 static void ProcessI2CPendingWrite(void);
 static void Scheduler_Tick10ms(void);
+static void PowerStateMachine_OnTick1s(void);
 
 /*===========================================================================*/
 /* Phase 2: Validation functions (register bounds, RO enforcement in apply)  */
@@ -137,6 +143,21 @@ uint8_t Validate_LoadOnDelay(uint16_t value)
 }
 
 /*===========================================================================*/
+/* Phase 4: State machine helpers (declared in ups_state.h)                   */
+/*===========================================================================*/
+uint8_t Charger_IsInfluencingVBAT(const system_state_t *s)
+{
+    return (s->charger_state == CHARGER_STATE_PRESENT) ? 1u : 0u;
+}
+
+uint8_t IsTrueVbatSampleFresh(uint32_t now_ticks, uint32_t last_true_vbat_sample_tick)
+{
+    /* Unsigned wrap gives correct age when tick_counter has wrapped */
+    uint32_t age_ticks = now_ticks - last_true_vbat_sample_tick;
+    return (age_ticks <= TRUE_VBAT_MAX_AGE_TICKS) ? 1u : 0u;
+}
+
+/*===========================================================================*/
 /* Phase 2: Register 0x17 derivation and register image fill                 */
 /*===========================================================================*/
 uint8_t GetPowerStatusRegisterValue(const authoritative_state_t *auth_state, const system_state_t *state)
@@ -158,7 +179,7 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
 {
     uint16_t u16;
     uint32_t u32;
-    uint8_t i;
+    uint16_t i;
 
     buf[REG_MCU_VOLTAGE_L]       = (uint8_t)(auth->mcu_voltage_mv & 0xFFu);
     buf[REG_MCU_VOLTAGE_H]       = (uint8_t)((auth->mcu_voltage_mv >> 8) & 0xFFu);
@@ -397,6 +418,19 @@ static void InitAuthoritativeStateFromDefaults(void)
     sys_state.charger_state_entry_ticks = 0;
     sys_state.factory_reset_requested = 0;
     sys_state.pending_power_cut = 0;
+
+    /* Phase 4: State machine runtime */
+    window_mgr.window_due = 0;
+    window_mgr.window_active = 0;
+    window_mgr.last_window_end_ticks = 0;
+    window_mgr.window_start_ticks = 0;
+    charger_physical.charger_physically_present = 0;
+    charger_physical.charger_stability_count = 0;
+    charger_physical.charger_last_seen_seq = 0;
+    prot_state.below_threshold_count = 0;
+    prot_state.protection_active = 0;
+    prot_state.last_adc_battery_mv = 0;
+    prot_state.last_seen_seq = 0;
 }
 
 /* Apply persisted register buffer (from flash) to state; call after GetRegValue() when flash was valid */
@@ -419,6 +453,9 @@ static void InitAuthoritativeStateFromBuffer(void)
     if (state.empty_voltage_mv < state.protection_voltage_mv) state.empty_voltage_mv = state.protection_voltage_mv;
     if (!Validate_SamplePeriod(state.sample_period_minutes)) state.sample_period_minutes = DEFAULT_SAMPLE_PERIOD_MIN;
     if (state.low_battery_percent > 100u) state.low_battery_percent = DEFAULT_LOW_BATTERY_PERCENT;
+    /* Runtime-only: countdowns must not restore from flash; zero after load */
+    state.shutdown_countdown_sec = 0;
+    state.restart_countdown_sec = 0;
 }
 
 void NVIC_SetVectorTable(void)
@@ -458,6 +495,7 @@ int main(void)
     Snapshot_Init();
     sys_state.factory_reset_requested = 0;
 
+    /* Allow power rails / I2C pull-ups to settle before main loop; remove or reduce if not required on target hardware. */
     LL_mDelay(100);
 
     //__enable_irq(); /* Enable interrupts after initialization */
@@ -493,41 +531,14 @@ int main(void)
             if (sys_state.power_state == POWER_STATE_RPI_ON)
             {
                 state.current_runtime_sec++;
-                if (state.usbc_voltage_mv > 4000 || state.microusb_voltage_mv > 4000)
+                if (Charger_IsInfluencingVBAT(&sys_state))
                     state.charging_time_sec++;
             }
             else
             {
                 state.current_runtime_sec = 0;
             }
-            /* Countdowns: check actions first, then decrement (so == 1 is never skipped) */
-            if (state.shutdown_countdown_sec == 1)
-            {
-                sys_state.power_state = POWER_STATE_RPI_OFF;
-                state.shutdown_countdown_sec = 0;
-            }
-            else if (state.shutdown_countdown_sec > 1)
-                state.shutdown_countdown_sec--;
-            /* Restart: when countdown reaches 1, power cycle RPi (MT_EN low 5s then high) and clear.
-             * Risk: __disable_irq() for full 5s stalls TIM1, I2C; Phase 4: make non-blocking. */
-            if (state.restart_countdown_sec == 1)
-            {
-                __disable_irq();
-                LL_GPIO_ResetOutputPin(GPIOA, MT_EN);
-                LL_mDelay(5000);
-                LL_GPIO_SetOutputPin(GPIOA, MT_EN);
-                sys_state.power_state = POWER_STATE_RPI_ON;
-                state.restart_countdown_sec = 0;
-                __enable_irq();
-            }
-            else if (state.restart_countdown_sec > 1)
-                state.restart_countdown_sec--;
-            if (state.load_on_delay_remaining_sec != 0)
-            {
-                state.load_on_delay_remaining_sec--;
-                if (state.load_on_delay_remaining_sec == 0 && state.battery_percent > state.low_battery_percent)
-                    sys_state.power_state = POWER_STATE_RPI_ON;
-            }
+            PowerStateMachine_OnTick1s();
             Snapshot_Update();
             sched_flags.tick_1s = 0;
         }
@@ -535,11 +546,18 @@ int main(void)
         /* Phase 2: Apply I2C writes to authoritative state (RO rejected, bounds checked) */
         ProcessI2CPendingWrite();
 
+        /* Invariant A6: attempt flash commit first; only then cut MT_EN (set PROTECTION_LATCHED) */
         if (flash_save_requested)
         {
             flash_save_requested = 0;
             Snapshot_Update();
             StorRegValue();
+            if (sys_state.pending_power_cut)
+            {
+                sys_state.power_state = POWER_STATE_PROTECTION_LATCHED;
+                sys_state.power_state_entry_ticks = sched_flags.tick_counter;
+                sys_state.pending_power_cut = 0;
+            }
         }
 
         /* Factory reset requested via I2C 0x1B */
@@ -572,6 +590,23 @@ int main(void)
                 state.battery_voltage_mv = VBAT_MIN_VALID_MV;
             UpdateBatteryMinMax();
             UpdateBatteryPercentage();
+            /* Phase 4: True-VBAT sample tick when charger not influencing (for staleness gating).
+             * Intentional mismatch: freshness uses Charger_IsInfluencingVBAT; percent uses VBUS heuristic per B8. */
+            if (!Charger_IsInfluencingVBAT(&sys_state))
+                state.last_true_vbat_sample_tick = sched_flags.tick_counter;
+            /* Protection: only update on new ADC sample (this block is adc_ready; do not move counter elsewhere) */
+            prot_state.last_adc_battery_mv = state.battery_voltage_mv;
+            if (sys_state.power_state == POWER_STATE_RPI_ON)
+            {
+                if (state.battery_voltage_mv <= state.protection_voltage_mv)
+                {
+                    prot_state.below_threshold_count++;
+                    if (prot_state.below_threshold_count > PROTECTION_SAMPLES_REQUIRED)
+                        prot_state.below_threshold_count = PROTECTION_SAMPLES_REQUIRED;
+                }
+                else if (state.battery_voltage_mv > state.protection_voltage_mv + PROTECTION_HYSTERESIS_MV)
+                    prot_state.below_threshold_count = 0;
+            }
             Snapshot_Update();
             adc_sample_seq++;
             adc_ready = 0;
@@ -590,28 +625,90 @@ int main(void)
                 ;
         }
 
-        /* Button short press: toggle RPi power */
+        /* Button short press: toggle RPi power; entry to RPI_ON resets protection count */
         if (sKeyClick == 1)
         {
             sKeyClick = 0;
-            sys_state.power_state = (sys_state.power_state == POWER_STATE_RPI_ON) ? POWER_STATE_RPI_OFF : POWER_STATE_RPI_ON;
+            if (sys_state.power_state == POWER_STATE_RPI_ON)
+                sys_state.power_state = POWER_STATE_RPI_OFF;
+            else
+            {
+                sys_state.power_state = POWER_STATE_RPI_ON;
+                sys_state.power_state_entry_ticks = sched_flags.tick_counter;
+                prot_state.below_threshold_count = 0;
+            }
             Snapshot_Update();
         }
     }
 }
 
+/**
+ * Phase 4: Check power-on conditions with explicit state transitions and
+ * staleness gating. RPI_OFF -> LOAD_ON_DELAY when conditions met (and true-VBAT
+ * fresh if charger present). LOAD_ON_DELAY -> RPI_OFF when conditions no longer met.
+ */
 void CheckPowerOnConditions(void)
 {
-    uint8_t isCharging = (state.microusb_voltage_mv > 4000 || state.usbc_voltage_mv > 4000);
-    uint8_t batteryOk = (state.battery_percent > state.low_battery_percent);
+    if (!state.auto_power_on)
+        return;
 
-    if (state.load_on_delay_remaining_sec != 0)
+    uint32_t now_ticks = sched_flags.tick_counter;
+    uint8_t battery_ok = (state.battery_percent > state.low_battery_percent);
+    /* Charger physically connected (PRESENT or FORCED_OFF_WINDOW); distinct from Charger_IsInfluencingVBAT */
+    uint8_t charger_present = (sys_state.charger_state == CHARGER_STATE_PRESENT ||
+                              sys_state.charger_state == CHARGER_STATE_FORCED_OFF_WINDOW);
+    uint8_t true_vbat_fresh = IsTrueVbatSampleFresh(now_ticks, state.last_true_vbat_sample_tick);
+
+    if (sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
     {
-        if (!isCharging && !batteryOk)
+        /* Cancel if any required condition fails (plan: battery % must be > low for power decisions) */
+        if (!battery_ok)
+        {
+            sys_state.power_state = POWER_STATE_RPI_OFF;
+            sys_state.power_state_entry_ticks = now_ticks;
             state.load_on_delay_remaining_sec = 0;
+        }
+        return;
     }
-    else if (isCharging && sys_state.power_state != POWER_STATE_RPI_ON && batteryOk)
+
+    if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
     {
+        /* Staleness: if charger present, require fresh true-VBAT for percent-based decision */
+        if (charger_present && battery_ok && true_vbat_fresh)
+        {
+            sys_state.power_state = POWER_STATE_LOAD_ON_DELAY;
+            sys_state.power_state_entry_ticks = now_ticks;
+            state.load_on_delay_remaining_sec = state.load_on_delay_config_sec;
+            sys_state.pending_power_cut = 0;
+            prot_state.below_threshold_count = 0;
+        }
+        else
+        {
+            sys_state.power_state = POWER_STATE_RPI_OFF;
+            sys_state.power_state_entry_ticks = now_ticks;
+            sys_state.pending_power_cut = 0;
+            prot_state.below_threshold_count = 0;
+        }
+        return;
+    }
+
+    if (sys_state.power_state != POWER_STATE_RPI_OFF)
+        return;
+
+    /* Staleness gate: if charger present, require fresh true-VBAT before auto power-on */
+    if (sys_state.charger_state == CHARGER_STATE_PRESENT && !true_vbat_fresh)
+    {
+        /* Plan: force measurement window ASAP so we get fresh true-VBAT */
+        if (!window_mgr.window_active)
+            window_mgr.window_due = 1;
+        return;
+    }
+
+    /* Allow transition when battery_ok (battery % > low) */
+    if (battery_ok)
+    {
+        sys_state.power_state = POWER_STATE_LOAD_ON_DELAY;
+        sys_state.power_state_entry_ticks = now_ticks;
         state.load_on_delay_remaining_sec = state.load_on_delay_config_sec;
     }
 }
@@ -629,6 +726,25 @@ void FactoryReset(void)
     state.battery_params_self_programmed = 1;
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.learning_mode = LEARNING_INACTIVE;
+
+    /* Phase 4: Reset runtime/state-machine variables so FSM is in known-safe state */
+    sys_state.charger_state = CHARGER_STATE_ABSENT;
+    sys_state.charger_state_entry_ticks = 0;
+    sys_state.power_state_entry_ticks = 0;
+    sys_state.pending_power_cut = 0;
+    window_mgr.window_due = 0;
+    window_mgr.window_active = 0;
+    window_mgr.last_window_end_ticks = 0;
+    window_mgr.window_start_ticks = 0;
+    charger_physical.charger_physically_present = 0;
+    charger_physical.charger_stability_count = 0;
+    charger_physical.charger_last_seen_seq = 0;
+    prot_state.below_threshold_count = 0;
+    prot_state.protection_active = 0;
+    prot_state.last_adc_battery_mv = 0;
+    prot_state.last_seen_seq = 0;
+    restart_phase = 0;
+    restart_remaining_ticks = 0;
 }
 
 void StorRegValue(void)
@@ -778,8 +894,11 @@ void UpdateBatteryPercentage(void)
     uint16_t percentage = (uint16_t)(((uint32_t)(state.battery_voltage_mv - state.empty_voltage_mv) * 100u) / (uint32_t)range);
     if (percentage > 100u)
         percentage = 100u;
-    if (percentage > 0 && percentage < 100)
+    /* 0% and 100%: same heuristic as 1–99%; display converges when conditions allow. No separate clamp. */
+    if (percentage >= 0 && percentage <= 100)
     {
+        /* Per B8: voltage heuristic (not Charger_IsInfluencingVBAT) to avoid long stale percent when on charger.
+         * During FORCED_OFF_WINDOW VBUS may still be high; percent may treat as charging—intentional per B8. */
         uint8_t charging = (state.microusb_voltage_mv > 4000 || state.usbc_voltage_mv > 4000);
         if (charging && percentage > state.battery_percent)
             state.battery_percent = (uint8_t)percentage;
@@ -827,96 +946,218 @@ void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
     }
 }
 
-/* Phase 3: Scheduler tasks (run from main loop when flags set). Called when sched_flags.tick_10ms.
- * Measurement window: one active flag + sched_counters.measurement_window_ticks; keep non-nested
- * / non-retriggered when moving to explicit state machine (Phase 4+). */
-#define SAMPLE_PERIOD_TICKS_PER_MIN  (6000u)  /* 10ms ticks per minute: 60 * TICKS_PER_1S */
-static uint8_t measurement_window_active = 0;
+/* Phase 4: Scheduler uses explicit state machine (power, charger, protection). */
+#define SAMPLE_PERIOD_TICKS_PER_MIN  ((uint32_t)(60u * TICKS_PER_1S))
 
-static void Scheduler_Tick10ms(void)
+/* MT_EN: restart phase overrides (MT_EN low for 5s); else driven by power_state.
+ * Protection cut happens only after flash commit in main loop; see pending_power_cut. */
+static void ApplyGPIOFromState(void)
 {
-    /* Protection check */
-    if (state.battery_voltage_mv > 1000 && (state.microusb_voltage_mv + state.usbc_voltage_mv) < 4000)
-    {
-        if (state.battery_voltage_mv < state.protection_voltage_mv)
-        {
-            if (sys_state.power_state == POWER_STATE_RPI_ON)
-                flash_save_requested = 1;
-            sys_state.power_state = POWER_STATE_RPI_OFF;
-        }
-    }
-    if (sys_state.power_state == POWER_STATE_RPI_ON)
+    if (restart_phase != 0)
+        LL_GPIO_ResetOutputPin(GPIOA, MT_EN);
+    else if (sys_state.power_state == POWER_STATE_RPI_ON)
         LL_GPIO_SetOutputPin(GPIOA, MT_EN);
     else
         LL_GPIO_ResetOutputPin(GPIOA, MT_EN);
+    /* IP_EN HIGH only when PRESENT; ABSENT and FORCED_OFF_WINDOW both drive IP_EN low (intentional) */
+    if (sys_state.charger_state == CHARGER_STATE_PRESENT)
+        LL_GPIO_SetOutputPin(GPIOA, IP_EN);
+    else
+        LL_GPIO_ResetOutputPin(GPIOA, IP_EN);
+    LL_GPIO_SetOutputPin(GPIOA, PWR_EN);
+}
 
-    /* Measurement window and sample period (IP_EN) */
-    if (state.usbc_voltage_mv > 3000 || state.microusb_voltage_mv > 3000 || sys_state.power_state == POWER_STATE_RPI_ON)
+static void Protection_Step(void)
+{
+    if (sys_state.power_state != POWER_STATE_RPI_ON)
+        return;
+    if (state.battery_voltage_mv <= 1000u)
+        return;
+    /* Use charger state, not voltage heuristic (plan: true-VBAT / protection when not charging) */
+    if (Charger_IsInfluencingVBAT(&sys_state))
+        return;
+    if (prot_state.below_threshold_count < PROTECTION_SAMPLES_REQUIRED)
+        return;
+    /* Invariant A6: request flash, set pending_power_cut; main loop commits then sets PROTECTION_LATCHED */
+    flash_save_requested = 1;
+    sys_state.pending_power_cut = 1;
+}
+
+static void ChargerStateMachine_Step(void)
+{
+    uint32_t tick = sched_flags.tick_counter;
+    uint16_t charger_mv = UpsChargerVoltageMv(&state);
+
+    if (sys_state.charger_state == CHARGER_STATE_FORCED_OFF_WINDOW)
     {
-        sIPIdleTicks = 0;
-        if (measurement_window_active)
+        uint32_t elapsed = tick - sys_state.charger_state_entry_ticks;
+        if (elapsed >= MEASUREMENT_WINDOW_TICKS)
         {
-            sched_counters.measurement_window_ticks++;
-            LL_GPIO_ResetOutputPin(GPIOA, IP_EN);
-            if (sched_counters.measurement_window_ticks >= MEASUREMENT_WINDOW_TICKS)
-            {
-                measurement_window_active = 0;
-                sched_counters.sample_period_elapsed_ticks = 0;
-                LL_GPIO_SetOutputPin(GPIOA, IP_EN);
-                flash_save_requested = 1;
-                MustRefreshVDD = 1;
-            }
+            window_mgr.window_active = 0;
+            window_mgr.last_window_end_ticks = tick;
+            /* Unplug mid-window: decide PRESENT vs ABSENT from current voltage at window end.
+             * Hysteresis: ABSENT uses > ON_MV for detection; here >= OFF_MV = still present (no 1mV gap). */
+            if (charger_mv >= CHARGER_PRESENT_OFF_MV)
+                sys_state.charger_state = CHARGER_STATE_PRESENT;
+            else
+                sys_state.charger_state = CHARGER_STATE_ABSENT;
+            sys_state.charger_state_entry_ticks = tick;
+            /* No flash save here: charger_state/window_mgr are runtime-only (B9); saves at window end would increase wear with no persistence benefit. */
+            MustRefreshVDD = 1;
         }
-        else
-        {
-            sched_counters.sample_period_elapsed_ticks++;
-            if (sched_counters.sample_period_elapsed_ticks > 0 && sched_counters.sample_period_elapsed_ticks < 12000u)
-            {
-                /* 523 is a prime number; every time interval of this length, re-trigger the button. */
-                if (((sched_counters.sample_period_elapsed_ticks + 520) % 523) == 0)
-                {
-                    LL_GPIO_ResetOutputPin(GPIOA, IP_EN);
-                }
-                else if (((sched_counters.sample_period_elapsed_ticks + 520) % 523) == 20)
-                {
-                    LL_GPIO_SetOutputPin(GPIOA, IP_EN);
-                }
-            }
-            /*
-            * Periodically perform a brief power interruption for 1.5seconds
-            */
-            else if (sched_counters.sample_period_elapsed_ticks >= SAMPLE_PERIOD_TICKS_PER_MIN * (uint32_t)state.sample_period_minutes &&
-                     sched_counters.sample_period_elapsed_ticks < (SAMPLE_PERIOD_TICKS_PER_MIN * (uint32_t)state.sample_period_minutes) + MEASUREMENT_WINDOW_TICKS)
-            {
-                if (!measurement_window_active)
-                {
-                    measurement_window_active = 1;
-                    sched_counters.measurement_window_ticks = 0;
-                }
-                LL_GPIO_ResetOutputPin(GPIOA, IP_EN);
-            }
-            else if (sched_counters.sample_period_elapsed_ticks >= (SAMPLE_PERIOD_TICKS_PER_MIN * (uint32_t)state.sample_period_minutes) + MEASUREMENT_WINDOW_TICKS)
-            {
-                sched_counters.sample_period_elapsed_ticks = 0;
-                LL_GPIO_SetOutputPin(GPIOA, IP_EN);
-                // At this time, also save the registers while we’re at it.
-                flash_save_requested = 1;
-                MustRefreshVDD = 1;
-            }
-        }
-    }  /* end if (charger present or RPi on) */
+    }
     else
     {
-        sched_counters.sample_period_elapsed_ticks = 0;
+        if (adc_sample_seq != charger_physical.charger_last_seen_seq)
+        {
+            charger_physical.charger_last_seen_seq = adc_sample_seq;
+            if (charger_mv > CHARGER_PRESENT_ON_MV)
+                charger_physical.charger_physically_present = 1;
+            else if (charger_mv < CHARGER_PRESENT_OFF_MV)
+                charger_physical.charger_physically_present = 0;
+
+            if (sys_state.charger_state == CHARGER_STATE_ABSENT)
+            {
+                if (charger_mv > CHARGER_PRESENT_ON_MV)
+                {
+                    charger_physical.charger_stability_count++;
+                    if (charger_physical.charger_stability_count >= CHARGER_STABILITY_SAMPLES)
+                    {
+                        sys_state.charger_state = CHARGER_STATE_PRESENT;
+                        sys_state.charger_state_entry_ticks = tick;
+                        charger_physical.charger_stability_count = 0;
+                        charger_physical.charger_physically_present = 1;
+                    }
+                }
+                else
+                    charger_physical.charger_stability_count = 0;
+            }
+            else if (sys_state.charger_state == CHARGER_STATE_PRESENT)
+            {
+                if (charger_mv < CHARGER_PRESENT_OFF_MV)
+                {
+                    charger_physical.charger_stability_count++;
+                    if (charger_physical.charger_stability_count >= CHARGER_STABILITY_SAMPLES)
+                    {
+                        sys_state.charger_state = CHARGER_STATE_ABSENT;
+                        sys_state.charger_state_entry_ticks = tick;
+                        charger_physical.charger_stability_count = 0;
+                        charger_physical.charger_physically_present = 0;
+                    }
+                }
+                else
+                    charger_physical.charger_stability_count = 0;
+            }
+        }
+
+        if (sys_state.charger_state == CHARGER_STATE_PRESENT && !window_mgr.window_active)
+        {
+            uint32_t elapsed_since = tick - window_mgr.last_window_end_ticks;
+            uint32_t period_ticks = SAMPLE_PERIOD_TICKS_PER_MIN * (uint32_t)state.sample_period_minutes;
+            if (elapsed_since >= period_ticks)
+                window_mgr.window_due = 1;
+        }
+
+        if (sys_state.charger_state == CHARGER_STATE_PRESENT && window_mgr.window_due && !window_mgr.window_active)
+        {
+            sys_state.charger_state = CHARGER_STATE_FORCED_OFF_WINDOW;
+            sys_state.charger_state_entry_ticks = tick;
+            window_mgr.window_due = 0;
+            window_mgr.window_active = 1;
+            window_mgr.window_start_ticks = tick;
+            charger_physical.charger_stability_count = 0;  /* Defensive cleanup on window entry */
+        }
+    }
+
+    if (sys_state.charger_state != CHARGER_STATE_ABSENT || sys_state.power_state == POWER_STATE_RPI_ON)
+        sIPIdleTicks = 0;
+    else
+    {
         sIPIdleTicks++;
-        if (sIPIdleTicks > 0x1000)
+        if (sIPIdleTicks > 0x1000u)
         {
             sIPIdleTicks = 0;
             MustRefreshVDD = 1;
         }
     }
+}
 
-    /* Button debounce (tick_10ms) - still inside Scheduler_Tick10ms() */
+/**
+ * Restart power-cycle step: when in restart phase, count down 10ms ticks;
+ * at 0 transition to RPI_ON (entry: reset protection count). Runs every 10ms.
+ */
+static void RestartPowerCycle_Step(void)
+{
+    if (restart_phase == 0)
+        return;
+    if (restart_remaining_ticks == 0)
+        return;
+    restart_remaining_ticks--;
+    if (restart_remaining_ticks == 0)
+    {
+        restart_phase = 0;
+        sys_state.power_state = POWER_STATE_RPI_ON;
+        sys_state.power_state_entry_ticks = sched_flags.tick_counter;
+        prot_state.below_threshold_count = 0;
+    }
+}
+
+static void PowerStateMachine_Step(void)
+{
+    RestartPowerCycle_Step();
+    Protection_Step();
+}
+
+/**
+ * Phase 4: Power FSM tick_1s - countdown decrements and transitions (single place).
+ * Entry to RPI_ON resets protection sample count so N samples are observed while on.
+ */
+static void PowerStateMachine_OnTick1s(void)
+{
+    /* Shutdown countdown: action at 1, then clear; else decrement */
+    if (state.shutdown_countdown_sec == 1)
+    {
+        sys_state.power_state = POWER_STATE_RPI_OFF;
+        sys_state.power_state_entry_ticks = sched_flags.tick_counter;
+        state.shutdown_countdown_sec = 0;
+    }
+    else if (state.shutdown_countdown_sec > 1)
+        state.shutdown_countdown_sec--;
+
+    /* Restart countdown: at 1 start non-blocking power-cycle (MT_EN low 5s then RPI_ON) */
+    if (state.restart_countdown_sec == 1)
+    {
+        state.restart_countdown_sec = 0;
+        restart_phase = 1;
+        restart_remaining_ticks = RESTART_POWER_OFF_TICKS;
+        sys_state.power_state = POWER_STATE_RPI_OFF;  /* 0x17 reports no power during cycle */
+        sys_state.power_state_entry_ticks = sched_flags.tick_counter;
+    }
+    else if (state.restart_countdown_sec > 1)
+        state.restart_countdown_sec--;
+
+    /* Load-on-delay: decrement; at 0 and battery_ok -> RPI_ON with entry action */
+    if (state.load_on_delay_remaining_sec != 0)
+    {
+        state.load_on_delay_remaining_sec--;
+        if (state.load_on_delay_remaining_sec == 0 &&
+            state.battery_percent > state.low_battery_percent)
+        {
+            sys_state.power_state = POWER_STATE_RPI_ON;
+            sys_state.power_state_entry_ticks = sched_flags.tick_counter;
+            prot_state.below_threshold_count = 0;
+        }
+    }
+}
+
+static void Scheduler_Tick10ms(void)
+{
+    PowerStateMachine_Step();
+    ChargerStateMachine_Step();
+    /* Single place for GPIO: reflects power state and charger state after both FSM steps */
+    ApplyGPIOFromState();
+
+    /* Button debounce (tick_10ms) */
     if (sKeyFlag)
     {
         if (!LL_GPIO_IsInputPinSet(GPIOB, LL_GPIO_PIN_1))

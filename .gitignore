@@ -6,3 +6,4 @@ firmware.bin
 .project
 .DS_Store
 .cproject
+*.launch

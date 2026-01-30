@@ -274,6 +274,7 @@ typedef enum {
  * threshold checks in the charger FSM.
  */
 typedef struct {
+    /* Diagnostic only: not used for FSM decisions (stability + current charger_mv at window end drive state). */
     uint8_t charger_physically_present;  /* 1 = VBUS/USBIN above threshold, 0 = absent */
     uint8_t charger_stability_count;     /* Consecutive ADC samples (gated by adc_sample_seq) */
     uint32_t charger_last_seen_seq;     /* Last adc_sample_seq for charger detection */
@@ -325,7 +326,7 @@ typedef struct {
     charger_state_t charger_state;
     learning_mode_t learning_mode;     /* Derived from battery_params_self_programmed; never set directly */
     
-    /* State timing (in TIM1 ticks) */
+    /* State timing (in TIM1 ticks). Invariant: set on every transition into that state (including restart start, charger PRESENT/ABSENT, power RPI_ON/RPI_OFF). */
     uint32_t power_state_entry_ticks;
     uint32_t charger_state_entry_ticks;
     
@@ -549,17 +550,6 @@ typedef struct {
     volatile uint8_t tick_1s;      /* Derived by main from tick_100ms (10 pulses = 1s), cleared by main loop */
     volatile uint32_t tick_counter; /* Free-running 10ms counter (monotonic, never cleared) */
 } scheduler_flags_t;
-
-/**
- * @brief Scheduler Counters - For periodic task timing (Phase 3)
- *
- * Used by main loop for measurement window (1.5s), sample period, and related timing.
- */
-typedef struct {
-    uint32_t sample_period_elapsed_ticks;  /* TIM1 ticks (10ms) since last measurement window ended */
-    uint32_t measurement_window_ticks;    /* Ticks elapsed in current window (0..MEASUREMENT_WINDOW_TICKS) */
-    uint32_t last_flash_write_tick;       /* Last flash write tick (for rate limiting) */
-} scheduler_counters_t;
 
 /*===========================================================================*/
 /*                         I2C PENDING WRITE STRUCTURE                        */
@@ -828,9 +818,6 @@ uint8_t Charger_IsInfluencingVBAT(const system_state_t *state);
  * so that modulo-2^32 subtraction yields correct age when tick_counter has wrapped. */
 uint8_t IsTrueVbatSampleFresh(uint32_t now_ticks, uint32_t last_true_vbat_sample_tick);
 /* Returns 1 if fresh, 0 if stale */
-
-/* Timing - returns TIM1 tick counter (10ms resolution) */
-uint32_t GetCurrentTick(void);
 
 #ifdef __cplusplus
 }

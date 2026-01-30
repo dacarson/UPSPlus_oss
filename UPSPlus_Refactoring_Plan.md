@@ -73,7 +73,7 @@ typedef enum {
     - Defer any auto-power-on decision until a fresh true-VBAT sample is captured and battery_percent is updated from it.
   - **Battery percent staleness enforcement**: Any power decision that depends on percent must also require `last_true_vbat_sample_tick` to be "fresh enough" if the charger is present. This is a hard gate in `CheckPowerOnConditions()`.
 - `LOAD_ON_DELAY` → `RPI_ON`: Delay elapsed AND conditions still met
-- `LOAD_ON_DELAY` → `RPI_OFF`: Conditions no longer met (battery dropped, charger disconnected)
+- `LOAD_ON_DELAY` → `RPI_OFF`: Battery % drops below low (cancel is battery-only; charger disconnect does not cancel)
 - `RPI_ON` → `PROTECTION_LATCHED`: Battery voltage ≤ Protection Voltage (with hysteresis, N consecutive samples)
 - `RPI_ON` → `RPI_OFF`: Button short press (toggle)
 - `PROTECTION_LATCHED` → `LOAD_ON_DELAY`: Charger connected AND battery % > threshold AND AutoPowerOn enabled
@@ -831,6 +831,8 @@ typedef struct {
 } scheduler_counters_t;
 ```
 
+**Note**: Phase 4 uses `window_manager_state_t` for measurement window timing; `scheduler_counters_t` was removed from the codebase (can be re-added if needed).
+
 ---
 
 ## Flash Persistence
@@ -1063,8 +1065,8 @@ bool is_charging(void) {
 - **Canonical true-VBAT definition**: A "true VBAT" sample is any ADC sample taken when `charger_state != CHARGER_STATE_PRESENT` (i.e., charger path not influencing the battery node). This includes:
   - `CHARGER_STATE_ABSENT` (no charger connected), and
   - `CHARGER_STATE_FORCED_OFF_WINDOW` (charger connected but charger path disabled via IP_EN).
-- Therefore battery percent updates and VBAT-based learning must use only samples taken when `charger_state == ABSENT` or `charger_state == FORCED_OFF_WINDOW`
-- Battery percentage calculated only when NOT charging (i.e., when charger_state != PRESENT)
+- Therefore VBAT-based learning must use only samples taken when `charger_state == ABSENT` or `charger_state == FORCED_OFF_WINDOW`.
+- **Battery percentage update policy**: Per **B8 (Decisions Locked)**, battery percentage updates do **not** gate on `charger_state != PRESENT`. The UPS is often on charger for long periods and the sampling interval is user-defined; gating percent on true-VBAT only would yield long periods of stale percentage. The implementation uses a voltage heuristic for "charging" in `UpdateBatteryPercentage()` and may update percent when that heuristic indicates not charging; see B8.
 
 **Note**: True VBAT condition is defined by charger path state (`charger_state != PRESENT`), not by VBUS voltage reading. A charger may be physically plugged in (VBUS reads high) but IP_EN is LOW during measurement window, allowing true VBAT measurement.
 
@@ -1259,7 +1261,7 @@ This avoids the trap where you cut power and then never get to write.
 **Behavior**:
 - Start countdown when conditions met
 - Countdown duration: Load On Delay seconds
-- If conditions change (battery drops, charger disconnected), reset countdown
+- Cancel countdown only when battery % drops below low (battery-only; charger disconnect does not cancel)
 - When countdown completes, enable RPi power if conditions still met
 
 ---
@@ -1405,7 +1407,7 @@ Created `Inc/ups_state.h` containing:
 - Authoritative state structure (`authoritative_state_t`) - single source of truth
 - Snapshot buffer structure (`snapshot_buffer_t`) for double-buffered I2C coherence
 - Flash persistence structure (`flash_persistent_data_t`) with A/B slot support
-- Scheduler structures (`scheduler_flags_t`, `scheduler_counters_t`)
+- Scheduler structures (`scheduler_flags_t`; `scheduler_counters_t` removed in Phase 4—window_mgr used; can be re-added if needed)
 - I2C pending write structure (`i2c_pending_write_t`)
 - Protection state structure (`protection_state_t`)
 - Button handler structure (`button_handler_t`)
@@ -1436,11 +1438,12 @@ Created `Inc/ups_state.h` containing:
 
 **Implementation Notes (Phase 2)**:
 - **Authoritative state** (`main.c`): `state` (`authoritative_state_t`) and `sys_state` (`system_state_t`) are the single source of truth. All former globals (uXXXVolt, counters, mode flags) removed as authoritative; only timing helpers remain (`CountDownPowerOffTicks`, `CountDownRebootTicks`, `sKeyFlag`, etc.) with comments that real countdown/state lives in `state`/`sys_state`.
-- **Snapshot mechanism**: Double-buffered register image `reg_image[2][256]` and `volatile uint8_t active_reg_image`. `Snapshot_Update()` builds into `reg_image[inactive]` via `StateToRegisterBuffer()`, then atomically flips `active_reg_image`. `aReceiveBuffer` is used for flash load (`GetRegValue`) only; I2C reads use `reg_image` only. `Snapshot_Update()` is called only on state changes (ADC processed, 1s tick, I2C write applied, flash save, factory reset, OTA, countdown actions, button toggle)—no unconditional per-loop update.
-- **I2C coherence**: In `I2C_Slave.c`, on ADDR+READ the ISR latches `latched_reg_image = active_reg_image`; TX transmits from `reg_image[latched_reg_image][uI2CRegIndex++]` for the whole transaction, ensuring coherent multi-byte reads.
+- **Snapshot mechanism**: Double-buffered register image `reg_image[2][256]` (volatile) and `volatile uint8_t active_reg_image`. `Snapshot_Update()` builds into `reg_image[inactive]` via `StateToRegisterBuffer()`, then atomically flips `active_reg_image`, then copies `reg_image[active_reg_image]` to `aReceiveBuffer` so I2C TX sees current data. `aReceiveBuffer` is used for flash load (`GetRegValue`) and for I2C TX; main keeps it in sync in `Snapshot_Init()` and `Snapshot_Update()`. `Snapshot_Update()` is called only on state changes (ADC processed, 1s tick, I2C write applied, flash save, factory reset, OTA, countdown actions, button toggle)—no unconditional per-loop update.
+- **I2C coherence**: In `I2C_Slave.c`, TX transmits from `aReceiveBuffer[uI2CRegIndex++]` (main keeps `aReceiveBuffer` in sync with `reg_image`). On ADDR+WRITE the ISR resets `uI2CRegIndex = 0`; first byte of write sets `uI2CRegIndex` and `i2c_pending_write.reg_addr` (write-then-repeated-start-read works). Multi-byte reads are coherent because `aReceiveBuffer` is updated only at snapshot boundaries.
 - **I2C register map**: `StateToRegisterBuffer()` maps `state`/`sys_state` to the 256-byte register image; validation helpers (`Validate_FullVoltage`, etc.) and `ProcessI2CPendingWrite()` apply and validate writes. RO registers enforced in `ProcessI2CPendingWrite()` (writes to RO/Reserved discarded).
-- **I2C semantics**: First byte of write sets both `uI2CRegIndex` and `i2c_pending_write.reg_addr` (write-then-repeated-start-read works). STOP sets `i2c_pending_write.pending` only when `length > 0` (pointer-only writes do not pend). Overwrite protection: if `pending != 0` on ADDR+WRITE, set `ignore_write` and drop bytes until STOP. `i2c_pending_write_t` fields and `active_reg_image`/`latched_reg_image` are `volatile` where shared with ISR.
-- **Init**: `InitAuthoritativeStateFromDefaults()`, `InitAuthoritativeStateFromBuffer()` (from `aReceiveBuffer` after flash load), `Snapshot_Init()` (both `reg_image` buffers + snapshot).
+- **I2C semantics**: First byte of write sets both `uI2CRegIndex` and `i2c_pending_write.reg_addr`. On ADDR+WRITE, `uI2CRegIndex` is reset to 0. STOP sets `i2c_pending_write.pending` only when `length > 0` (pointer-only writes do not pend). Overwrite protection: if `pending != 0` on ADDR+WRITE, set `ignore_write` and drop bytes until STOP. `i2c_pending_write_t` fields are shared with ISR.
+- **Init**: `InitAuthoritativeStateFromDefaults()`, `InitAuthoritativeStateFromBuffer()` (from `aReceiveBuffer` after flash load), `Snapshot_Init()` (both `reg_image` buffers + copy to `aReceiveBuffer` + snapshot).
+- **TX from reg_image (all zeros)**: The intended design was I2C TX from `reg_image[latched_reg_image][uI2CRegIndex++]`. On device that path returns all zeros; making `reg_image` volatile did **not** fix it, so the cause is not compiler optimization. Current workaround: TX from `aReceiveBuffer`, with main copying `reg_image` to `aReceiveBuffer` in `Snapshot_Init()` and `Snapshot_Update()`. Root cause (e.g. linker/symbol, memory layout, or STM32 I2C slave read-from-extern) remains TBD.
 
 ### Phase 3: Timing and Scheduling ✓
 **Goal**: Consolidate timing to TIM1 canonical scheduler
@@ -1459,24 +1462,58 @@ Created `Inc/ups_state.h` containing:
 **Implementation Notes (Phase 3)**:
 - **TIM1 ISR** (`main.c`): Flag-only. Sets `tick_10ms`, `tick_100ms`, `tick_500ms`, increments `tick_counter`; no state machine, GPIO, or countdown logic in ISR.
 - **SysTick**: Uptime only (`uUptimeMsCounter`, `uint32_t`, free-running ms). 1s timing derived from TIM1 in main (tick_1s from 10× tick_100ms).
-- **Scheduler** (`scheduler_flags_t`, `scheduler_counters_t` in `ups_state.h`): Main loop checks flags, runs `Scheduler_Tick10ms()` on tick_10ms; ADC trigger on tick_500ms; runtime/countdowns/snapshot on tick_1s; Snapshot_Update on tick_100ms.
-- **Scheduler_Tick10ms()**: Protection check, MT_EN from power state, measurement window + sample period (IP_EN, `sched_counters`, `measurement_window_active`), button debounce. All timing logic in main.
-- **Countdowns**: Shutdown and restart actions + decrements handled in tick_1s block only; restart power-cycle (MT_EN low 5s then high) triggers when countdown reaches 1 (see 0x1A semantics).
-- **Risks documented in code**: Long IRQ disable during restart power-cycle (Phase 4: make non-blocking); flag race / missed tick (counters or copy+clear if needed); modulo in TIM1 ISR (downcounters if tick rate increases); `uUptimeMsCounter` semantics (free-running ms, not “ms within second”).
+- **Scheduler** (`scheduler_flags_t` in `ups_state.h`): Main loop checks flags, runs `Scheduler_Tick10ms()` on tick_10ms; ADC trigger on tick_500ms; runtime/countdowns/snapshot on tick_1s; Snapshot_Update on tick_100ms.
+- **Scheduler_Tick10ms()** (Phase 4): Calls `PowerStateMachine_Step()` (restart phase, protection, ApplyGPIO), `ChargerStateMachine_Step()`, `ApplyGPIOFromState()`, then button debounce. All timing and state logic in main.
+- **Countdowns**: Shutdown and restart countdown decrements + transition logic in `PowerStateMachine_OnTick1s()` (tick_1s). Restart power-cycle is non-blocking: when countdown reaches 1, `restart_phase` and `restart_remaining_ticks` are set; `RestartPowerCycle_Step()` (10ms) counts down and restores RPI_ON after 5s (see Phase 4).
+- **Risks documented in code**: Flag race / missed tick (counters or copy+clear if needed); modulo in TIM1 ISR (downcounters if tick rate increases); `uUptimeMsCounter` semantics (free-running ms, not “ms within second”).
 
-### Phase 4: State Machine Implementation
+### Phase 4: State Machine Implementation ✓
 **Goal**: Implement explicit state machine
 
-1. **State Machine Core**
-   - Implement state enumeration
-   - Implement state transition logic
-   - Implement state entry/exit actions
+1. **State Machine Core** ✓
+   - State enumerations (`power_state_t`, `charger_state_t`, `learning_mode_t`) in `ups_state.h`
+   - State transition logic in `PowerStateMachine_Step()`, `ChargerStateMachine_Step()`, `Protection_Step()`, `PowerStateMachine_OnTick1s()`, `CheckPowerOnConditions()`
+   - Entry/exit actions: `power_state_entry_ticks`, `charger_state_entry_ticks`, `prot_state.below_threshold_count` reset on entry to RPI_ON, `pending_power_cut` / flash then PROTECTION_LATCHED
 
-2. **State-Specific Logic**
-   - Charging state
-   - Measurement window state
-   - Protection shutdown state
-   - Load on delay state
+2. **State-Specific Logic** ✓
+   - **Charger state**: `ChargerStateMachine_Step()` — detection (adc_sample_seq gated), window scheduling/entry/exit; unplug mid-window: PRESENT vs ABSENT decided from current voltage at window end
+   - **Measurement window**: `window_mgr` (window_due, window_active); invariant `window_active == (charger_state == FORCED_OFF_WINDOW)`; staleness forces `window_due = 1` for ASAP measurement
+   - **Protection**: `Protection_Step()` uses `Charger_IsInfluencingVBAT()` (not voltage heuristic); protection sample count gated to RPI_ON only; invariant A6: flash commit attempted in main loop, then `power_state = PROTECTION_LATCHED` (MT_EN cut via ApplyGPIO)
+   - **Load on delay**: Cancel when `!battery_ok` (any condition fails); `PowerStateMachine_OnTick1s()` handles countdown and LOAD_ON_DELAY → RPI_ON with entry actions
+
+3. **Restart power-cycle (state machine)** ✓
+   - Non-blocking: `restart_phase`, `restart_remaining_ticks`; when restart countdown reaches 1, set phase and 5s ticks; `RestartPowerCycle_Step()` (10ms) decrements and transitions to RPI_ON when done
+   - `ApplyGPIOFromState()`: when `restart_phase != 0`, MT_EN forced low; else MT_EN from `power_state`
+   - No IRQ disable or blocking delay during restart
+
+**Implementation Notes (Phase 4)**:
+- **main.c**: `window_mgr`, `charger_physical`, `prot_state`; `ApplyGPIOFromState()`, `Protection_Step()`, `ChargerStateMachine_Step()`, `RestartPowerCycle_Step()`, `PowerStateMachine_Step()`, `PowerStateMachine_OnTick1s()`; protection cut ordering: main loop sets `power_state = PROTECTION_LATCHED` only after `StorRegValue()` when `pending_power_cut` is set.
+- **Helpers** (declared in `ups_state.h`, implemented in main.c): `Charger_IsInfluencingVBAT()`, `IsTrueVbatSampleFresh()`. Canonical tick: `sched_flags.tick_counter` (GetCurrentTick is static/internal in main.c).
+- **ADC processing**: `last_true_vbat_sample_tick` when `!Charger_IsInfluencingVBAT()`; protection sample count updated only when `power_state == RPI_ON`.
+- **CheckPowerOnConditions()**: Staleness forces `window_due = 1` when charger present and stale; LOAD_ON_DELAY cancel when `!battery_ok`; PROTECTION_LATCHED transitions with staleness and count reset.
+- **scheduler_counters_t**: Removed from `ups_state.h` and main.c; Phase 4 uses `window_manager_state_t` for measurement window timing. Can be re-added if needed.
+
+**Phase 4 Testing Checklist** (validate on device before moving to Phase 5):
+
+- [ ] **Power state**
+  - [ ] RPI_OFF ↔ RPI_ON via button short press; 0x17 reflects state.
+  - [ ] LOAD_ON_DELAY: auto power-on conditions start countdown; cancel if battery drops below low (e.g. disconnect charger and battery % &lt; low).
+  - [ ] LOAD_ON_DELAY → RPI_ON when countdown reaches 0 and battery_ok.
+  - [ ] PROTECTION_LATCHED: battery below protection (N samples while RPI_ON) → flash save attempted, then MT_EN cut; 0x17 = 0.
+  - [ ] PROTECTION_LATCHED → LOAD_ON_DELAY or RPI_OFF when charger + battery_ok (with staleness) or conditions not met.
+- [ ] **Charger state**
+  - [ ] Charger plug/unplug: ABSENT ↔ PRESENT after stability (thresholds/hysteresis); IP_EN follows (HIGH when PRESENT, LOW when ABSENT/FORCED_OFF_WINDOW).
+  - [ ] Measurement window: after sample period, PRESENT → FORCED_OFF_WINDOW for 1.5s; IP_EN low; then back to PRESENT or ABSENT.
+  - [ ] **Unplug mid-window**: Unplug charger during FORCED_OFF_WINDOW; window runs full 1.5s; at end, transition to ABSENT (not PRESENT).
+- [ ] **Restart countdown**
+  - [ ] Write 0x1A (e.g. 10); countdown decrements every 1s; at 1, MT_EN goes low for 5s then RPI_ON; no IRQ disable (TIM1/I2C keep running); 0x17 = 0 during 5s, then 1.
+- [ ] **Protection cut ordering**
+  - [ ] Trigger protection (e.g. disconnect charger, run RPi until battery below protection); confirm flash save is attempted before MT_EN is cut (e.g. observe order or add debug).
+- [ ] **I2C**
+  - [ ] Read 0x17 (power status) during RPI_ON, RPI_OFF, LOAD_ON_DELAY, restart phase, learning mode; values match plan.
+  - [ ] Multi-byte register reads coherent (no mixed bytes under snapshot swap).
+- [ ] **Staleness / window_due**
+  - [ ] With charger present and stale true-VBAT, auto power-on is deferred and `window_due` is set so next measurement window runs ASAP; after fresh sample, auto power-on can proceed.
 
 ### Phase 5: Battery Management
 **Goal**: Implement battery learning and protection
@@ -1748,6 +1785,14 @@ Clients must not interpret 0x2 as "power off."
 #### B7. Reserved-region behavior
 
 **Decision**: ACK writes but discard; reads return 0x00 unless characterization proves legacy differs.
+
+#### B8. Battery percentage update policy
+
+**Decision**: Battery percentage updates do **not** switch to gating on `charger_state != PRESENT` (true-VBAT only). The UPS is expected to be connected to the charger for long periods, and the measurement/sampling interval is user-defined; gating percent updates on true-VBAT only could result in long periods of stale battery percentage. The current behavior (voltage heuristic for "charging" in `UpdateBatteryPercentage()`) is retained. During FORCED_OFF_WINDOW, true-VBAT freshness is updated (charger not influencing) while percent may still treat the system as "charging" by voltage heuristic—this conceptual mismatch is an explicit policy choice (avoid stale percent when on charger).
+
+#### B9. Boot-from-flash charger state
+
+**Decision**: On load from flash, `charger_state` is **not** restored; we assume no charger until re-detection. Only `power_state` (and other persisted config) is restored from flash. Charger presence is re-evaluated on the next ADC/scheduler cycle.
 
 ⸻
 
