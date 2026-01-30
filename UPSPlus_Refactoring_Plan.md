@@ -1323,7 +1323,7 @@ typedef struct {
 - Hold detected: Button still pressed when hold_time reaches exactly 1000 ticks (10s)
 - **Boundary**: Exactly 10s (1000 ticks) counts as long press
 - Action: Trigger factory reset immediately (same as writing 1 to register 0x1B)
-- Factory reset executes: All parameters reset to defaults, flash updated, system continues operation
+- Factory reset executes: All parameters reset to defaults, flash updated; **RPi power is forced off on long-press reset**
 
 ### Button Handler Implementation
 
