@@ -164,7 +164,8 @@ uint8_t GetPowerStatusRegisterValue(const authoritative_state_t *auth_state, con
 {
     (void)auth_state;
     uint8_t value = 0x00u;
-    if (state->power_state == POWER_STATE_RPI_ON)
+    /* Bit0 reflects effective MT_EN assertion; restart_phase forces MT_EN LOW. */
+    if (state->power_state == POWER_STATE_RPI_ON && restart_phase == 0)
         value |= 0x01u; /* Power to RPi */
     if (state->learning_mode == LEARNING_ACTIVE)
         value |= 0x02u; /* Learning/Calibration enabled */
@@ -266,6 +267,11 @@ void Snapshot_Init(void)
     snapshot.snapshot_version = 0;
 }
 
+static void UpdateDerivedState(void)
+{
+    sys_state.learning_mode = (state.battery_params_self_programmed == 0) ? LEARNING_ACTIVE : LEARNING_INACTIVE;
+}
+
 void Snapshot_Update(void)
 {
     state.snapshot_tick = sched_flags.tick_counter;  /* Phase 3: canonical TIM1 tick */
@@ -275,6 +281,12 @@ void Snapshot_Update(void)
     snapshot.buffer[inactive] = state;
     snapshot.active_buffer = inactive;
     snapshot.snapshot_version++;
+}
+
+static void Snapshot_UpdateDerived(void)
+{
+    UpdateDerivedState();
+    Snapshot_Update();
 }
 
 /* RO register addresses: reject writes (ignore, don't apply) */
@@ -295,6 +307,8 @@ static void ProcessI2CPendingWrite(void)
     uint8_t len = i2c_pending_write.length;
     uint16_t u16;
     uint8_t u8;
+    uint8_t changed = 0;
+    uint8_t persist_changed = 0;
 
     if (!i2c_pending_write.pending) return;
 
@@ -316,44 +330,87 @@ static void ProcessI2CPendingWrite(void)
     case REG_FULL_VOLTAGE_L:
         if (len >= 2) {
             u16 = (uint16_t)i2c_pending_write.data[0] | ((uint16_t)i2c_pending_write.data[1] << 8);
-            if (Validate_FullVoltage(u16)) state.full_voltage_mv = u16;
+            if (Validate_FullVoltage(u16)) {
+                int32_t range = (int32_t)u16 - (int32_t)state.empty_voltage_mv;
+                if (range >= MIN_VOLTAGE_DELTA_MV && state.full_voltage_mv != u16) {
+                state.full_voltage_mv = u16;
+                changed = 1;
+                persist_changed = 1;
+                }
+            }
         }
         break;
     case REG_EMPTY_VOLTAGE_L:
         if (len >= 2) {
             u16 = (uint16_t)i2c_pending_write.data[0] | ((uint16_t)i2c_pending_write.data[1] << 8);
-            if (Validate_EmptyVoltage(u16) && u16 >= state.protection_voltage_mv)
-                state.empty_voltage_mv = u16;
+            if (Validate_EmptyVoltage(u16) && u16 >= state.protection_voltage_mv) {
+                int32_t range = (int32_t)state.full_voltage_mv - (int32_t)u16;
+                if (range >= MIN_VOLTAGE_DELTA_MV && state.empty_voltage_mv != u16) {
+                    state.empty_voltage_mv = u16;
+                    changed = 1;
+                    persist_changed = 1;
+                }
+            }
         }
         break;
     case REG_PROTECT_VOLTAGE_L:
         if (len >= 2) {
             u16 = (uint16_t)i2c_pending_write.data[0] | ((uint16_t)i2c_pending_write.data[1] << 8);
             if (Validate_ProtectionVoltage(u16)) {
-                state.protection_voltage_mv = u16;
-                if (state.empty_voltage_mv < u16) state.empty_voltage_mv = u16;
+                if (state.protection_voltage_mv != u16) {
+                    state.protection_voltage_mv = u16;
+                    changed = 1;
+                    persist_changed = 1;
+                }
+                if (state.empty_voltage_mv < u16) {
+                    state.empty_voltage_mv = u16;
+                    changed = 1;
+                    persist_changed = 1;
+                }
+                if (state.full_voltage_mv < u16) {
+                    state.full_voltage_mv = u16;
+                    changed = 1;
+                    persist_changed = 1;
+                }
             }
         }
         break;
     case REG_SAMPLE_PERIOD_L:
         if (len >= 2) {
             u16 = (uint16_t)i2c_pending_write.data[0] | ((uint16_t)i2c_pending_write.data[1] << 8);
-            if (Validate_SamplePeriod(u16)) state.sample_period_minutes = u16;
+            if (Validate_SamplePeriod(u16) && state.sample_period_minutes != u16) {
+                state.sample_period_minutes = u16;
+                changed = 1;
+                persist_changed = 1;
+            }
         }
         break;
     case REG_SHUTDOWN_COUNTDOWN:
         if (len >= 1) {
             u8 = i2c_pending_write.data[0];
-            if (Validate_Countdown(u8)) state.shutdown_countdown_sec = u8;
+            if (Validate_Countdown(u8) && state.shutdown_countdown_sec != u8) {
+                state.shutdown_countdown_sec = u8;
+                changed = 1;
+            }
         }
         break;
     case REG_AUTO_POWER_ON:
-        if (len >= 1) state.auto_power_on = (i2c_pending_write.data[0] != 0) ? 1u : 0u;
+        if (len >= 1) {
+            u8 = (i2c_pending_write.data[0] != 0) ? 1u : 0u;
+            if (state.auto_power_on != u8) {
+                state.auto_power_on = u8;
+                changed = 1;
+                persist_changed = 1;
+            }
+        }
         break;
     case REG_RESTART_COUNTDOWN:
         if (len >= 1) {
             u8 = i2c_pending_write.data[0];
-            if (Validate_Countdown(u8)) state.restart_countdown_sec = u8;
+            if (Validate_Countdown(u8) && state.restart_countdown_sec != u8) {
+                state.restart_countdown_sec = u8;
+                changed = 1;
+            }
         }
         break;
     case REG_FACTORY_RESET:
@@ -361,27 +418,48 @@ static void ProcessI2CPendingWrite(void)
         break;
     case REG_BATTERY_SELF_PROG:
         if (len >= 1) {
-            state.battery_params_self_programmed = (i2c_pending_write.data[0] != 0) ? 1u : 0u;
-            sys_state.learning_mode = (state.battery_params_self_programmed == 0) ? LEARNING_ACTIVE : LEARNING_INACTIVE;
+            uint8_t new_value = (i2c_pending_write.data[0] != 0) ? 1u : 0u;
+            if (state.battery_params_self_programmed != new_value) {
+                state.battery_params_self_programmed = new_value;
+                if (new_value == 0u) {
+                    state.full_voltage_mv = DEFAULT_VBAT_FULL_MV;
+                    state.empty_voltage_mv = DEFAULT_VBAT_EMPTY_MV;
+                    if (state.empty_voltage_mv < state.protection_voltage_mv)
+                        state.empty_voltage_mv = state.protection_voltage_mv;
+                }
+                changed = 1;
+                persist_changed = 1;
+            }
         }
         break;
     case REG_LOW_BATTERY_PERCENT:
         if (len >= 1) {
             u8 = i2c_pending_write.data[0];
-            if (Validate_LowBatteryPercent(u8)) state.low_battery_percent = u8;
+            if (Validate_LowBatteryPercent(u8) && state.low_battery_percent != u8) {
+                state.low_battery_percent = u8;
+                changed = 1;
+                persist_changed = 1;
+            }
         }
         break;
     case REG_LOAD_ON_DELAY_L:
         if (len >= 2) {
             u16 = (uint16_t)i2c_pending_write.data[0] | ((uint16_t)i2c_pending_write.data[1] << 8);
-            if (Validate_LoadOnDelay(u16)) state.load_on_delay_config_sec = u16;
+            if (Validate_LoadOnDelay(u16) && state.load_on_delay_config_sec != u16) {
+                state.load_on_delay_config_sec = u16;
+                changed = 1;
+                persist_changed = 1;
+            }
         }
         break;
     default:
         break;
     }
 
-    Snapshot_Update();
+    if (changed)
+        Snapshot_UpdateDerived();
+    if (persist_changed)
+        flash_save_requested = 1;
     i2c_pending_write.pending = 0;
 }
 
@@ -445,7 +523,6 @@ static void InitAuthoritativeStateFromBuffer(void)
     state.battery_params_self_programmed = (aReceiveBuffer[REG_BATTERY_SELF_PROG] != 0) ? 1u : 0u;
     state.low_battery_percent   = aReceiveBuffer[REG_LOW_BATTERY_PERCENT];
     state.load_on_delay_config_sec = (uint16_t)aReceiveBuffer[REG_LOAD_ON_DELAY_L] | ((uint16_t)aReceiveBuffer[REG_LOAD_ON_DELAY_H] << 8);
-    sys_state.power_state       = (aReceiveBuffer[REG_POWER_STATUS] & 0x01u) ? POWER_STATE_RPI_ON : POWER_STATE_RPI_OFF;
     sys_state.learning_mode     = (state.battery_params_self_programmed == 0) ? LEARNING_ACTIVE : LEARNING_INACTIVE;
     /* Clamp to valid ranges */
     if (!Validate_FullVoltage(state.full_voltage_mv)) state.full_voltage_mv = DEFAULT_VBAT_FULL_MV;
@@ -517,7 +594,7 @@ int main(void)
                 sched_flags.tick_1s = 1;
                 tick_100ms_count = 0;
             }
-            Snapshot_Update();  /* Phase 3: 100ms periodic snapshot (ensures freshness) */
+            Snapshot_UpdateDerived();  /* Phase 3: 100ms periodic snapshot (ensures freshness) */
             sched_flags.tick_100ms = 0;
         }
         if (sched_flags.tick_500ms)
@@ -540,7 +617,7 @@ int main(void)
                 state.current_runtime_sec = 0;
             }
             PowerStateMachine_OnTick1s();
-            Snapshot_Update();
+            Snapshot_UpdateDerived();
             sched_flags.tick_1s = 0;
         }
 
@@ -551,7 +628,7 @@ int main(void)
         if (flash_save_requested)
         {
             flash_save_requested = 0;
-            Snapshot_Update();
+            Snapshot_UpdateDerived();
             StorRegValue();
             if (sys_state.pending_power_cut)
             {
@@ -565,7 +642,7 @@ int main(void)
         if (sys_state.factory_reset_requested)
         {
             FactoryReset();
-            Snapshot_Update();
+            Snapshot_UpdateDerived();
             StorRegValue();
             sys_state.factory_reset_requested = 0;
         }
@@ -587,28 +664,20 @@ int main(void)
             state.usbc_voltage_mv = __LL_ADC_CALC_DATA_TO_VOLTAGE(state.mcu_voltage_mv * 4, aADCxConvertedData[2], LL_ADC_RESOLUTION_12B);
             state.microusb_voltage_mv = __LL_ADC_CALC_DATA_TO_VOLTAGE(state.mcu_voltage_mv * 4, aADCxConvertedData[3], LL_ADC_RESOLUTION_12B);
             state.temperature_raw = __LL_ADC_CALC_TEMPERATURE(state.mcu_voltage_mv, aADCxConvertedData[4], LL_ADC_RESOLUTION_12B);
-            if (state.battery_voltage_mv < VBAT_MIN_VALID_MV)
-                state.battery_voltage_mv = VBAT_MIN_VALID_MV;
+            uint16_t min_valid_mv = VBAT_MIN_VALID_MV;
+            if (min_valid_mv < state.protection_voltage_mv)
+                min_valid_mv = state.protection_voltage_mv;
+            if (state.battery_voltage_mv < min_valid_mv)
+                state.battery_voltage_mv = min_valid_mv;
             UpdateBatteryMinMax();
             UpdateBatteryPercentage();
             /* Phase 4: True-VBAT sample tick when charger not influencing (for staleness gating).
              * Intentional mismatch: freshness uses Charger_IsInfluencingVBAT; percent uses VBUS heuristic per B8. */
             if (!Charger_IsInfluencingVBAT(&sys_state))
                 state.last_true_vbat_sample_tick = sched_flags.tick_counter;
-            /* Protection: only update on new ADC sample (this block is adc_ready; do not move counter elsewhere) */
+            /* Protection: store last ADC reading; counting is done in Protection_Step with adc_sample_seq gating. */
             prot_state.last_adc_battery_mv = state.battery_voltage_mv;
-            if (sys_state.power_state == POWER_STATE_RPI_ON)
-            {
-                if (state.battery_voltage_mv <= state.protection_voltage_mv)
-                {
-                    prot_state.below_threshold_count++;
-                    if (prot_state.below_threshold_count > PROTECTION_SAMPLES_REQUIRED)
-                        prot_state.below_threshold_count = PROTECTION_SAMPLES_REQUIRED;
-                }
-                else if (state.battery_voltage_mv > state.protection_voltage_mv + PROTECTION_HYSTERESIS_MV)
-                    prot_state.below_threshold_count = 0;
-            }
-            Snapshot_Update();
+            Snapshot_UpdateDerived();
             adc_sample_seq++;
             adc_ready = 0;
         }
@@ -619,7 +688,7 @@ int main(void)
         if (ota_triggered && OTAShot == 0)
         {
             ota_triggered = 0;
-            Snapshot_Update();
+            Snapshot_UpdateDerived();
             StorRegValue();
             OTAShot = 1;
             while (1)
@@ -638,7 +707,7 @@ int main(void)
                 sys_state.power_state_entry_ticks = sched_flags.tick_counter;
                 prot_state.below_threshold_count = 0;
             }
-            Snapshot_Update();
+            Snapshot_UpdateDerived();
         }
     }
 }
@@ -873,15 +942,19 @@ void UpdateBatteryMinMax(void)
     {
         if (state.battery_voltage_mv > state.full_voltage_mv)
             state.battery_voltage_mv = state.full_voltage_mv;
-        if (state.empty_voltage_mv > state.battery_voltage_mv)
+        if (state.battery_voltage_mv < state.empty_voltage_mv)
             state.battery_voltage_mv = state.empty_voltage_mv;
     }
     else
     {
-        if (state.battery_voltage_mv > state.full_voltage_mv)
-            state.full_voltage_mv = state.battery_voltage_mv;
-        else if (state.empty_voltage_mv > state.battery_voltage_mv && state.battery_voltage_mv > state.protection_voltage_mv)
-            state.empty_voltage_mv = state.battery_voltage_mv;
+        if (!Charger_IsInfluencingVBAT(&sys_state))
+        {
+            if (state.battery_voltage_mv > state.full_voltage_mv)
+                state.full_voltage_mv = state.battery_voltage_mv;
+            if (state.battery_voltage_mv < state.empty_voltage_mv &&
+                state.battery_voltage_mv > state.protection_voltage_mv)
+                state.empty_voltage_mv = state.battery_voltage_mv;
+        }
     }
     if (state.empty_voltage_mv < state.protection_voltage_mv)
         state.empty_voltage_mv = state.protection_voltage_mv;
@@ -889,21 +962,31 @@ void UpdateBatteryMinMax(void)
 
 void UpdateBatteryPercentage(void)
 {
-    uint16_t range = state.full_voltage_mv - state.empty_voltage_mv;
+    int32_t range = (int32_t)state.full_voltage_mv - (int32_t)state.empty_voltage_mv;
     if (range < MIN_VOLTAGE_DELTA_MV)
         return;
-    uint16_t percentage = (uint16_t)(((uint32_t)(state.battery_voltage_mv - state.empty_voltage_mv) * 100u) / (uint32_t)range);
-    if (percentage > 100u)
-        percentage = 100u;
-    /* 0% and 100%: same heuristic as 1–99%; display converges when conditions allow. No separate clamp. */
-    if (percentage >= 0 && percentage <= 100)
+    int32_t voltage = (int32_t)state.battery_voltage_mv;
+    int32_t percentage;
+    if (voltage <= (int32_t)state.empty_voltage_mv)
+        percentage = 0;
+    else if (voltage >= (int32_t)state.full_voltage_mv)
+        percentage = 100;
+    else
+        percentage = (int32_t)(((voltage - (int32_t)state.empty_voltage_mv) * 100) / range);
+    if (percentage < 0)
+        percentage = 0;
+    else if (percentage > 100)
+        percentage = 100;
+
+    /* Per B8: voltage heuristic (not Charger_IsInfluencingVBAT) to avoid long stale percent when on charger.
+     * During FORCED_OFF_WINDOW VBUS may still be high; percent may treat as charging—intentional per B8. */
+    uint8_t charging = (state.microusb_voltage_mv > 4000 || state.usbc_voltage_mv > 4000);
+    int32_t delta = percentage - (int32_t)state.battery_percent;
+    if (delta >= (int32_t)BATTERY_PERCENT_HYSTERESIS || delta <= -(int32_t)BATTERY_PERCENT_HYSTERESIS)
     {
-        /* Per B8: voltage heuristic (not Charger_IsInfluencingVBAT) to avoid long stale percent when on charger.
-         * During FORCED_OFF_WINDOW VBUS may still be high; percent may treat as charging—intentional per B8. */
-        uint8_t charging = (state.microusb_voltage_mv > 4000 || state.usbc_voltage_mv > 4000);
-        if (charging && percentage > state.battery_percent)
+        if (charging && delta > 0)
             state.battery_percent = (uint8_t)percentage;
-        else if (!charging && percentage < state.battery_percent)
+        else if (!charging && delta < 0)
             state.battery_percent = (uint8_t)percentage;
         else if (state.battery_percent == 0)
             state.battery_percent = (uint8_t)percentage;
@@ -972,11 +1055,25 @@ static void Protection_Step(void)
 {
     if (sys_state.power_state != POWER_STATE_RPI_ON)
         return;
-    if (state.battery_voltage_mv <= 1000u)
-        return;
     /* Use charger state, not voltage heuristic (plan: true-VBAT / protection when not charging) */
     if (Charger_IsInfluencingVBAT(&sys_state))
+    {
+        prot_state.below_threshold_count = 0;
         return;
+    }
+    if (adc_sample_seq != prot_state.last_seen_seq)
+    {
+        prot_state.last_seen_seq = adc_sample_seq;
+        if (prot_state.last_adc_battery_mv <= state.protection_voltage_mv)
+        {
+            if (prot_state.below_threshold_count < PROTECTION_SAMPLES_REQUIRED)
+                prot_state.below_threshold_count++;
+        }
+        else if (prot_state.last_adc_battery_mv > state.protection_voltage_mv + PROTECTION_HYSTERESIS_MV)
+        {
+            prot_state.below_threshold_count = 0;
+        }
+    }
     if (prot_state.below_threshold_count < PROTECTION_SAMPLES_REQUIRED)
         return;
     /* Invariant A6: request flash, set pending_power_cut; main loop commits then sets PROTECTION_LATCHED */

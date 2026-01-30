@@ -1048,6 +1048,7 @@ typedef struct {
 - **Charging State**:
   - Charging: USB-C voltage > present_on_threshold OR microUSB voltage > present_on_threshold (with stability)
   - Discharging: Both USB-C and microUSB < present_off_threshold (with stability)
+- **VBAT clamping floor**: The ADC clamp floor for VBAT uses `max(VBAT_MIN_VALID_MV, uVBATProtect)` so the published VBAT (0x05/0x06) never undercuts the protection threshold.
 
 **Charging Detection Function**:
 ```c
@@ -1076,7 +1077,7 @@ bool is_charging(void) {
 
 **When Battery Parameters Self-Programmed = 0**:
 
-The system sets learning_mode = LEARNING_ACTIVE (register 0x17 = 0x2) when actively learning battery parameters.
+Learning mode is derived from 0x2A only (no temporary overrides). It is recomputed whenever the snapshot is updated; the learning algorithm does not set or clear it directly.
 
 **Learning Mode Exit Criteria**:
 - Learning is active whenever Battery Parameters Self-Programmed (0x2A) = 0
@@ -1129,7 +1130,7 @@ void UpdateBatteryMinMax(void) {
 
 **When Battery Parameters Self-Programmed = 1**:
 - Use user-provided Full and Empty voltages
-- Clip measured voltage to range [Empty, Full] if needed
+- If clipping is needed, it is applied to the measured VBAT itself (0x05/0x06), so the published voltage reflects the clamped value.
 
 ### Battery Percentage Calculation
 
@@ -1183,8 +1184,10 @@ void UpdateBatteryPercentage(void) {
 - **Hysteresis**: 50mV
 - **Shutdown condition**: Battery voltage ≤ Protection Voltage for N consecutive **ADC updates** (not 10ms ticks)
 - **Power-on condition**: Battery voltage > (Protection Voltage + Hysteresis) AND other conditions met (charger present, battery % > threshold, AutoPowerOn enabled)
+- **Invalid-reading filter**: Ignore clearly bogus VBAT readings (e.g., ≤ `VBAT_MIN_VALID_MV`) to avoid false protection triggers when ADC data is invalid or not yet settled.
 
 **Important**: Protection checks occur every 10ms using the **last measured battery voltage** (from most recent ADC conversion). However, the sample count is incremented only on **new ADC updates** (every 500ms). This prevents false triggers from transient measurements while still providing responsive protection.
+**Protection uses clamped VBAT**: Protection comparisons use the clamped battery voltage (the same VBAT value exposed via 0x05/0x06 after applying any self_programmed clamping).
 
 ```c
 #define PROTECTION_HYSTERESIS_MV 50
@@ -1515,23 +1518,37 @@ Created `Inc/ups_state.h` containing:
 - [ ] **Staleness / window_due**
   - [ ] With charger present and stale true-VBAT, auto power-on is deferred and `window_due` is set so next measurement window runs ASAP; after fresh sample, auto power-on can proceed.
 
-### Phase 5: Battery Management
+### Phase 5: Battery Management ✓ COMPLETE
 **Goal**: Implement battery learning and protection
 
-1. **Battery Learning**
+1. **Battery Learning** ✓
    - Implement learning algorithm
    - Implement bounds checking
    - Test learning behavior
 
-2. **Battery Protection**
+2. **Battery Protection** ✓
    - Implement protection voltage logic with hysteresis
    - Implement protection shutdown
    - Test protection behavior
 
-3. **Battery Percentage**
+3. **Battery Percentage** ✓
    - Implement percentage calculation
-   - Only update when not charging
+   - Do not decrease while charging; do not increase while discharging (per B8 policy)
    - Implement hysteresis
+
+#### Parameter Sanity / Clamping
+- **VBAT_MIN_VALID_MV** MUST be >= `protection_voltage_mv`
+- If configured lower, clamp **VBAT_MIN_VALID_MV** up to `protection_voltage_mv`
+- `empty_voltage_mv` MUST be >= `protection_voltage_mv` (existing behavior; document here)
+- **Full/Empty range**: Reject config writes that would make `full - empty < MIN_VOLTAGE_DELTA_MV`
+
+**Implementation Notes (Phase 5)**:
+- **Learning mode derivation**: Derived from 0x2A in `UpdateDerivedState()` and applied before snapshot updates.
+- **VBAT clamp floor**: ADC clamp floor uses `max(VBAT_MIN_VALID_MV, protection_voltage_mv)` so published VBAT never undercuts protection.
+- **Protection comparisons**: Use the clamped VBAT value (same value exposed at 0x05/0x06).
+- **Self-programmed reset**: Setting 0x2A→0 resets full/empty to defaults and reasserts empty ≥ protection.
+- **Parameter consistency**: Reject full/empty writes that invert the range or shrink it below `MIN_VOLTAGE_DELTA_MV`.
+- **Percent update policy**: Directional update (no decrease while charging; no increase while discharging) per B8.
 
 ### Phase 6: Flash Persistence
 **Goal**: Implement safe flash persistence
@@ -1717,6 +1734,10 @@ This addendum "locks" the plan so implementation can start without further surpr
 3. **No flash in ISR**: Flash erase/program never runs in any ISR context.
 4. **No read side effects**: I2C reads must never change state, counters, timers, or persistence flags.
 
+#### A1.1 Battery parameter sanity invariants
+- **VBAT_MIN_VALID_MV vs protection**: `VBAT_MIN_VALID_MV` MUST be >= `uVBATProtect`. If configured lower, clamp it up to `uVBATProtect`.
+- **Empty vs protection**: `uVBATMin` (Empty) MUST be >= `uVBATProtect`. If set lower, clamp `uVBATMin` up to `uVBATProtect`.
+
 #### A2. I2C coherence invariants
 5. **Transaction snapshot latch**: On I2C transaction start (ADDR match preferred; reg-index byte acceptable fallback), latch `snapshot_buf.active_buffer` into a transaction-local variable. Use that same buffer for all bytes until STOPF.
 6. **No relatch on repeated-start**: Repeated-start without STOP must not relatch the snapshot buffer.
@@ -1776,11 +1797,20 @@ No "auto exit."
 
 #### B6. Power status register meaning (0x17)
 
-**Decision**: 0x17 is operational mode:
-- 0x2 indicates learning/calibration enabled (0x2A=0), regardless of MT_EN.
-- 0x1 indicates RPi powered and not in learning mode.
-- 0x0 otherwise.
-Clients must not interpret 0x2 as "power off."
+**Decision**: 0x17 is a bit field describing current operating state:
+- Bit 0 (0x1): RPi power is enabled (MT_EN asserted, i.e., effective MT_EN output is HIGH)
+- Bit 1 (0x2): Learning/calibration is enabled (0x2A == 0)
+
+Values:
+- 0x0: not powered, learning disabled
+- 0x1: powered, learning disabled
+- 0x2: not powered, learning enabled
+- 0x3: powered, learning enabled
+
+Client guidance:
+- Clients MUST treat bit 1 (0x2) as “learning enabled,” not as “power off.”
+- Clients MUST check bit 0 to determine whether the RPi is powered.
+- **Restart-phase note**: During a restart power-cycle, MT_EN is forced LOW even if `power_state == RPI_ON`. Bit 0 MUST reflect the effective MT_EN output (LOW during restart), not just the logical power_state.
 
 #### B7. Reserved-region behavior
 
