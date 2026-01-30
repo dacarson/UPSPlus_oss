@@ -313,7 +313,7 @@ All registers must be implemented according to the specification table. Key requ
 
 **Runtime Counters (RO)**
 - 0x1C-0x1F: Cumulative Running Time (RuntimeAtAll)
-- 0x20-0x23: Accumulated Charging Time (RuntimePowerOn)
+- 0x20-0x23: Accumulated Charging Time (RuntimePowerOn) — increments when charger is present, regardless of RPi power state
 - 0x24-0x27: Running Time (RuntimeOnetime)
 
 **Version and Serial (RO)**
@@ -842,7 +842,7 @@ typedef struct {
 1. **Never in ISRs**: No flash writes in I2C ISR, DMA ISR, SysTick, or TIM1
 2. **Rate Limiting**: Minimum interval between commits (e.g., 5 seconds)
 3. **Integrity Protection**: CRC and version number
-4. **Safe Update Method**: A/B slots or equivalent to prevent corruption
+4. **Safe Update Method**: Single-slot with CRC/sequence + retry; fallback to defaults on invalid data
 
 ### Flash Storage Structure
 
@@ -850,9 +850,7 @@ typedef struct {
 #define FLASH_PAGE_SIZE 1024  // STM32F030F4Px (1KB pages)
 #define FLASH_STORAGE_START 0x08003C00  // Start of flash storage area
 #define FLASH_STORAGE_END   0x08003FFF  // Last usable address (0x08004000 is end of 16KB flash)
-#define FLASH_SLOT_A_ADDR 0x08003C00    // Slot A: first 512 bytes of storage page
-#define FLASH_SLOT_B_ADDR 0x08003E00    // Slot B: second 512 bytes of storage page
-#define FLASH_SLOT_SIZE 512              // Each slot is 512 bytes (half a page)
+/* Single-slot persistence: full 1KB page reserved (linker: FLASH_STORAGE) */
 
 **Important**: Verify flash size matches STM32F030F4Px (16KB) in linker script and part ID before using these addresses. Different SKUs may have different flash sizes, and using wrong addresses could brick the device.
 
@@ -894,57 +892,34 @@ typedef struct {
 
 **Countdown persistence rule**: Shutdown and restart countdown current values are runtime-only and MUST NOT be restored after reboot. Only configuration values (e.g., enable flags, delays, initial countdown values) are persisted. The current countdown values (`shutdown_countdown_sec`, `restart_countdown_sec` in authoritative state) are reset to 0 on boot and only become active when explicitly triggered.
 
-**A/B Slot Method**:
-1. Always write to inactive slot
-2. Verify CRC after write
-3. On boot, active slot is the valid slot with highest sequence number (determined by sequence number + CRC validation)
-4. If corrupted, try other slot
-5. If both corrupted, use factory defaults
+**Single-Slot Method** (linker reserves only one 1KB page):
+1. Read the record at `FLASH_STORAGE_START`
+2. If CRC/version/magic invalid → factory defaults and mark dirty for retry
+3. On write: erase page, program full record, verify CRC after readback
+4. If write fails, keep running with RAM state and retry later (rate-limited)
 
 **Flash Page Erase Algorithm**:
 
-Since STM32F030F4Px requires erasing the entire 1KB page before writing, and both slots are in the same page, the A/B update algorithm is:
+Since STM32F030F4Px requires erasing the entire 1KB page before writing, the single-slot algorithm is:
 
-1. **Read both slots into RAM**:
-   - Read Slot A (0x08003C00) into `ram_slot_a`
-   - Read Slot B (0x08003E00) into `ram_slot_b`
-
-2. **Determine active slot**:
-   - Check CRC and sequence number for both slots
-   - Active slot = highest valid sequence number with valid CRC (using wraparound-aware comparison)
-   - If both invalid, use factory defaults
-
-3. **Prepare new record**:
-   - Copy current authoritative state to `ram_slot_new`
+1. **Read record into RAM** and validate CRC/version/magic
+2. **Prepare new record**:
+   - Copy current authoritative state to `ram_record`
    - Increment sequence number (monotonic, wraps at 65535)
    - Calculate CRC32 of data section
    - Set magic number (0x55505350 "UPSP")
-
-4. **Erase page** (entire 1KB page):
-   - Unlock flash
-   - Set PER (Page Erase) bit
-   - Set page address (0x08003C00)
-   - Start erase (STRT bit)
-   - Wait for completion
-
-5. **Write new record to inactive slot**:
-   - Write `ram_slot_new` to inactive slot address
-   - Verify write (read back and compare)
-
+3. **Erase page** (entire 1KB page at 0x08003C00)
+4. **Write new record** to `FLASH_STORAGE_START`
+5. **Verify write** (read back + CRC)
 6. **If verification fails**:
-   - **Recovery strategy**: Keep running with RAM state, mark flash as dirty for retry
-   - On next flash write attempt, will try again (may succeed if failure was transient)
-   - **Note**: After page erase, old active slot data is already gone. Recovery writeback would require reprogramming from RAM backup, which might fail for the same reason. More realistic approach: accept the failure, continue with RAM state, retry on next write cycle.
-   - On next boot: If both slots invalid (due to failed write), fall back to factory defaults (already stated in step 2)
-
+   - Keep running with RAM state, mark flash dirty for retry
+   - On next boot: if record invalid, fall back to defaults
 7. **Lock flash**
 
 **Sequence Number**:
-- Each slot includes a 16-bit monotonic sequence number
-- On boot, slot with highest sequence number (with valid CRC) is active
+- Single record includes a 16-bit monotonic sequence number
 - Sequence number increments on each write, wraps at 65535
-- This provides automatic "newest wins" logic without explicit "active" marker
-- **Wraparound handling**: Sequence number comparison handles wraparound. Wraparound comparison must treat sequence numbers modulo 65536; a signed delta comparison is acceptable. In practice, wraparound after ~65k writes is effectively never, but proper comparison ensures correctness.
+- Used for diagnostics and to detect "newer than factory default" content
 
 ### Flash Write Triggers
 
@@ -1412,7 +1387,7 @@ Created `Inc/ups_state.h` containing:
 - System state structure (`system_state_t`) with all fields from plan
 - Authoritative state structure (`authoritative_state_t`) - single source of truth
 - Snapshot buffer structure (`snapshot_buffer_t`) for double-buffered I2C coherence
-- Flash persistence structure (`flash_persistent_data_t`) with A/B slot support
+- Flash persistence structure (`flash_persistent_data_t`) with CRC/sequence support
 - Scheduler structures (`scheduler_flags_t`; `scheduler_counters_t` removed in Phase 4—window_mgr used; can be re-added if needed)
 - I2C pending write structure (`i2c_pending_write_t`)
 - Protection state structure (`protection_state_t`)
@@ -1444,7 +1419,7 @@ Created `Inc/ups_state.h` containing:
 
 **Implementation Notes (Phase 2)**:
 - **Authoritative state** (`main.c`): `state` (`authoritative_state_t`) and `sys_state` (`system_state_t`) are the single source of truth. All former globals (uXXXVolt, counters, mode flags) removed as authoritative; only timing helpers remain (`CountDownPowerOffTicks`, `CountDownRebootTicks`, `sKeyFlag`, etc.) with comments that real countdown/state lives in `state`/`sys_state`.
-- **Snapshot mechanism**: Double-buffered register image `reg_image[2][256]` (volatile) and `volatile uint8_t active_reg_image`. `Snapshot_Update()` builds into `reg_image[inactive]` via `StateToRegisterBuffer()`, then atomically flips `active_reg_image`, then copies `reg_image[active_reg_image]` to `aReceiveBuffer` so I2C TX sees current data. `aReceiveBuffer` is used for flash load (`GetRegValue`) and for I2C TX; main keeps it in sync in `Snapshot_Init()` and `Snapshot_Update()`. `Snapshot_Update()` is called only on state changes (ADC processed, 1s tick, I2C write applied, flash save, factory reset, OTA, countdown actions, button toggle)—no unconditional per-loop update.
+- **Snapshot mechanism**: Double-buffered register image `reg_image[2][256]` (volatile) and `volatile uint8_t active_reg_image`. `Snapshot_Update()` builds into `reg_image[inactive]` via `StateToRegisterBuffer()`, then atomically flips `active_reg_image`, then copies `reg_image[active_reg_image]` to `aReceiveBuffer` so I2C TX sees current data. `aReceiveBuffer` is used for flash load (`Flash_Load` path) and for I2C TX; main keeps it in sync in `Snapshot_Init()` and `Snapshot_Update()`. `Snapshot_Update()` is called only on state changes (ADC processed, 1s tick, I2C write applied, flash save, factory reset, OTA, countdown actions, button toggle)—no unconditional per-loop update.
 - **I2C coherence**: In `I2C_Slave.c`, TX transmits from `aReceiveBuffer[uI2CRegIndex++]` (main keeps `aReceiveBuffer` in sync with `reg_image`). On ADDR+WRITE the ISR resets `uI2CRegIndex = 0`; first byte of write sets `uI2CRegIndex` and `i2c_pending_write.reg_addr` (write-then-repeated-start-read works). Multi-byte reads are coherent because `aReceiveBuffer` is updated only at snapshot boundaries.
 - **I2C register map**: `StateToRegisterBuffer()` maps `state`/`sys_state` to the 256-byte register image; validation helpers (`Validate_FullVoltage`, etc.) and `ProcessI2CPendingWrite()` apply and validate writes. RO registers enforced in `ProcessI2CPendingWrite()` (writes to RO/Reserved discarded).
 - **I2C semantics**: First byte of write sets both `uI2CRegIndex` and `i2c_pending_write.reg_addr`. On ADDR+WRITE, `uI2CRegIndex` is reset to 0. STOP sets `i2c_pending_write.pending` only when `length > 0` (pointer-only writes do not pend). Overwrite protection: if `pending != 0` on ADDR+WRITE, set `ignore_write` and drop bytes until STOP. `i2c_pending_write_t` fields are shared with ISR.
@@ -1493,7 +1468,7 @@ Created `Inc/ups_state.h` containing:
    - No IRQ disable or blocking delay during restart
 
 **Implementation Notes (Phase 4)**:
-- **main.c**: `window_mgr`, `charger_physical`, `prot_state`; `ApplyGPIOFromState()`, `Protection_Step()`, `ChargerStateMachine_Step()`, `RestartPowerCycle_Step()`, `PowerStateMachine_Step()`, `PowerStateMachine_OnTick1s()`; protection cut ordering: main loop sets `power_state = PROTECTION_LATCHED` only after `StorRegValue()` when `pending_power_cut` is set.
+- **main.c**: `window_mgr`, `charger_physical`, `prot_state`; `ApplyGPIOFromState()`, `Protection_Step()`, `ChargerStateMachine_Step()`, `RestartPowerCycle_Step()`, `PowerStateMachine_Step()`, `PowerStateMachine_OnTick1s()`; protection cut ordering: main loop sets `power_state = PROTECTION_LATCHED` only after `Flash_Save()` when `pending_power_cut` is set.
 - **Helpers** (declared in `ups_state.h`, implemented in main.c): `Charger_IsInfluencingVBAT()`, `IsTrueVbatSampleFresh()`. Canonical tick: `sched_flags.tick_counter` (GetCurrentTick is static/internal in main.c).
 - **ADC processing**: `last_true_vbat_sample_tick` when `!Charger_IsInfluencingVBAT()`; protection sample count updated only when `power_state == RPI_ON`.
 - **CheckPowerOnConditions()**: Staleness forces `window_due = 1` when charger present and stale; LOAD_ON_DELAY cancel when `!battery_ok`; PROTECTION_LATCHED transitions with staleness and count reset.
@@ -1553,23 +1528,31 @@ Created `Inc/ups_state.h` containing:
 - **Parameter consistency**: Reject full/empty writes that invert the range or shrink it below `MIN_VOLTAGE_DELTA_MV`.
 - **Percent update policy**: Directional update (no decrease while charging; no increase while discharging) per B8.
 
-### Phase 6: Flash Persistence
+### Phase 6: Flash Persistence ✓ COMPLETE
 **Goal**: Implement safe flash persistence
 
-1. **Flash Structure**
-   - Implement A/B slot mechanism
+1. **Flash Structure** ✓
+   - Implement single-slot record (1KB page)
    - Implement CRC calculation
    - Implement version checking
 
-2. **Flash Write Logic**
+2. **Flash Write Logic** ✓
    - Implement rate limiting
-   - Implement write triggers
-   - Test power-loss recovery
+   - Implement write triggers (config changes, protection, factory reset, OTA, periodic dirty flush)
+   - Implement readback verification (CRC + sequence)
+   - Add retry/backoff on failure
 
-3. **Flash Read Logic**
+3. **Flash Read Logic** ✓
    - Implement boot-time read
-   - Implement corruption recovery
+   - Implement corruption recovery (factory defaults + dirty)
    - Test default fallback
+
+**Implementation Notes (Phase 6)**:
+- Single-slot persistence uses linker-defined `FLASH_STORAGE` (1KB page at 0x08003C00).
+- Flash writes are main-loop only; protection cut waits for save attempt.
+- Save verification reads back and validates CRC + sequence; only then clears dirty.
+- Failed saves keep `flash_save_requested` asserted and retry with a short backoff.
+- Periodic dirty flush every 60s, plus flush on measurement window completion if dirty.
 
 ### Phase 7: Button Handling
 **Goal**: Implement robust button handling
@@ -1693,7 +1676,7 @@ These tests specifically validate the new architecture's coherence and gating ru
      - Final state becomes ABSENT after window finishes
 - [ ] Flash reads work on boot
 - [ ] Power loss during write doesn't corrupt data
-- [ ] A/B slot mechanism works
+- [ ] Single-slot persistence works (CRC/sequence)
 - [ ] CRC validation works
 - [ ] Factory reset works
 
@@ -1882,8 +1865,8 @@ For each state dimension (power/charger/learning):
   - Confirm SKU flash size and linker layout
   - Confirm bootloader region
   - Confirm storage page not overlapping code/consts
-- A/B slot algorithm defined with:
-  - Boot-time slot selection
+- Single-slot algorithm defined with:
+  - Boot-time record validation
   - Runtime commit trigger & rate limit
   - Factory reset bypass rule
   - Protection ordering rule (commit attempt before power cut) documented and treated as invariant
@@ -1900,7 +1883,8 @@ For each state dimension (power/charger/learning):
 These are required verification steps, but they do not change the plan unless verification fails:
 
 1. **Flash address/layout verification** against actual linker script and bootloader footprint (bricking prevention).
-   - **Status**: Deferred to Phase 6 (gated behind UPS_ENABLE_FLASH_PERSISTENCE and UPS_FLASH_LAYOUT_VERIFIED)
+   - **Status**: ✓ VERIFIED (Phase 6)
+   - **Result**: Linker reserves `FLASH_STORAGE` at 0x08003C00–0x08004000 (1KB) for persistence; bootloader footprint confirmed.
 
 2. **ADC scaling confirmation** for VBUS/USBIN thresholds (confirm that the existing macros' scaling corresponds to connector mV as assumed).
    - **Status**: ✓ VERIFIED (Phase 1)

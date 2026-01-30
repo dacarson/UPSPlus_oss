@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "ups_state.h"
 
-/* I2C slave receive buffer - 256 bytes; used for flash load (GetRegValue) only */
+/* I2C slave receive buffer - 256 bytes; TX reads use reg_image[] */
 extern volatile uint8_t aReceiveBuffer[256];
 
 /* Phase 2: Double-buffered register image; ISR latches active_reg_image on ADDR+READ, TX from reg_image[latched] */

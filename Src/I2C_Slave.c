@@ -7,7 +7,7 @@
 #include "stm32f0xx_ll_cortex.h"
 #include "stm32f0xx.h"
 
-/* I2C slave receive buffer - 256 bytes; used for flash load (GetRegValue) only. I2C reads use reg_image[]. */
+/* I2C slave receive buffer - 256 bytes; TX reads use reg_image[]. */
 volatile uint8_t aReceiveBuffer[256];
 
 /* Phase 2: Pending write - ISR stores here; main loop applies to authoritative state */

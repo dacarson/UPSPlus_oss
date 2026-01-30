@@ -17,13 +17,13 @@
 #include "I2C_Slave.h"
 #include "ups_state.h"
 
+#include <string.h>
+
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ADC_Init(void);
 static void MX_DMA_Init(void);
 
-void StorRegValue(void);
-uint8_t GetRegValue(void);  /* Returns 1 if loaded from flash, 0 if factory reset */
 uint32_t GetUptimeSeconds(void);
 void UpdateBatteryPercentage(void);
 void UpdateBatteryMinMax(void);
@@ -88,8 +88,13 @@ static scheduler_flags_t sched_flags;
 /* Main loop derives tick_1s from tick_100ms (10 pulses = 1s) */
 static uint8_t tick_100ms_count = 0;
 
-/* Flash save requested (e.g. protection shutdown); main loop does Snapshot_Update then StorRegValue */
+/* Flash save requested; main loop snapshots then commits (rate-limited unless bypassed). */
 static volatile uint8_t flash_save_requested = 0;
+static volatile uint8_t flash_save_bypass = 0;
+static uint8_t flash_dirty = 0;
+static uint16_t flash_sequence = 0;
+static uint32_t flash_last_write_sec = 0;
+static uint32_t flash_next_retry_sec = 0;
 /* OTA requested via I2C write 127 to register 0x32 (50) */
 static volatile uint8_t ota_triggered = 0;
 
@@ -289,6 +294,15 @@ static void Snapshot_UpdateDerived(void)
     Snapshot_Update();
 }
 
+static void RequestFlashSave(uint8_t bypass, uint8_t mark_dirty)
+{
+    flash_save_requested = 1;
+    if (bypass)
+        flash_save_bypass = 1;
+    if (mark_dirty)
+        flash_dirty = 1;
+}
+
 /* RO register addresses: reject writes (ignore, don't apply) */
 static uint8_t IsReadOnlyRegister(uint8_t reg)
 {
@@ -459,7 +473,7 @@ static void ProcessI2CPendingWrite(void)
     if (changed)
         Snapshot_UpdateDerived();
     if (persist_changed)
-        flash_save_requested = 1;
+        RequestFlashSave(0, 1);
     i2c_pending_write.pending = 0;
 }
 
@@ -479,7 +493,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.shutdown_countdown_sec = 0;
     state.auto_power_on = DEFAULT_AUTO_POWER_ON;
     state.restart_countdown_sec = 0;
-    state.battery_params_self_programmed = 1;
+    state.battery_params_self_programmed = 0;
     state.low_battery_percent = DEFAULT_LOW_BATTERY_PERCENT;
     state.load_on_delay_config_sec = DEFAULT_LOAD_ON_DELAY_SEC;
     state.load_on_delay_remaining_sec = 0;
@@ -512,37 +526,15 @@ static void InitAuthoritativeStateFromDefaults(void)
     prot_state.last_seen_seq = 0;
 }
 
-/* Apply persisted register buffer (from flash) to state; call after GetRegValue() when flash was valid */
-static void InitAuthoritativeStateFromBuffer(void)
-{
-    state.full_voltage_mv       = (uint16_t)aReceiveBuffer[REG_FULL_VOLTAGE_L] | ((uint16_t)aReceiveBuffer[REG_FULL_VOLTAGE_H] << 8);
-    state.empty_voltage_mv      = (uint16_t)aReceiveBuffer[REG_EMPTY_VOLTAGE_L] | ((uint16_t)aReceiveBuffer[REG_EMPTY_VOLTAGE_H] << 8);
-    state.protection_voltage_mv = (uint16_t)aReceiveBuffer[REG_PROTECT_VOLTAGE_L] | ((uint16_t)aReceiveBuffer[REG_PROTECT_VOLTAGE_H] << 8);
-    state.sample_period_minutes = (uint16_t)aReceiveBuffer[REG_SAMPLE_PERIOD_L] | ((uint16_t)aReceiveBuffer[REG_SAMPLE_PERIOD_H] << 8);
-    state.auto_power_on         = (aReceiveBuffer[REG_AUTO_POWER_ON] != 0) ? 1u : 0u;
-    state.battery_params_self_programmed = (aReceiveBuffer[REG_BATTERY_SELF_PROG] != 0) ? 1u : 0u;
-    state.low_battery_percent   = aReceiveBuffer[REG_LOW_BATTERY_PERCENT];
-    state.load_on_delay_config_sec = (uint16_t)aReceiveBuffer[REG_LOAD_ON_DELAY_L] | ((uint16_t)aReceiveBuffer[REG_LOAD_ON_DELAY_H] << 8);
-    sys_state.learning_mode     = (state.battery_params_self_programmed == 0) ? LEARNING_ACTIVE : LEARNING_INACTIVE;
-    /* Clamp to valid ranges */
-    if (!Validate_FullVoltage(state.full_voltage_mv)) state.full_voltage_mv = DEFAULT_VBAT_FULL_MV;
-    if (!Validate_EmptyVoltage(state.empty_voltage_mv)) state.empty_voltage_mv = DEFAULT_VBAT_EMPTY_MV;
-    if (!Validate_ProtectionVoltage(state.protection_voltage_mv)) state.protection_voltage_mv = DEFAULT_VBAT_PROTECT_MV;
-    if (state.empty_voltage_mv < state.protection_voltage_mv) state.empty_voltage_mv = state.protection_voltage_mv;
-    if (!Validate_SamplePeriod(state.sample_period_minutes)) state.sample_period_minutes = DEFAULT_SAMPLE_PERIOD_MIN;
-    if (state.low_battery_percent > 100u) state.low_battery_percent = DEFAULT_LOW_BATTERY_PERCENT;
-    /* Runtime-only: countdowns must not restore from flash; zero after load */
-    state.shutdown_countdown_sec = 0;
-    state.restart_countdown_sec = 0;
-}
-
 void NVIC_SetVectorTable(void)
 {
     uint8_t i;
-    uint32_t *pVecTab = (uint32_t *)(0x20000000);
+    extern const uint32_t __vector_table_ram_start__;
+    extern const uint32_t __vector_table_flash_start__;
+    uint32_t *pVecTab = (uint32_t *)&__vector_table_ram_start__;
     for (i = 0; i < 48; i++)
     {
-        *(pVecTab++) = *(__IO uint32_t *)(0x8000800 + (i << 2));
+        *(pVecTab++) = *(__IO uint32_t *)((uint32_t)&__vector_table_flash_start__ + (i << 2));
     }
     LL_SYSCFG_SetRemapMemory(LL_SYSCFG_REMAP_SRAM);
 }
@@ -566,10 +558,10 @@ int main(void)
     MX_ADC_Init();
     MX_I2C1_Slave_Init();
 
-    /* Phase 2: Single source of truth; load from defaults then optionally from flash */
+    /* Phase 2/6: Single source of truth; load from defaults then from flash */
     InitAuthoritativeStateFromDefaults();
-    if (GetRegValue())
-        InitAuthoritativeStateFromBuffer();
+    Flash_Init();
+    Flash_Load();
     Snapshot_Init();
     sys_state.factory_reset_requested = 0;
 
@@ -607,16 +599,17 @@ int main(void)
         {
             state.cumulative_runtime_sec++;
             if (sys_state.power_state == POWER_STATE_RPI_ON)
-            {
                 state.current_runtime_sec++;
-                if (Charger_IsInfluencingVBAT(&sys_state))
-                    state.charging_time_sec++;
-            }
             else
-            {
                 state.current_runtime_sec = 0;
-            }
+            if (Charger_IsInfluencingVBAT(&sys_state))
+                state.charging_time_sec++;
             PowerStateMachine_OnTick1s();
+            if (flash_dirty &&
+                (state.cumulative_runtime_sec - flash_last_write_sec) >= FLASH_DIRTY_MAX_INTERVAL_SEC)
+            {
+                RequestFlashSave(0, 0);
+            }
             Snapshot_UpdateDerived();
             sched_flags.tick_1s = 0;
         }
@@ -627,14 +620,31 @@ int main(void)
         /* Invariant A6: attempt flash commit first; only then cut MT_EN (set PROTECTION_LATCHED) */
         if (flash_save_requested)
         {
-            flash_save_requested = 0;
-            Snapshot_UpdateDerived();
-            StorRegValue();
-            if (sys_state.pending_power_cut)
+            uint32_t now_sec = state.cumulative_runtime_sec;
+            if (now_sec < flash_next_retry_sec)
             {
-                sys_state.power_state = POWER_STATE_PROTECTION_LATCHED;
-                sys_state.power_state_entry_ticks = sched_flags.tick_counter;
-                sys_state.pending_power_cut = 0;
+                /* Backoff after failed flash save to avoid tight retry loop */
+            }
+            else
+            {
+                Snapshot_UpdateDerived();
+                if (Flash_Save(flash_save_bypass))
+                {
+                    flash_save_requested = 0;
+                    flash_save_bypass = 0;
+                    flash_next_retry_sec = 0;
+                    if (sys_state.pending_power_cut)
+                    {
+                        sys_state.power_state = POWER_STATE_PROTECTION_LATCHED;
+                        sys_state.power_state_entry_ticks = sched_flags.tick_counter;
+                        sys_state.pending_power_cut = 0;
+                    }
+                }
+                else
+                {
+                    uint32_t backoff = flash_save_bypass ? FLASH_RETRY_BACKOFF_SEC_BYPASS : FLASH_RETRY_BACKOFF_SEC;
+                    flash_next_retry_sec = now_sec + backoff;
+                }
             }
         }
 
@@ -643,7 +653,17 @@ int main(void)
         {
             FactoryReset();
             Snapshot_UpdateDerived();
-            StorRegValue();
+            flash_save_bypass = 1;
+            flash_dirty = 1;
+            if (Flash_Save(1u))
+            {
+                flash_save_requested = 0;
+                flash_save_bypass = 0;
+            }
+            else
+            {
+                flash_save_requested = 1;
+            }
             sys_state.factory_reset_requested = 0;
         }
 
@@ -689,7 +709,17 @@ int main(void)
         {
             ota_triggered = 0;
             Snapshot_UpdateDerived();
-            StorRegValue();
+            flash_save_bypass = 1;
+            flash_dirty = 1;
+            if (Flash_Save(1u))
+            {
+                flash_save_requested = 0;
+                flash_save_bypass = 0;
+            }
+            else
+            {
+                flash_save_requested = 1;
+            }
             OTAShot = 1;
             while (1)
                 ;
@@ -793,9 +823,17 @@ void FactoryReset(void)
     state.low_battery_percent = DEFAULT_LOW_BATTERY_PERCENT;
     state.load_on_delay_config_sec = DEFAULT_LOAD_ON_DELAY_SEC;
     state.auto_power_on = DEFAULT_AUTO_POWER_ON;
-    state.battery_params_self_programmed = 1;
+    state.battery_params_self_programmed = 0;
+    state.battery_percent = 0;
+    state.shutdown_countdown_sec = 0;
+    state.restart_countdown_sec = 0;
+    state.load_on_delay_remaining_sec = 0;
+    state.cumulative_runtime_sec = 0;
+    state.charging_time_sec = 0;
+    state.current_runtime_sec = 0;
+    state.last_true_vbat_sample_tick = 0;
     sys_state.power_state = POWER_STATE_RPI_OFF;
-    sys_state.learning_mode = LEARNING_INACTIVE;
+    sys_state.learning_mode = LEARNING_ACTIVE;
 
     /* Phase 4: Reset runtime/state-machine variables so FSM is in known-safe state */
     sys_state.charger_state = CHARGER_STATE_ABSENT;
@@ -817,68 +855,267 @@ void FactoryReset(void)
     restart_remaining_ticks = 0;
 }
 
-void StorRegValue(void)
+extern const uint8_t __flash_storage_start__[];
+extern const uint8_t __flash_storage_end__[];
+static inline const uint8_t *FlashStorageStartPtr(void)
 {
-    uint32_t Timeout = 0;
-    uint8_t i = 0;
-    uint32_t Address = 0x08003C00;
-    uint8_t *img = reg_image[active_reg_image];
+    return __flash_storage_start__;
+}
+static inline const uint8_t *FlashStorageEndPtr(void)
+{
+    return __flash_storage_end__;
+}
 
+static uint32_t Flash_ComputeCrc32(const uint8_t *data, uint32_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    uint32_t i;
+    uint32_t bit;
+    for (i = 0; i < len; i++)
+    {
+        crc ^= data[i];
+        for (bit = 0; bit < 8u; bit++)
+        {
+            if (crc & 1u)
+                crc = (crc >> 1) ^ 0xEDB88320u;
+            else
+                crc >>= 1;
+        }
+    }
+    return ~crc;
+}
+
+static uint8_t Flash_RecordIsValid(const flash_persistent_data_t *rec)
+{
+    uint32_t computed;
+    if (rec->magic != FLASH_MAGIC_NUMBER)
+        return 0;
+    if (rec->version != FLASH_STRUCTURE_VERSION)
+        return 0;
+    computed = Flash_ComputeCrc32(((const uint8_t *)rec) + FLASH_CRC_START_OFFSET, FLASH_CRC_SIZE);
+    return (computed == rec->crc32) ? 1u : 0u;
+}
+
+static void Flash_ApplyRecordToState(const flash_persistent_data_t *rec)
+{
+    state.full_voltage_mv = rec->full_voltage_mv;
+    state.empty_voltage_mv = rec->empty_voltage_mv;
+    state.protection_voltage_mv = rec->protection_voltage_mv;
+    state.sample_period_minutes = rec->sample_period_minutes;
+    state.auto_power_on = (rec->auto_power_on != 0u) ? 1u : 0u;
+    state.battery_params_self_programmed = (rec->battery_params_self_programmed != 0u) ? 1u : 0u;
+    state.low_battery_percent = rec->low_battery_percent;
+    state.load_on_delay_config_sec = rec->load_on_delay_config_sec;
+    state.cumulative_runtime_sec = rec->cumulative_runtime_sec;
+    state.charging_time_sec = rec->charging_time_sec;
+
+    /* Clamp to valid ranges (same policy as InitAuthoritativeStateFromBuffer) */
+    if (!Validate_FullVoltage(state.full_voltage_mv)) state.full_voltage_mv = DEFAULT_VBAT_FULL_MV;
+    if (!Validate_EmptyVoltage(state.empty_voltage_mv)) state.empty_voltage_mv = DEFAULT_VBAT_EMPTY_MV;
+    if (!Validate_ProtectionVoltage(state.protection_voltage_mv)) state.protection_voltage_mv = DEFAULT_VBAT_PROTECT_MV;
+    if (state.empty_voltage_mv < state.protection_voltage_mv) state.empty_voltage_mv = state.protection_voltage_mv;
+    if (!Validate_SamplePeriod(state.sample_period_minutes)) state.sample_period_minutes = DEFAULT_SAMPLE_PERIOD_MIN;
+    if (state.low_battery_percent > 100u) state.low_battery_percent = DEFAULT_LOW_BATTERY_PERCENT;
+
+    /* Runtime-only: countdowns must not restore from flash; zero after load */
+    state.shutdown_countdown_sec = 0;
+    state.restart_countdown_sec = 0;
+    state.current_runtime_sec = 0;
+}
+
+static void Flash_FillRecordFromState(flash_persistent_data_t *rec, uint16_t seq)
+{
+    memset(rec, 0, sizeof(*rec));
+    rec->magic = FLASH_MAGIC_NUMBER;
+    rec->version = FLASH_STRUCTURE_VERSION;
+    rec->sequence_number = seq;
+    rec->reserved_header = 0;
+
+    rec->full_voltage_mv = state.full_voltage_mv;
+    rec->empty_voltage_mv = state.empty_voltage_mv;
+    rec->protection_voltage_mv = state.protection_voltage_mv;
+    rec->sample_period_minutes = state.sample_period_minutes;
+    rec->auto_power_on = (state.auto_power_on != 0u) ? 1u : 0u;
+    rec->battery_params_self_programmed = (state.battery_params_self_programmed != 0u) ? 1u : 0u;
+    rec->low_battery_percent = state.low_battery_percent;
+    rec->load_on_delay_config_sec = state.load_on_delay_config_sec;
+    rec->cumulative_runtime_sec = state.cumulative_runtime_sec;
+    rec->charging_time_sec = state.charging_time_sec;
+
+    rec->crc32 = Flash_ComputeCrc32(((const uint8_t *)rec) + FLASH_CRC_START_OFFSET, FLASH_CRC_SIZE);
+}
+
+static uint8_t Flash_ErasePage(uint32_t address)
+{
+    uint32_t Timeout = 48000000;
+    if ((address & 0x3FFu) != 0u)
+        return 0;
     if (READ_BIT(FLASH->CR, FLASH_CR_LOCK) != RESET)
     {
         WRITE_REG(FLASH->KEYR, FLASH_KEY1);
         WRITE_REG(FLASH->KEYR, FLASH_KEY2);
     }
+    /* Clear error and EOP flags */
+    FLASH->SR = FLASH_SR_EOP | FLASH_SR_PGERR | FLASH_SR_WRPRTERR;
     SET_BIT(FLASH->CR, FLASH_CR_PER);
-    WRITE_REG(FLASH->AR, Address);
+    WRITE_REG(FLASH->AR, address);
     SET_BIT(FLASH->CR, FLASH_CR_STRT);
-    Timeout = 48000000;
     while (((FLASH->SR) & (FLASH_SR_BSY)) == (FLASH_SR_BSY))
     {
         if (Timeout-- == 0)
-            return;
+        {
+            CLEAR_BIT(FLASH->CR, FLASH_CR_PER);
+            SET_BIT(FLASH->CR, FLASH_CR_LOCK);
+            return 0;
+        }
     }
     CLEAR_BIT(FLASH->CR, FLASH_CR_PER);
-    for (i = 0; i < 0xFF; i++)
+    if (FLASH->SR & (FLASH_SR_PGERR | FLASH_SR_WRPRTERR))
     {
-        SET_BIT(FLASH->CR, FLASH_CR_PG);
-        *(__IO uint16_t *)Address = img[i];
+        SET_BIT(FLASH->CR, FLASH_CR_LOCK);
+        return 0;
+    }
+    return 1;
+}
 
-        /* Wait for last operation to be completed */
+static uint8_t Flash_ProgramBuffer(uint32_t address, const uint8_t *data, uint32_t len)
+{
+    uint32_t Timeout;
+    uint32_t i = 0;
+    uint32_t addr = address;
+    uint16_t halfword;
+
+    if ((address & 1u) != 0u)
+        return 0;
+    if (len == 0u || len > FLASH_PAGE_SIZE)
+        return 0;
+
+    while (i < len)
+    {
+        uint8_t low = data[i];
+        uint8_t high = 0xFFu;
+        if ((i + 1u) < len)
+            high = data[i + 1u];
+        halfword = (uint16_t)low | ((uint16_t)high << 8);
+
+        FLASH->SR = FLASH_SR_EOP | FLASH_SR_PGERR | FLASH_SR_WRPRTERR;
+        SET_BIT(FLASH->CR, FLASH_CR_PG);
+        *(__IO uint16_t *)addr = halfword;
+
         Timeout = 48000000;
         while (((FLASH->SR) & (FLASH_SR_BSY)) == (FLASH_SR_BSY))
         {
             if (Timeout-- == 0)
             {
-                /* Time-out occurred. Set LED2 to blinking mode */
-                return;
+                CLEAR_BIT(FLASH->CR, FLASH_CR_PG);
+                SET_BIT(FLASH->CR, FLASH_CR_LOCK);
+                return 0;
             }
         }
-
-        /* If the program operation is completed, disable the PG Bit */
         CLEAR_BIT(FLASH->CR, FLASH_CR_PG);
+        if (FLASH->SR & (FLASH_SR_PGERR | FLASH_SR_WRPRTERR))
+        {
+            SET_BIT(FLASH->CR, FLASH_CR_LOCK);
+            return 0;
+        }
 
-        Address = Address + 2;
+        addr += 2u;
+        i += 2u;
     }
     SET_BIT(FLASH->CR, FLASH_CR_LOCK);
+    return 1;
 }
 
-uint8_t GetRegValue(void)
+void Flash_Init(void)
 {
-    uint8_t i = 0;
-    uint32_t Address = 0x08003C00;
+    flash_dirty = 0;
+    flash_sequence = 0;
+    flash_last_write_sec = 0;
+}
 
-    if (*(__IO uint8_t *)Address != 0xFF)
+void Flash_Load(void)
+{
+    flash_persistent_data_t rec;
+    size_t storage_size = (size_t)(FlashStorageEndPtr() - FlashStorageStartPtr());
+    if (storage_size < sizeof(rec))
     {
-        for (i = 0; i < 0xFF; i++)
-        {
-            aReceiveBuffer[i] = *(__IO uint16_t *)Address & 0xFF;
-            Address = Address + 2;
-        }
-        return 1;  /* Loaded from flash; caller applies to state via InitAuthoritativeStateFromBuffer */
+        FactoryReset();
+        RequestFlashSave(0, 1);
+        flash_sequence = 0;
+        return;
     }
+    memcpy(&rec, (const void *)FlashStorageStartPtr(), sizeof(rec));
+
+    if (Flash_RecordIsValid(&rec))
+    {
+        Flash_ApplyRecordToState(&rec);
+        UpdateDerivedState();
+        flash_sequence = rec.sequence_number;
+        flash_dirty = 0;
+        flash_last_write_sec = state.cumulative_runtime_sec;
+    }
+    else
+    {
+        FactoryReset();
+        RequestFlashSave(0, 1);
+        flash_sequence = 0;
+    }
+}
+
+uint8_t Flash_Save(uint8_t bypass)
+{
+    flash_persistent_data_t rec;
+    flash_persistent_data_t verify;
+    uint16_t next_seq = (uint16_t)(flash_sequence + 1u);
+    uint32_t target_addr = (uint32_t)(uintptr_t)FlashStorageStartPtr();
+    uint32_t primask;
+    uint8_t ok;
+    size_t storage_size = (size_t)(FlashStorageEndPtr() - FlashStorageStartPtr());
+
+    if (!flash_dirty && !bypass)
+        return 1u;
+    if (!bypass && !Flash_CanWrite())
+        return 0u;
+    if (storage_size < sizeof(rec))
+        return 0u;
+
+    Flash_FillRecordFromState(&rec, next_seq);
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    ok = Flash_ErasePage(target_addr);
+    if (ok)
+        ok = Flash_ProgramBuffer(target_addr, (const uint8_t *)&rec, sizeof(rec));
+    if (!primask)
+        __enable_irq();
+    if (!ok)
+        return 0u;
+
+    memcpy(&verify, (const void *)FlashStorageStartPtr(), sizeof(verify));
+    if (!Flash_RecordIsValid(&verify) || verify.sequence_number != next_seq)
+        return 0u;
+
+    flash_sequence = next_seq;
+    flash_last_write_sec = state.cumulative_runtime_sec;
+    flash_dirty = 0;
+    return 1u;
+}
+
+void Flash_FactoryReset(void)
+{
     FactoryReset();
-    return 0;  /* Factory reset; state already set by FactoryReset */
+    RequestFlashSave(1, 1);
+}
+
+uint8_t Flash_IsDirty(void)
+{
+    return flash_dirty;
+}
+
+uint8_t Flash_CanWrite(void)
+{
+    uint32_t elapsed = state.cumulative_runtime_sec - flash_last_write_sec;
+    return (elapsed >= FLASH_WRITE_RATE_LIMIT_SEC) ? 1u : 0u;
 }
 
 /**
@@ -1077,7 +1314,7 @@ static void Protection_Step(void)
     if (prot_state.below_threshold_count < PROTECTION_SAMPLES_REQUIRED)
         return;
     /* Invariant A6: request flash, set pending_power_cut; main loop commits then sets PROTECTION_LATCHED */
-    flash_save_requested = 1;
+    RequestFlashSave(1, 1);
     sys_state.pending_power_cut = 1;
 }
 
@@ -1100,8 +1337,10 @@ static void ChargerStateMachine_Step(void)
             else
                 sys_state.charger_state = CHARGER_STATE_ABSENT;
             sys_state.charger_state_entry_ticks = tick;
-            /* No flash save here: charger_state/window_mgr are runtime-only (B9); saves at window end would increase wear with no persistence benefit. */
+            /* Charger/window are runtime-only (B9); only flush if something else is dirty. */
             MustRefreshVDD = 1;
+            if (flash_dirty)
+                RequestFlashSave(0, 0);
         }
     }
     else

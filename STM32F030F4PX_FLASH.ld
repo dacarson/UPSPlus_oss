@@ -9,8 +9,7 @@
 **                      16KBytes FLASH total
 **                      - Bootloader: 0x08000000 to 0x08000800 (2KB reserved)
 **                      - Application: 0x08000800 to 0x08003C00 (13KB available)
-**                      - Flash Storage: 0x08003C00 to 0x08003DFE (510 bytes reserved for register storage)
-**                      - Remaining: 0x08003DFE to 0x08004000 (514 bytes buffer)
+**                      - Flash Storage: 0x08003C00 to 0x08004000 (1KB reserved for persistence)
 **                      4KBytes RAM
 **
 **                Set heap size, stack size and stack location according
@@ -49,11 +48,19 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 4K
-  /* Application flash: 0x08000800 to 0x08003C00 (13KB)
-   * Flash storage reserved: 0x08003C00 to 0x08003DFE (510 bytes for register storage)
-   * Remaining space: 0x08003DFE to 0x08004000 (514 bytes buffer) */
-  FLASH    (rx)    : ORIGIN = 0x08000800,   LENGTH = 13K
+  /* Application flash: 0x08000800 to 0x08003C00 (13KB) */
+  FLASH         (rx)    : ORIGIN = 0x08000800,   LENGTH = 13K
+  /* Flash storage reserved: 0x08003C00 to 0x08004000 (1KB for persistence) */
+  FLASH_STORAGE (rx)    : ORIGIN = 0x08003C00,   LENGTH = 1K
 }
+
+/* Export flash storage bounds for C code */
+__flash_storage_start__ = ORIGIN(FLASH_STORAGE);
+__flash_storage_end__   = ORIGIN(FLASH_STORAGE) + LENGTH(FLASH_STORAGE);
+
+/* Export vector table locations for C code */
+__vector_table_ram_start__   = ORIGIN(RAM);
+__vector_table_flash_start__ = ORIGIN(FLASH);
 
 /* Sections */
 SECTIONS

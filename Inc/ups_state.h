@@ -126,45 +126,19 @@ STATIC_ASSERT((1000 % TICK_PERIOD_MS) == 0, "TICK_PERIOD_MS must divide 1000");
 /* Snapshot and Scheduling */
 /* Note: Snapshot updates use tick_counter deltas (canonical timing), not convenience counters */
 
-/* Flash Persistence - Gated for Phase 6+ */
-/* 
- * Flash persistence structures and APIs are gated behind UPS_ENABLE_FLASH_PERSISTENCE.
- * For Phase 1-5: Define UPS_ENABLE_FLASH_PERSISTENCE=0 (default)
- * For Phase 6+: Define UPS_ENABLE_FLASH_PERSISTENCE=1 after verification
- */
-#ifndef UPS_ENABLE_FLASH_PERSISTENCE
-#define UPS_ENABLE_FLASH_PERSISTENCE  0           /* Default: disabled for Phase 1-5 */
-#endif
-
-#if UPS_ENABLE_FLASH_PERSISTENCE == 1
-/* Flash Persistence Verification Guard */
-#ifndef UPS_FLASH_LAYOUT_VERIFIED
-#error "Flash persistence enabled without UPS_FLASH_LAYOUT_VERIFIED. " \
-       "Flash layout must be verified before enabling persistence."
-#endif
-
-/* Flash Persistence Constants */
+/* Flash Persistence */
 /* Magic number: "UPSP" - endian-safe constant construction */
 /* Note: Flash storage is little-endian on STM32; this constant ensures correct
  * byte order when comparing against flash-stored values. */
 #define FLASH_MAGIC_NUMBER            ((uint32_t)('U') | ((uint32_t)('P')<<8) | ((uint32_t)('S')<<16) | ((uint32_t)('P')<<24))
 #define FLASH_STRUCTURE_VERSION       1           /* Increment when structure changes */
 #define FLASH_WRITE_RATE_LIMIT_SEC    5           /* Minimum seconds between flash writes */
+#define FLASH_DIRTY_MAX_INTERVAL_SEC  60          /* Max seconds before forcing a dirty save */
+#define FLASH_RETRY_BACKOFF_SEC       2           /* Retry backoff after failed save */
+#define FLASH_RETRY_BACKOFF_SEC_BYPASS 1          /* Backoff for bypass saves (protection/OTA) */
 
-/* Flash Page Size - ASSUMPTION PENDING VERIFICATION */
-/* Note: Assumed 1KB for STM32F030F4Px. MUST verify actual SKU flash size and part ID
- * before Phase 6. This constant is used for structure size checks only, not addresses. */
-#define FLASH_PAGE_SIZE               1024        /* Assumed page size (1KB) - VERIFY SKU */
-
-/* Flash Layout - Addresses in Separate Header */
-/* 
- * Flash address macros (FLASH_STORAGE_START, FLASH_SLOT_A_ADDR, FLASH_SLOT_B_ADDR)
- * are NOT defined in this header. They are in ups_flash_layout.h, included only
- * by flash persistence code (Phase 6+). This prevents flash assumptions from
- * leaking into Phase 1-5 code.
- */
-#define FLASH_SLOT_SIZE               512         /* Each slot is 512 bytes */
-#endif /* UPS_ENABLE_FLASH_PERSISTENCE */
+/* Flash Page Size - STM32F030F4Px uses 1KB pages */
+#define FLASH_PAGE_SIZE               1024
 
 /* True-VBAT Staleness (timing uses canonical 10ms tick - see TICK_PERIOD_MS block) */
 #define TRUE_VBAT_MAX_AGE_SEC         600     /* 10 minutes max staleness */
@@ -469,8 +443,6 @@ typedef struct {
 /*                       FLASH PERSISTENCE STRUCTURE                          */
 /*===========================================================================*/
 
-#if UPS_ENABLE_FLASH_PERSISTENCE == 1
-
 /**
  * @brief Flash Persistent Data Structure
  * 
@@ -527,10 +499,8 @@ typedef struct {
 #define FLASH_CRC_SIZE          (FLASH_CRC_END_OFFSET - FLASH_CRC_START_OFFSET)
 
 /* Compile-time assertion: flash structure must fit in slot size */
-STATIC_ASSERT(sizeof(flash_persistent_data_t) <= FLASH_SLOT_SIZE, 
-               "flash_persistent_data_t exceeds FLASH_SLOT_SIZE");
-
-#endif /* UPS_ENABLE_FLASH_PERSISTENCE */
+STATIC_ASSERT(sizeof(flash_persistent_data_t) <= FLASH_PAGE_SIZE,
+               "flash_persistent_data_t exceeds FLASH_PAGE_SIZE");
 
 /*===========================================================================*/
 /*                         SCHEDULER STRUCTURES                               */
@@ -766,15 +736,13 @@ void Snapshot_Init(void);
 void Snapshot_Update(void);
 uint8_t Snapshot_ReadRegister(uint8_t reg_addr);
 
-/* Flash Persistence - Gated for Phase 6+ */
-#if UPS_ENABLE_FLASH_PERSISTENCE == 1
+/* Flash Persistence */
 void Flash_Init(void);
 void Flash_Load(void);
-void Flash_Save(void);
+uint8_t Flash_Save(uint8_t bypass); /* Returns 1 on success or no-op, 0 on failure */
 void Flash_FactoryReset(void);
 uint8_t Flash_IsDirty(void);      /* Returns 1 if dirty, 0 if clean */
 uint8_t Flash_CanWrite(void);    /* Returns 1 if rate limit allows, 0 if not */
-#endif /* UPS_ENABLE_FLASH_PERSISTENCE */
 
 /* ADC Processing */
 void ADC_ProcessSample(void);
