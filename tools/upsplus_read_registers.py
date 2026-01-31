@@ -49,8 +49,11 @@ def format_bool(value: int) -> str:
 
 def format_power_status(value: int) -> str:
     power_on = bool(value & 0x01)
-    learning_mode = bool(value & 0x02)
-    return f"0x{value:02X} (power_on={format_bool(power_on)}, learning_mode={format_bool(learning_mode)})"
+    calibration_window = bool(value & 0x02)
+    return (
+        f"0x{value:02X} (power_on={format_bool(power_on)}, "
+        f"calibration_window={format_bool(calibration_window)})"
+    )
 
 
 def print_kv(label: str, value: str) -> None:

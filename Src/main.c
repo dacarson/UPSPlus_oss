@@ -301,7 +301,9 @@ void Snapshot_Init(void)
 
 static void UpdateDerivedState(void)
 {
-    sys_state.learning_mode = (state.battery_params_self_programmed == 0) ? LEARNING_ACTIVE : LEARNING_INACTIVE;
+    sys_state.learning_mode = (sys_state.charger_state == CHARGER_STATE_FORCED_OFF_WINDOW)
+        ? LEARNING_ACTIVE
+        : LEARNING_INACTIVE;
 }
 
 void Snapshot_Update(void)
@@ -543,7 +545,7 @@ static void InitAuthoritativeStateFromDefaults(void)
 
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.charger_state = CHARGER_STATE_ABSENT;
-    sys_state.learning_mode = (state.battery_params_self_programmed == 0) ? LEARNING_ACTIVE : LEARNING_INACTIVE;
+    sys_state.learning_mode = LEARNING_INACTIVE;
     sys_state.power_state_entry_ticks = 0;
     sys_state.charger_state_entry_ticks = 0;
     sys_state.factory_reset_requested = 0;
@@ -870,7 +872,6 @@ void FactoryReset(void)
     state.current_runtime_sec = 0;
     state.last_true_vbat_sample_tick = 0;
     sys_state.power_state = POWER_STATE_RPI_OFF;
-    sys_state.learning_mode = LEARNING_ACTIVE;
     sys_state.factory_test_selector = 0;
 
     /* Reset runtime/state-machine variables so FSM is in known-safe state */
@@ -878,6 +879,7 @@ void FactoryReset(void)
     sys_state.charger_state_entry_ticks = 0;
     sys_state.power_state_entry_ticks = 0;
     sys_state.pending_power_cut = 0;
+    sys_state.learning_mode = LEARNING_INACTIVE;
     window_mgr.window_due = 0;
     window_mgr.window_active = 0;
     window_mgr.last_window_end_ticks = 0;

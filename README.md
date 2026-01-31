@@ -60,7 +60,7 @@ Note: multi-byte registers are little-endian (LSB at lower address).
   - `0x11–0x12` Protection voltage (mV)
 - `0x13–0x14` Battery percent (RO; LSB=percent, MSB=0x00)
 - `0x15–0x16` Sample period minutes (RW)
-- `0x17` Power status (RO; bit0=power, bit1=learning)
+- `0x17` Power status (RO; bit0=power, bit1=calibration window active)
 - `0x18` Shutdown countdown seconds (RW)
 - `0x19` Auto power on (RW; 0/1)
 - `0x1A` Restart countdown seconds (RW)
@@ -70,7 +70,7 @@ Note: multi-byte registers are little-endian (LSB at lower address).
   - `0x20–0x23` Charging time (s)
   - `0x24–0x27` Current runtime (s)
 - `0x28–0x29` Firmware version (RO)
-- `0x2A` Battery parameters self-programmed (RW; 0=learn, 1=manual)
+- `0x2A` Battery parameters self-programmed (RW; 0=self-program, 1=manual)
 - `0x2B` Low battery percent threshold (RW)
 - `0x2C–0x2D` Load on delay (RW, seconds)
 - `0x2E–0xEF` Reserved (RO 0x00, writes ignored)
@@ -80,7 +80,7 @@ Note: multi-byte registers are little-endian (LSB at lower address).
   - `0xFD–0xFF` Page data
 
 Factory Testing selectors:
-- `0x01` State page: power_state, charger_state, learning_mode
+- `0x01` State page: power_state, charger_state, learning_mode (legacy name; indicates calibration window active)
 - `0x02` Button page: button_state, click, hold_ticks (LSB)
 - `0x03` Charger/window page: charger_present, window_active, window_due
 - `0x04` Protection page: protection_active, below_count, pending_power_cut

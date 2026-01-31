@@ -187,15 +187,15 @@ typedef enum {
 } charger_state_t;
 
 /**
- * @brief Learning Mode - Battery parameter learning state
+ * @brief Calibration Window Flag (legacy name: learning_mode_t)
  * 
  * Transitions:
- * - INACTIVE -> ACTIVE: Battery Parameters Self-Programmed (0x2A) = 0
- * - ACTIVE -> INACTIVE: Battery Parameters Self-Programmed (0x2A) = 1 (user override)
+ * - INACTIVE -> ACTIVE: Charger state enters FORCED_OFF_WINDOW
+ * - ACTIVE -> INACTIVE: Charger state exits FORCED_OFF_WINDOW
  */
 typedef enum {
-    LEARNING_INACTIVE = 0,             /* Not learning (0x2A = 1) */
-    LEARNING_ACTIVE                    /* Learning battery Full/Empty voltages (0x2A = 0) */
+    LEARNING_INACTIVE = 0,             /* Calibration window inactive */
+    LEARNING_ACTIVE                    /* Calibration window active (charger forced off) */
 } learning_mode_t;
 
 /**
@@ -284,21 +284,21 @@ typedef struct {
 /**
  * @brief Combined System State Machine Structure
  * 
- * Contains the three orthogonal state dimensions (power, charger, learning)
+ * Contains the three orthogonal state dimensions (power, charger, calibration flag)
  * plus their entry timing. Window management and physical charger detection
  * are separate structures to maintain clear separation of concerns.
  * 
- * Learning Mode Contract:
- * - learning_mode is DERIVED-ONLY and must be recomputed from battery_params_self_programmed during state update
+ * Calibration Window Flag Contract:
+ * - learning_mode is DERIVED-ONLY and must be recomputed from charger_state during state update
  * - learning_mode must NEVER be directly set from I2C writes
- * - Canonical source: battery_params_self_programmed (0x2A) in authoritative_state_t
- * - learning_mode == LEARNING_ACTIVE iff battery_params_self_programmed == 0
+ * - Canonical source: charger_state == CHARGER_STATE_FORCED_OFF_WINDOW
+ * - learning_mode == LEARNING_ACTIVE iff charger_state == CHARGER_STATE_FORCED_OFF_WINDOW
  */
 typedef struct {
     /* State dimensions */
     power_state_t power_state;
     charger_state_t charger_state;
-    learning_mode_t learning_mode;     /* Derived from battery_params_self_programmed; never set directly */
+    learning_mode_t learning_mode;     /* Derived from charger_state; never set directly */
     
     /* State timing (in TIM1 ticks). Invariant: set on every transition into that state (including restart start, charger PRESENT/ABSENT, power RPI_ON/RPI_OFF). */
     uint32_t power_state_entry_ticks;
@@ -395,8 +395,8 @@ typedef struct {
     uint8_t shutdown_countdown_sec;    /* 0x18: Current countdown (0=inactive, 10-255) */
     uint8_t auto_power_on;             /* 0x19: Back-to-AC auto power up (0/1) */
     uint8_t restart_countdown_sec;     /* 0x1A: Current countdown (0=inactive, 10-255) */
-    /* Battery Parameters Self-Programmed (0x2A): 0 => learning active, 1 => learning inactive */
-    uint8_t battery_params_self_programmed; /* 0x2A: 0=learning active, 1=learning inactive (user override) */
+    /* Battery Parameters Self-Programmed (0x2A): 0 => self-programming enabled, 1 => disabled */
+    uint8_t battery_params_self_programmed; /* 0x2A: 0=enable self-programming, 1=disable (user override) */
     uint8_t low_battery_percent;       /* 0x2B: Low battery threshold (0-100%) */
     /* Load On Delay Register Readback Rule (0x2C-0x2D):
      * - When countdown inactive (power_state != LOAD_ON_DELAY): Returns load_on_delay_config_sec
@@ -727,9 +727,9 @@ extern volatile uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]; /* 
 /* State Machine */
 void StateMachine_Init(void);
 void StateMachine_Update(void);
-/* Register 0x17 derivation: depends on learning_mode (from battery_params_self_programmed) and power_state.
+/* Register 0x17 derivation: depends on learning_mode (from charger_state) and power_state.
  * Contract: Do not trust state->learning_mode unless it was recomputed during StateMachine_Update();
- * learning_mode is derived-only from 0x2A and must be kept in sync when reading power status. */
+ * learning_mode is derived-only from charger_state and must be kept in sync when reading power status. */
 uint8_t GetPowerStatusRegisterValue(const authoritative_state_t *auth_state, const system_state_t *state);
 
 /* Snapshot Management */
