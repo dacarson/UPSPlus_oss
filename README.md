@@ -110,6 +110,11 @@ Factory Testing selectors:
 - Behavior specification (contract for features): `documents/UPSPlus_Behavior_Spec.md`
 - Refactoring plan and rationale: `documents/UPSPlus_Refactoring_Plan.md`
 
+## NUT Driver
+
+A pre-built Linux NUT driver for UPSPlus is available here:
+https://github.com/dacarson/nut/releases/tag/v2.8.2-upsplus
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
