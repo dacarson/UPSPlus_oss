@@ -15,13 +15,15 @@ The code has been re-written from the ground up using a combination of ChatGPT a
 - Battery monitoring via I2C register map.
 - Protection shutdown at configured protection voltage.
 - Auto power-on with configurable low-battery threshold and load-on delay.
+- Boot brownout backoff learning (see [Boot Brownout Backoff](#boot-brownout-backoff)).
 - Factory Testing pages (0xFC–0xFF) for diagnostics.
 - OTA firmware update support.
 
 ## Button Behavior
 
 - The Func Key button is debounced at 50 ms.
-- Short press: powers on the load when the UPS is off and conditions are safe.
+- If the load is off, short press powers on the load when the UPS is off and conditions are safe (aka there is sufficient charge in the batteries).
+- If the load is on, short press has no action.
 - Long press (>= 10 s) when the load is on: powers off.
 - Long press (>= 10 s) when the load is off: triggers a factory reset.
 
