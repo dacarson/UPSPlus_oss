@@ -18,6 +18,16 @@ The code has been re-written from the ground up using a combination of ChatGPT a
 - Factory Testing pages (0xFC–0xFF) for diagnostics.
 - OTA firmware update support.
 
+## Boot Brownout Backoff
+
+If the RPi browns out shortly after power-on (battery voltage drops to or below the protection
+threshold within 5 minutes of RPi being powerd on), the firmware treats this as a boot failure
+and increments the internal `load.on.delay` by 1 minute before the next auto power-on attempt.
+Learning stops after a successful 5-minute run without a protection-triggered shutdown. The
+learned delay is clamped to 60 minutes, persists across power cycles, and is cleared only by
+factory reset. A user write to `load.on.delay` becomes the new baseline; any further learning
+adds minutes on top of that value.
+
 ## Firmware Update (OTA)
 
 1. Ensure the UPSPlus is connected to your Raspberry Pi.

@@ -332,6 +332,49 @@ static void RequestFlashSave(uint8_t bypass, uint8_t mark_dirty)
         flash_dirty = 1;
 }
 
+static void BootBackoff_OnPowerOn(void)
+{
+    sys_state.boot_backoff_active = 1u;
+    sys_state.boot_attempt_start_ticks = sched_flags.tick_counter;
+}
+
+static void BootBackoff_OnProtectionTrigger(void)
+{
+    if (!sys_state.boot_backoff_active)
+        return;
+    if (sys_state.power_state != POWER_STATE_RPI_ON)
+        return;
+
+    uint32_t elapsed = sched_flags.tick_counter - sys_state.boot_attempt_start_ticks;
+    if (elapsed <= BOOT_BROWNOUT_WINDOW_TICKS)
+    {
+        uint32_t new_delay = (uint32_t)state.load_on_delay_config_sec + BOOT_BACKOFF_INCREMENT_SEC;
+        if (new_delay > BOOT_BACKOFF_MAX_SEC)
+            new_delay = BOOT_BACKOFF_MAX_SEC;
+        if ((state.load_on_delay_config_sec < BOOT_BACKOFF_MAX_SEC) && (state.load_on_delay_config_sec != (uint16_t)new_delay)) 
+        {
+            state.load_on_delay_config_sec = (uint16_t)new_delay;
+            RequestFlashSave(0, 1);
+            Snapshot_UpdateDerived();
+        }
+    }
+
+    sys_state.boot_backoff_active = 0u;
+}
+
+static void BootBackoff_CheckSuccess(void)
+{
+    if (!sys_state.boot_backoff_active)
+        return;
+    if (sys_state.power_state != POWER_STATE_RPI_ON)
+    {
+        sys_state.boot_backoff_active = 0u;
+        return;
+    }
+    if ((sched_flags.tick_counter - sys_state.boot_attempt_start_ticks) >= BOOT_BROWNOUT_WINDOW_TICKS)
+        sys_state.boot_backoff_active = 0u;
+}
+
 /* RO register addresses: reject writes (ignore, don't apply) */
 static uint8_t IsReadOnlyRegister(uint8_t reg)
 {
@@ -539,7 +582,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.version = 20;
+    state.version = 21;
     state.snapshot_tick = 0;
     state.last_true_vbat_sample_tick = 0;
 
@@ -551,6 +594,8 @@ static void InitAuthoritativeStateFromDefaults(void)
     sys_state.factory_reset_requested = 0;
     sys_state.factory_test_selector = 0;
     sys_state.pending_power_cut = 0;
+    sys_state.boot_backoff_active = 0;
+    sys_state.boot_attempt_start_ticks = 0;
 
     /* State machine runtime state */
     window_mgr.window_due = 0;
@@ -880,6 +925,8 @@ void FactoryReset(void)
     sys_state.power_state_entry_ticks = 0;
     sys_state.pending_power_cut = 0;
     sys_state.learning_mode = LEARNING_INACTIVE;
+    sys_state.boot_backoff_active = 0;
+    sys_state.boot_attempt_start_ticks = 0;
     window_mgr.window_due = 0;
     window_mgr.window_active = 0;
     window_mgr.last_window_end_ticks = 0;
@@ -1339,6 +1386,8 @@ static void Protection_Step(void)
     if (prot_state.below_threshold_count < PROTECTION_SAMPLES_REQUIRED)
         return;
     /* Invariant A6: request flash, set pending_power_cut; main loop commits then sets PROTECTION_LATCHED */
+    if (sys_state.pending_power_cut == 0u)
+        BootBackoff_OnProtectionTrigger();
     RequestFlashSave(1, 1);
     sys_state.pending_power_cut = 1;
 }
@@ -1461,6 +1510,7 @@ static void RestartPowerCycle_Step(void)
         sys_state.power_state = POWER_STATE_RPI_ON;
         sys_state.power_state_entry_ticks = sched_flags.tick_counter;
         prot_state.below_threshold_count = 0;
+        BootBackoff_OnPowerOn();
     }
 }
 
@@ -1508,8 +1558,11 @@ static void PowerStateMachine_OnTick1s(void)
             sys_state.power_state = POWER_STATE_RPI_ON;
             sys_state.power_state_entry_ticks = sched_flags.tick_counter;
             prot_state.below_threshold_count = 0;
+            BootBackoff_OnPowerOn();
         }
     }
+
+    BootBackoff_CheckSuccess();
 }
 
 static void Scheduler_Tick10ms(void)
@@ -1658,6 +1711,7 @@ static void Button_DispatchActions(void)
                 prot_state.below_threshold_count = 0;
                 sys_state.pending_power_cut = 0;
                 state.load_on_delay_remaining_sec = 0;
+                BootBackoff_OnPowerOn();
                 Snapshot_UpdateDerived();
             }
         }

@@ -118,6 +118,12 @@ extern "C" {
 /* Note: >= BUTTON_LONG_PRESS_TICKS (exactly 10s) counts as long press per plan boundary */
 #define BUTTON_LONG_PRESS_TICKS       (10000 / TICK_PERIOD_MS)   /* 10 seconds for long press */
 
+/* Boot brownout backoff */
+#define BOOT_BROWNOUT_WINDOW_MINUTES  5u
+#define BOOT_BROWNOUT_WINDOW_TICKS    (BOOT_BROWNOUT_WINDOW_MINUTES * 60u * TICKS_PER_1S)
+#define BOOT_BACKOFF_INCREMENT_SEC    60u
+#define BOOT_BACKOFF_MAX_SEC          3600u
+
 /* Compile-time guards: TICK_PERIOD_MS must divide 100/500/1000 cleanly for derived tick constants */
 STATIC_ASSERT((100 % TICK_PERIOD_MS) == 0, "TICK_PERIOD_MS must divide 100");
 STATIC_ASSERT((500 % TICK_PERIOD_MS) == 0, "TICK_PERIOD_MS must divide 500");
@@ -319,6 +325,10 @@ typedef struct {
      * 4. ONLY AFTER commit attempt (success or failure), cut MT_EN LOW
      * This prevents cutting power before state is persisted. */
     uint8_t pending_power_cut;
+
+    /* Boot brownout backoff (runtime-only, not persisted) */
+    uint8_t boot_backoff_active;
+    uint32_t boot_attempt_start_ticks;
 } system_state_t;
 
 /**
