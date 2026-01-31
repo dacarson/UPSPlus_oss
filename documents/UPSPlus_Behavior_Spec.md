@@ -197,6 +197,22 @@ Key behaviors:
 - When protection triggers: pending power cut is set, flash save is attempted, then MT_EN is cut.
 - If flash save fails, power is still cut after the attempt. On next boot, defaults may apply,
   but the protection latch behavior remains effective.
+- **Boot brownout backoff (load-on delay learning):**
+  - **Boot attempt start:** when MT_EN is asserted (power_state enters `RPI_ON`).
+  - **Boot failure event:** protection triggers (battery voltage <= configured protection threshold
+    for required samples; see Section 7) within **5 minutes** of load enable (**inclusive**, ≤ 5:00).
+    For this rule, “protection triggers” means the same event that initiates the shutdown sequence
+    (pending power cut / transition into protection handling).
+  - **Boot success:** the load remains enabled for **5 minutes** without a protection threshold
+    violation.
+  - **Learning rule:** after each boot failure event (no consecutive-failure requirement), the
+    firmware increments the internal `load.on.delay` by **1 minute** before the next auto power-on
+    attempt, and learning stops after a successful boot.
+  - **Clamp:** learned delay is clamped to **60 minutes (3600 seconds)**.
+  - **Persistence:** learned `load.on.delay` persists across power cycles and reboots and is cleared
+    only by factory reset.
+  - **Manual override:** a user write to `load.on.delay` replaces the learned value and becomes the
+    new baseline for any future learning (learning adds minutes on top of the user-provided value).
 
 ---
 
