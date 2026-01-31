@@ -4,10 +4,7 @@
 #include <stdint.h>
 #include "ups_state.h"
 
-/* I2C slave receive buffer - 256 bytes; TX reads use reg_image[] */
-extern volatile uint8_t aReceiveBuffer[256];
-
-/* Phase 2: Double-buffered register image; ISR latches active_reg_image on ADDR+READ, TX from reg_image[latched] */
+/* Double-buffered register image; ISR latches active_reg_image on ADDR+READ, TX from reg_image[latched] */
 extern uint8_t reg_image[2][256];
 extern volatile uint8_t active_reg_image;
 
@@ -15,7 +12,7 @@ extern volatile uint8_t active_reg_image;
 extern "C" {
 #endif
 
-/* Phase 2: Pending write - ISR stores write data here; main loop applies to state */
+/* Pending write - ISR stores write data here; main loop applies to state */
 extern i2c_pending_write_t i2c_pending_write;
 
 void MX_I2C1_Slave_Init(void);

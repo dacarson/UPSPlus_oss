@@ -17,12 +17,12 @@
  * 5. Data Coherence: Multi-byte registers read from single atomic snapshot
  *
  * ---------------------------------------------------------------------------
- * Phase 1 Characterization Results (single reference for verification claims)
+ * Characterization Results (single reference for verification claims)
  * ---------------------------------------------------------------------------
- * The following were confirmed during Phase 1 characterization (user verification
- * on legacy firmware / hardware). Inline "VERIFIED (Phase 1)" or "Confirmed by
- * Phase 1 characterization" below refer to this block. If disputed later,
- * re-run characterization (e.g., test script reading reg 0x14, reserved region,
+ * The following were confirmed during characterization (user verification
+ * on legacy firmware / hardware). Inline "VERIFIED" or "Confirmed by
+ * characterization" below refer to this block. If disputed later, re-run
+ * characterization (e.g., test script reading reg 0x14, reserved region,
  * ADC scaling, temperature units) and update this section.
  *
  * - VBUS/USBIN ADC scaling: __LL_ADC_CALC_DATA_TO_VOLTAGE produces connector-
@@ -78,7 +78,7 @@ extern "C" {
  * as produced by the existing ADC conversion macros (same domain as uVBUSVolt/uUSBINVolt).
  * They are NOT raw ADC counts or pre-scaled values.
  * 
- * Confirmed by Phase 1 characterization: ADC scaling as above (see Phase 1 block at top of file).
+ * Confirmed by characterization: ADC scaling as above (see block at top of file).
  * 
  * Detection algorithm:
  * 1. Use MAX(usbc_voltage_mv, microusb_voltage_mv) as charger voltage
@@ -86,8 +86,8 @@ extern "C" {
  * 3. Hysteresis: present_on (4200mV) for detection, present_off (3800mV) for removal
  * 4. Require CHARGER_STABILITY_SAMPLES consecutive qualified samples before state change
  */
-#define CHARGER_PRESENT_ON_MV         4200    /* Threshold for charger detected (post-scaled mV); Phase 1 verified */
-#define CHARGER_PRESENT_OFF_MV        3800    /* Threshold for charger removed (post-scaled mV); Phase 1 verified */
+#define CHARGER_PRESENT_ON_MV         4200    /* Threshold for charger detected (post-scaled mV); verified */
+#define CHARGER_PRESENT_OFF_MV        3800    /* Threshold for charger removed (post-scaled mV); verified */
 /* Note: CHARGER_STABILITY_SAMPLES counts ADC samples (adc_sample_seq), not 10ms ticks */
 #define CHARGER_STABILITY_SAMPLES     3       /* Consecutive ADC samples for charger state change */
 
@@ -373,7 +373,7 @@ typedef struct {
     uint16_t battery_voltage_mv;       /* 0x05-0x06: uVBATVolt */
     uint16_t usbc_voltage_mv;          /* 0x07-0x08: uVBUSVolt */
     uint16_t microusb_voltage_mv;      /* 0x09-0x0A: uUSBINVolt */
-    /* Temperature: always integer °C (Phase 1 characterization; __LL_ADC_CALC_TEMPERATURE).
+    /* Temperature: always integer °C (__LL_ADC_CALC_TEMPERATURE).
      * Contract: value is always degrees Celsius (integer). Field name temperature_raw retained for now. */
     uint16_t temperature_raw;          /* 0x0B-0x0C: Temperature, always °C integer */
     
@@ -388,7 +388,7 @@ typedef struct {
      * Writer/compute logic MUST enforce 0-100 range. Snapshot/register mapping emits [percent, 0x00]. */
     uint8_t battery_percent;           /* 0x13-0x14: Published percentage (0-100), expanded to 16-bit in register */
     /* Battery percent staleness: battery_percent is assumed fresh iff last_true_vbat_sample_tick is fresh.
-     * Phase 2/3 power-on gating uses last_true_vbat_sample_tick exclusively (see IsTrueVbatSampleFresh()). */
+     * Power-on gating uses last_true_vbat_sample_tick exclusively (see IsTrueVbatSampleFresh()). */
     
     /* Configuration (RW via I2C, persisted to flash) */
     uint16_t sample_period_minutes;    /* 0x15-0x16: Sample period (1-1440 min) */
@@ -484,7 +484,7 @@ typedef struct {
     uint8_t reserved_padding0;         /* Alignment + deterministic CRC - MUST be zeroed */
     uint16_t load_on_delay_config_sec;
     uint16_t reserved_padding1;        /* Alignment + deterministic CRC - MUST be zeroed */
-    /* Note: In Phase 6, provide FlashPersistentData_InitZero(&rec) helper to ensure
+    /* Note: Provide FlashPersistentData_InitZero(&rec) helper to ensure
      * all reserved/padding fields are zeroed before CRC calculation. */
     
     /* Runtime state (included in CRC, for recovery after unexpected power loss) */
@@ -510,7 +510,7 @@ STATIC_ASSERT(sizeof(flash_persistent_data_t) <= FLASH_PAGE_SIZE,
 /*===========================================================================*/
 
 /**
- * @brief Scheduler Flags - Set by TIM1 ISR, cleared by main loop (Phase 3 canonical scheduler)
+ * @brief Scheduler Flags - Set by TIM1 ISR, cleared by main loop (canonical scheduler)
  *
  * TIM1 ISR sets tick_10ms every 10ms, tick_100ms every 100ms, tick_500ms every 500ms.
  * Main loop derives tick_1s from tick_100ms (10 pulses = 1 second) and clears all flags after processing.
@@ -630,9 +630,9 @@ extern volatile uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]; /* 
 /* Battery Percent Register Mapping Contract (0x13-0x14):
  * - battery_percent is stored as uint8_t (0-100) in authoritative_state
  * - Register mapping MUST emit [percent, 0x00] (LSB=percent, MSB=0)
- * Phase 1 characterization: reg 0x14 (MSB) always 0x00 in legacy (see Phase 1 block at top). */
+ * Characterization: reg 0x14 (MSB) always 0x00 in legacy (see block at top). */
 #define REG_BATTERY_PERCENT_L   0x13  /* LSB: battery_percent (0-100) */
-#define REG_BATTERY_PERCENT_H   0x14  /* MSB: always 0x00 (Phase 1 verified) */
+#define REG_BATTERY_PERCENT_H   0x14  /* MSB: always 0x00 (verified) */
 #define REG_SAMPLE_PERIOD_L     0x15
 #define REG_SAMPLE_PERIOD_H     0x16
 #define REG_POWER_STATUS        0x17
@@ -662,10 +662,10 @@ extern volatile uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]; /* 
 #define REG_LOAD_ON_DELAY_H     0x2D  /* Current countdown value (read from snapshot, no side effects) */
 
 /* Reserved Regions - Behavior: ACK writes but discard; reads return 0x00.
- * Phase 1 characterization: legacy returns 0x00 for reserved reads (see Phase 1 block at top).
+ * Characterization: legacy returns 0x00 for reserved reads (see block at top).
  * Snapshot mapping MUST explicitly return 0x00 for any reg in [0x2E-0xEF] and [0xFC-0xFF];
  * do not fall through to memory.
- * Future risk (Phase 2): I2C write path must NOT store "last written value" for reserved
+ * Future risk: I2C write path must NOT store "last written value" for reserved
  * regs—writes are ACK'd but discarded; reserved reads always return 0x00. */
 #define REG_RESERVED_START      0x2E  /* Start of reserved region */
 #define REG_RESERVED_END        0xEF  /* End of reserved region */

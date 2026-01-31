@@ -7,10 +7,7 @@
 #include "stm32f0xx_ll_cortex.h"
 #include "stm32f0xx.h"
 
-/* I2C slave receive buffer - 256 bytes; TX reads use reg_image[]. */
-volatile uint8_t aReceiveBuffer[256];
-
-/* Phase 2: Pending write - ISR stores here; main loop applies to authoritative state */
+/* Pending write - ISR stores here; main loop applies to authoritative state */
 i2c_pending_write_t i2c_pending_write = {0};
 
 /* I2C Slave state variables */

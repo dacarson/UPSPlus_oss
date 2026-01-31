@@ -24,33 +24,24 @@ static void MX_GPIO_Init(void);
 static void MX_ADC_Init(void);
 static void MX_DMA_Init(void);
 
-uint32_t GetUptimeSeconds(void);
 void UpdateBatteryPercentage(void);
 void UpdateBatteryMinMax(void);
 void FactoryReset(void);
 void CheckPowerOnConditions(void);
 
-#define VBAT_PROTECT_VOLTAGE 2800
-#define VBAT_LOW_PERCENT 10
-#define LOAD_ON_DELAY_TIME 60
-#define IP_REFRESH_TIME 2
-
 /* Everything below needs to be mapped to registers */
 
 #define ADC_CONVERTED_DATA_BUFFER_SIZE 6
 
-/* Phase 2: Raw ADC buffer; DMA fills, main loop processes into state */
+/* Raw ADC buffer; DMA fills, main loop processes into state */
 __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
 
-/* Phase 2: Timing/button helpers (TIM1/SysTick/EXTI). Authoritative state is state/sys_state only;
+/* Timing/button helpers (TIM1/EXTI). Authoritative state is state/sys_state only;
  * no shadow globals (uXXXVolt, counters, mode flags) remain as authoritative. */
 __IO uint8_t sKeyFlag = 0;         /* Button activity (EXTI edge) */
 __IO uint16_t sIPIdleTicks = 0;
 __IO uint8_t MustRefreshVDD = 1;
-/* Phase 3: Countdowns decremented in main loop on tick_1s (removed from ISR) */
-/* Free-running ms since boot (uint32_t, overflows ~49 days). Not "ms within current second";
- * document/use consistently. Phase 3: no longer reset for tick_1s. */
-__IO uint32_t uUptimeMsCounter = 0;
+/* Countdowns decremented in main loop on tick_1s (removed from ISR) */
 __IO uint8_t OTAShot = 0;
 
 #define BL_START_ADDRESS 0x8000000
@@ -59,9 +50,9 @@ typedef void (*pFunction)(void);
 __IO pFunction JumpToAplication;
 
 /*===========================================================================*/
-/* Phase 2: Authoritative state, system state, snapshot (single source)     */
-/* Phase 4: State machine runtime - window manager, charger physical,      */
-/*          protection (single place for transitions + entry/exit actions)  */
+/* Authoritative state, system state, snapshot (single source)              */
+/* State machine runtime - window manager, charger physical,                */
+/* protection (single place for transitions + entry/exit actions)           */
 /*===========================================================================*/
 static authoritative_state_t state;
 static system_state_t sys_state;
@@ -72,7 +63,7 @@ static protection_state_t prot_state;
 static button_handler_t button_handler;
 static uint8_t button_last_level = 0; /* 1=pressed, 0=released */
 
-/* Phase 2.2: Double-buffered register image. Snapshot_Update fills reg_image; main copies to aReceiveBuffer for I2C TX. */
+/* Double-buffered register image. Snapshot_Update fills reg_image for I2C TX. */
 uint8_t reg_image[2][256];
 volatile uint8_t active_reg_image = 0;
 
@@ -80,7 +71,7 @@ volatile uint8_t active_reg_image = 0;
 volatile uint8_t adc_ready = 0;
 volatile uint32_t adc_sample_seq = 0;
 
-/* Phase 3: Canonical scheduler - TIM1 sets flags only; main loop runs all tasks.
+/* Canonical scheduler - TIM1 sets flags only; main loop runs all tasks.
  * Flag race: small chance of losing an event if ISR sets a flag between main's check and clear.
  * For coarse 100ms/500ms tasks usually acceptable; for never-miss semantics consider
  * counters (increment in ISR) or copy+clear in one short critical section in main. */
@@ -112,7 +103,7 @@ static void Button_ProcessTick10ms(void);
 static void Button_DispatchActions(void);
 
 /*===========================================================================*/
-/* Phase 2: Validation functions (register bounds, RO enforcement in apply)  */
+/* Validation functions (register bounds, RO enforcement in apply)           */
 /*===========================================================================*/
 uint8_t Validate_FullVoltage(uint16_t value)
 {
@@ -151,7 +142,7 @@ uint8_t Validate_LoadOnDelay(uint16_t value)
 }
 
 /*===========================================================================*/
-/* Phase 4: State machine helpers (declared in ups_state.h)                   */
+/* State machine helpers (declared in ups_state.h)                            */
 /*===========================================================================*/
 uint8_t Charger_IsInfluencingVBAT(const system_state_t *s)
 {
@@ -166,7 +157,7 @@ uint8_t IsTrueVbatSampleFresh(uint32_t now_ticks, uint32_t last_true_vbat_sample
 }
 
 /*===========================================================================*/
-/* Phase 2: Register 0x17 derivation and register image fill                 */
+/* Register 0x17 derivation and register image fill                          */
 /*===========================================================================*/
 uint8_t GetPowerStatusRegisterValue(const authoritative_state_t *auth_state, const system_state_t *state)
 {
@@ -315,9 +306,9 @@ static void UpdateDerivedState(void)
 
 void Snapshot_Update(void)
 {
-    state.snapshot_tick = sched_flags.tick_counter;  /* Phase 3: canonical TIM1 tick */
+    state.snapshot_tick = sched_flags.tick_counter;  /* canonical TIM1 tick */
     uint8_t inactive = (uint8_t)(1u - active_reg_image);
-    StateToRegisterBuffer(&state, &sys_state, reg_image[inactive]);  /* never aReceiveBuffer */
+    StateToRegisterBuffer(&state, &sys_state, reg_image[inactive]);
     active_reg_image = inactive;
     snapshot.buffer[inactive] = state;
     snapshot.active_buffer = inactive;
@@ -559,7 +550,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     sys_state.factory_test_selector = 0;
     sys_state.pending_power_cut = 0;
 
-    /* Phase 4: State machine runtime */
+    /* State machine runtime state */
     window_mgr.window_due = 0;
     window_mgr.window_active = 0;
     window_mgr.last_window_end_ticks = 0;
@@ -618,7 +609,7 @@ int main(void)
     MX_ADC_Init();
     MX_I2C1_Slave_Init();
 
-    /* Phase 2/6: Single source of truth; load from defaults then from flash */
+    /* Single source of truth; load from defaults then from flash */
     InitAuthoritativeStateFromDefaults();
     Flash_Init();
     Flash_Load();
@@ -628,11 +619,9 @@ int main(void)
     /* Allow power rails / I2C pull-ups to settle before main loop; remove or reduce if not required on target hardware. */
     LL_mDelay(100);
 
-    //__enable_irq(); /* Enable interrupts after initialization */
-
     while (1)
     {
-        /* Phase 3: Canonical scheduler - run tasks from TIM1 flags, then clear flags */
+        /* Canonical scheduler - run tasks from TIM1 flags, then clear flags */
         if (sched_flags.tick_10ms)
         {
             Scheduler_Tick10ms();
@@ -646,7 +635,7 @@ int main(void)
                 sched_flags.tick_1s = 1;
                 tick_100ms_count = 0;
             }
-            Snapshot_UpdateDerived();  /* Phase 3: 100ms periodic snapshot (ensures freshness) */
+            Snapshot_UpdateDerived();  /* 100ms periodic snapshot (ensures freshness) */
             sched_flags.tick_100ms = 0;
         }
         if (sched_flags.tick_500ms)
@@ -674,7 +663,7 @@ int main(void)
             sched_flags.tick_1s = 0;
         }
 
-        /* Phase 2: Apply I2C writes to authoritative state (RO rejected, bounds checked) */
+        /* Apply I2C writes to authoritative state (RO rejected, bounds checked) */
         ProcessI2CPendingWrite();
 
         /* Invariant A6: attempt flash commit first; only then cut MT_EN (set PROTECTION_LATCHED) */
@@ -731,7 +720,7 @@ int main(void)
         if (state.sample_period_minutes < DEFAULT_SAMPLE_PERIOD_MIN)
             state.sample_period_minutes = DEFAULT_SAMPLE_PERIOD_MIN;
 
-        /* Phase 2: ADC processing in main loop (DMA sets adc_ready only) */
+        /* ADC processing in main loop (DMA sets adc_ready only) */
         if (adc_ready)
         {
             if (MustRefreshVDD)
@@ -751,7 +740,7 @@ int main(void)
                 state.battery_voltage_mv = min_valid_mv;
             UpdateBatteryMinMax();
             UpdateBatteryPercentage();
-            /* Phase 4: True-VBAT sample tick when charger not influencing (for staleness gating).
+            /* True-VBAT sample tick when charger not influencing (for staleness gating).
              * Intentional mismatch: freshness uses Charger_IsInfluencingVBAT; percent uses VBUS heuristic per B8. */
             if (!Charger_IsInfluencingVBAT(&sys_state))
                 state.last_true_vbat_sample_tick = sched_flags.tick_counter;
@@ -791,8 +780,8 @@ int main(void)
 }
 
 /**
- * Phase 4: Check power-on conditions with explicit state transitions and
- * staleness gating. RPI_OFF -> LOAD_ON_DELAY when conditions met (and true-VBAT
+ * Check power-on conditions with explicit state transitions and staleness gating.
+ * RPI_OFF -> LOAD_ON_DELAY when conditions met (and true-VBAT
  * fresh if charger present). LOAD_ON_DELAY -> RPI_OFF when conditions no longer met.
  */
 void CheckPowerOnConditions(void)
@@ -863,7 +852,7 @@ void CheckPowerOnConditions(void)
 
 void FactoryReset(void)
 {
-    /* Phase 2: Set authoritative state to defaults (single source of truth) */
+    /* Set authoritative state to defaults (single source of truth) */
     state.full_voltage_mv = DEFAULT_VBAT_FULL_MV;
     state.empty_voltage_mv = DEFAULT_VBAT_EMPTY_MV;
     state.protection_voltage_mv = DEFAULT_VBAT_PROTECT_MV;
@@ -884,7 +873,7 @@ void FactoryReset(void)
     sys_state.learning_mode = LEARNING_ACTIVE;
     sys_state.factory_test_selector = 0;
 
-    /* Phase 4: Reset runtime/state-machine variables so FSM is in known-safe state */
+    /* Reset runtime/state-machine variables so FSM is in known-safe state */
     sys_state.charger_state = CHARGER_STATE_ABSENT;
     sys_state.charger_state_entry_ticks = 0;
     sys_state.power_state_entry_ticks = 0;
@@ -1168,15 +1157,6 @@ uint8_t Flash_CanWrite(void)
 }
 
 /**
- * @brief Get system uptime in seconds
- * @retval Uptime in seconds since system start
- */
-uint32_t GetUptimeSeconds(void)
-{
-    return state.cumulative_runtime_sec;
-}
-
-/**
  * @brief System Clock Configuration
  * @retval None
  */
@@ -1279,7 +1259,7 @@ void UpdateBatteryPercentage(void)
     }
 }
 
-/* Phase 2: DMA only sets adc_ready; main loop processes ADC and updates state */
+/* DMA only sets adc_ready; main loop processes ADC and updates state */
 void DMA1_CH1_IRQHandler(void)
 {
     if (LL_DMA_IsActiveFlag_TC1(DMA1))
@@ -1293,13 +1273,7 @@ void DMA1_CH1_IRQHandler(void)
     }
 }
 
-/* Phase 3: SysTick is uptime only. 1s timing comes from TIM1 (tick_1s derived in main). */
-void SysTick_Handler(void)
-{
-    uUptimeMsCounter++;
-}
-
-/* Phase 3: TIM1 ISR is flag-only. All timing logic runs in main loop. */
+/* TIM1 ISR is flag-only. All timing logic runs in main loop. */
 void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
 {
     if (LL_TIM_IsActiveFlag_UPDATE(TIM1) == 1)
@@ -1316,7 +1290,7 @@ void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
     }
 }
 
-/* Phase 4: Scheduler uses explicit state machine (power, charger, protection). */
+/* Scheduler uses explicit state machine (power, charger, protection). */
 #define SAMPLE_PERIOD_TICKS_PER_MIN  ((uint32_t)(60u * TICKS_PER_1S))
 
 /* MT_EN: restart phase overrides (MT_EN low for 5s); else driven by power_state.
@@ -1495,7 +1469,7 @@ static void PowerStateMachine_Step(void)
 }
 
 /**
- * Phase 4: Power FSM tick_1s - countdown decrements and transitions (single place).
+ * Power FSM tick_1s - countdown decrements and transitions (single place).
  * Entry to RPI_ON resets protection sample count so N samples are observed while on.
  */
 static void PowerStateMachine_OnTick1s(void)
