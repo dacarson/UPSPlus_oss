@@ -92,8 +92,10 @@ It is intended as the source of truth for feature development and future changes
 - **0x1B Factory Reset**
   - Write 1: immediate reset to defaults, flash updated.
 - **0x2A Battery Parameters Self-Programmed**
-  - Write 0: enable learning; reset learned values.
-  - Write 1: disable learning; current learned values become user values.
+  - Write 0: enable self-programming of full/empty parameters; reset learned values.
+  - Write 1: disable self-programming; current learned values become user values.
+  - Note: This register controls self-programming only. The periodic calibration
+    measurement window (true VBAT sampling) is independent of 0x2A.
 - **0x2C–0x2D Load On Delay**
   - Read: remaining countdown if active, else configured delay.
   - Write: sets configured delay; if countdown active, resets remaining time.
@@ -160,9 +162,11 @@ Key behaviors:
 - `PRESENT → FORCED_OFF_WINDOW`: sample period elapsed (window due).
 - `FORCED_OFF_WINDOW → PRESENT`: window elapsed (1.5s).
 
-### 5.3 Learning Mode (`learning_mode_t`)
-- Derived from `battery_params_self_programmed`.
-- `0` → learning active, `1` → learning inactive.
+### 5.3 Calibration Window Flag (`learning_mode_t`)
+- **Legacy name:** `learning_mode_t` is retained for ABI compatibility.
+- Indicates **calibration window active** (charger forced off for true VBAT sampling).
+- `ACTIVE` while the charger state is `FORCED_OFF_WINDOW`, otherwise `INACTIVE`.
+- Calibration windows occur every `sample_period_minutes` and are independent of 0x2A.
 
 ### 5.4 Button FSM
 - Debounced at 50ms.
@@ -179,6 +183,9 @@ Key behaviors:
 - Window is never interrupted or restarted early.
 - If charger unplugged mid-window, window completes and samples are true VBAT.
 - Window states are represented in Factory Testing selector 0x03.
+- `learning_mode_t` reports **ACTIVE** during the window.
+- Purpose: eliminate charger influence on VBAT measurement and provide a stable
+  condition for ADC calibration.
 
 ---
 
@@ -253,7 +260,7 @@ These numeric values are part of the Factory Testing ABI and must remain stable.
 - **true VBAT**: Battery voltage sampled while charger path is disabled (IP_EN LOW).
 - **charger present**: Physical charger voltage above presence threshold with stability.
 - **charger influencing VBAT**: Charger state is PRESENT at ADC sample time.
-- **learning mode**: Automatic learning of full/empty thresholds when self-programmed flag is 0.
+- **calibration window active (legacy field `learning_mode_t`)**: Charger forced off for true VBAT sampling and ADC calibration.
 - **snapshot**: Coherent, double-buffered register image used for I2C reads.
 
 ---
