@@ -18,6 +18,13 @@ The code has been re-written from the ground up using a combination of ChatGPT a
 - Factory Testing pages (0xFC–0xFF) for diagnostics.
 - OTA firmware update support.
 
+## Button Behavior
+
+- The Func Key button is debounced at 50 ms.
+- Short press: powers on the load when the UPS is off and conditions are safe.
+- Long press (>= 10 s) when the load is on: powers off.
+- Long press (>= 10 s) when the load is off: triggers a factory reset.
+
 ## Boot Brownout Backoff
 
 If the RPi browns out shortly after power-on (battery voltage drops to or below the protection
