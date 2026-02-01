@@ -104,7 +104,7 @@ Optional flags:
 ## 6. I2C Bus Notes (hardware reference)
 
 The UPSPlus board has two INA219 chips on the same I2C bus at `0x40` and `0x45`, plus an RTC at
-`0x00`. The STM32 runs in I2C Slave mode and exposes its own register map at `0x17`, which makes
+`0x68`. The STM32 runs in I2C Slave mode and exposes its own register map at `0x17`, which makes
 direct access to those devices awkward. If the STM32 were to read the INA219 or RTC devices, it
 would need to drop its I2C Slave role (and thus disable `0x17`) so it could act as a master and
 probe them. That limitation is unfortunate because reading INA219 would help estimate RPi power

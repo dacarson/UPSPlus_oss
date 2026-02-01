@@ -107,6 +107,27 @@ extern "C" {
 #define MIN_VOLTAGE_DELTA_MV          50      /* Minimum voltage range for valid % calculation */
 #define BATTERY_PERCENT_HYSTERESIS    1       /* Minimum change to update percentage */
 
+/* Charging Plateau Full Detection (self-programming enabled) */
+#define PLATEAU_WINDOW_SEC            1800u   /* 30 minutes */
+#define PLATEAU_EVAL_PERIOD_SEC       5u      /* Sliding window evaluation period */
+#define PLATEAU_DELTA_MV              40u
+#define PLATEAU_MIN_VBAT_MV           4050u
+#define PLATEAU_MIN_CHANGE_MV         10u
+#define PLATEAU_ALPHA_NUM             1u      /* EMA alpha = 1/5 = 0.2 */
+#define PLATEAU_ALPHA_DEN             5u
+#define DISCHARGE_DETECT_MV           15u
+#define PLATEAU_POWER_STABLE_SEC      60u
+#define FULL_HYST_MV                  50u
+#define FULL_CLEAR_SEC                300u
+#define PLATEAU_PERSIST_MIN_CHANGE_MV 20u
+#define LEARNED_FULL_MIN_MV           3900u
+#define LEARNED_FULL_MAX_MV           4500u
+#define PLATEAU_WINDOW_SAMPLES        (PLATEAU_WINDOW_SEC / PLATEAU_EVAL_PERIOD_SEC)
+/* Filtered VBAT for plateau logic (simple IIR) */
+#define VBAT_FILTER_ALPHA_NUM         1u
+#define VBAT_FILTER_ALPHA_DEN         8u
+
+
 /* Timing Constants (in 10ms ticks unless otherwise noted)
  * Canonical scheduler: TIM1 tick period is fixed at 10ms (see Core Principles). Do not change
  * TIM1 period without updating TICK_PERIOD_MS and all derived constants. All other "10ms tick"
@@ -131,6 +152,8 @@ extern "C" {
 STATIC_ASSERT((100 % TICK_PERIOD_MS) == 0, "TICK_PERIOD_MS must divide 100");
 STATIC_ASSERT((500 % TICK_PERIOD_MS) == 0, "TICK_PERIOD_MS must divide 500");
 STATIC_ASSERT((1000 % TICK_PERIOD_MS) == 0, "TICK_PERIOD_MS must divide 1000");
+STATIC_ASSERT((PLATEAU_WINDOW_SEC % PLATEAU_EVAL_PERIOD_SEC) == 0,
+              "PLATEAU_WINDOW_SEC must be multiple of PLATEAU_EVAL_PERIOD_SEC");
 
 /* Snapshot and Scheduling */
 /* Note: Snapshot updates use tick_counter deltas (canonical timing), not convenience counters */

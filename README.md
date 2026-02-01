@@ -16,6 +16,7 @@ The code has been re-written from the ground up using a combination of ChatGPT a
 - Protection shutdown at configured protection voltage.
 - Auto power-on with configurable low-battery threshold and load-on delay.
 - Boot brownout backoff learning (see [Boot Brownout Backoff](#boot-brownout-backoff)).
+- Charging plateau detection for adaptive full-battery learning.
 - Factory Testing pages (0xFC–0xFF) for diagnostics.
 - OTA firmware update support.
 

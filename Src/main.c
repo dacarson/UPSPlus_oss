@@ -89,6 +89,18 @@ static uint32_t flash_next_retry_sec = 0;
 /* OTA requested via I2C write 127 to register 0x32 (50) */
 static volatile uint8_t ota_triggered = 0;
 
+/* Battery plateau full detection (self-programming enabled) */
+static uint16_t filtered_vbat_mv = 0;
+static uint16_t plateau_samples[PLATEAU_WINDOW_SAMPLES];
+static uint16_t plateau_sample_count = 0;
+static uint16_t plateau_sample_index = 0;
+static uint8_t plateau_suppressed = 0;
+static uint8_t plateau_persisted_this_session = 0;
+static charger_state_t plateau_last_charger_state = CHARGER_STATE_ABSENT;
+static uint8_t plateau_eval_counter = 0;
+static uint8_t battery_full = 0;
+static uint32_t battery_full_clear_start_ticks = 0;
+
 /* Restart power-cycle state machine: MT_EN low for 5s then RPI_ON (non-blocking) */
 #define RESTART_POWER_OFF_TICKS  (5u * TICKS_PER_1S)  /* 5 seconds in 10ms ticks */
 static uint8_t restart_phase = 0;       /* 0=idle, 1=MT_EN low, counting down */
@@ -102,6 +114,9 @@ static void PowerStateMachine_OnTick1s(void);
 static void Button_Init(void);
 static void Button_ProcessTick10ms(void);
 static void Button_DispatchActions(void);
+static void BatteryPlateau_Init(void);
+static void BatteryPlateau_OnAdcSample(uint16_t raw_vbat_mv);
+static void BatteryPlateau_Tick1s(void);
 
 /*===========================================================================*/
 /* Validation functions (register bounds, RO enforcement in apply)           */
@@ -155,6 +170,56 @@ uint8_t IsTrueVbatSampleFresh(uint32_t now_ticks, uint32_t last_true_vbat_sample
     /* Unsigned wrap gives correct age when tick_counter has wrapped */
     uint32_t age_ticks = now_ticks - last_true_vbat_sample_tick;
     return (age_ticks <= TRUE_VBAT_MAX_AGE_TICKS) ? 1u : 0u;
+}
+
+static uint16_t ClampU16(uint16_t value, uint16_t min_value, uint16_t max_value)
+{
+    if (value < min_value)
+        return min_value;
+    if (value > max_value)
+        return max_value;
+    return value;
+}
+
+static uint16_t AbsDiffU16(uint16_t a, uint16_t b)
+{
+    return (a >= b) ? (uint16_t)(a - b) : (uint16_t)(b - a);
+}
+
+static void BatteryPlateau_ResetWindow(void)
+{
+    plateau_sample_count = 0;
+    plateau_sample_index = 0;
+    plateau_eval_counter = 0;
+}
+
+static void BatteryPlateau_ResetSession(void)
+{
+    plateau_persisted_this_session = 0;
+    plateau_suppressed = 0;
+    BatteryPlateau_ResetWindow();
+}
+
+static void BatteryPlateau_Init(void)
+{
+    filtered_vbat_mv = 0;
+    battery_full = 0;
+    battery_full_clear_start_ticks = 0;
+    plateau_last_charger_state = CHARGER_STATE_ABSENT;
+    BatteryPlateau_ResetSession();
+}
+
+static void BatteryPlateau_OnAdcSample(uint16_t raw_vbat_mv)
+{
+    if (filtered_vbat_mv == 0u)
+        filtered_vbat_mv = raw_vbat_mv;
+    else
+    {
+        uint32_t num = (uint32_t)(VBAT_FILTER_ALPHA_DEN - VBAT_FILTER_ALPHA_NUM) * (uint32_t)filtered_vbat_mv +
+                       (uint32_t)VBAT_FILTER_ALPHA_NUM * (uint32_t)raw_vbat_mv +
+                       (uint32_t)(VBAT_FILTER_ALPHA_DEN / 2u);
+        filtered_vbat_mv = (uint16_t)(num / (uint32_t)VBAT_FILTER_ALPHA_DEN);
+    }
 }
 
 /*===========================================================================*/
@@ -583,7 +648,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.version = 21;
+    state.version = 22;
     state.snapshot_tick = 0;
     state.last_true_vbat_sample_tick = 0;
 
@@ -613,6 +678,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     prot_state.last_seen_seq = 0;
 
     Button_Init();
+    BatteryPlateau_Init();
 }
 
 static void Button_Init(void)
@@ -703,6 +769,7 @@ int main(void)
             if (Charger_IsInfluencingVBAT(&sys_state))
                 state.charging_time_sec++;
             PowerStateMachine_OnTick1s();
+            BatteryPlateau_Tick1s();
             if (flash_dirty &&
                 (state.cumulative_runtime_sec - flash_last_write_sec) >= FLASH_DIRTY_MAX_INTERVAL_SEC)
             {
@@ -786,11 +853,9 @@ int main(void)
             state.usbc_voltage_mv = __LL_ADC_CALC_DATA_TO_VOLTAGE(state.mcu_voltage_mv * 4, aADCxConvertedData[2], LL_ADC_RESOLUTION_12B);
             state.microusb_voltage_mv = __LL_ADC_CALC_DATA_TO_VOLTAGE(state.mcu_voltage_mv * 4, aADCxConvertedData[3], LL_ADC_RESOLUTION_12B);
             state.temperature_raw = __LL_ADC_CALC_TEMPERATURE(state.mcu_voltage_mv, aADCxConvertedData[4], LL_ADC_RESOLUTION_12B);
-            uint16_t min_valid_mv = VBAT_MIN_VALID_MV;
-            if (min_valid_mv < state.protection_voltage_mv)
-                min_valid_mv = state.protection_voltage_mv;
-            if (state.battery_voltage_mv < min_valid_mv)
-                state.battery_voltage_mv = min_valid_mv;
+            uint16_t min_valid_mv = ClampU16(VBAT_MIN_VALID_MV, state.protection_voltage_mv, 0xFFFFu);
+            state.battery_voltage_mv = ClampU16(state.battery_voltage_mv, min_valid_mv, 0xFFFFu);
+            BatteryPlateau_OnAdcSample(state.battery_voltage_mv);
             UpdateBatteryMinMax();
             UpdateBatteryPercentage();
             /* True-VBAT sample tick when charger not influencing (for staleness gating).
@@ -949,6 +1014,7 @@ void FactoryReset(void)
     prot_state.last_seen_seq = 0;
     restart_phase = 0;
     restart_remaining_ticks = 0;
+    BatteryPlateau_Init();
 }
 
 extern const uint8_t __flash_storage_start__[];
@@ -1009,7 +1075,7 @@ static void Flash_ApplyRecordToState(const flash_persistent_data_t *rec)
     if (!Validate_FullVoltage(state.full_voltage_mv)) state.full_voltage_mv = DEFAULT_VBAT_FULL_MV;
     if (!Validate_EmptyVoltage(state.empty_voltage_mv)) state.empty_voltage_mv = DEFAULT_VBAT_EMPTY_MV;
     if (!Validate_ProtectionVoltage(state.protection_voltage_mv)) state.protection_voltage_mv = DEFAULT_VBAT_PROTECT_MV;
-    if (state.empty_voltage_mv < state.protection_voltage_mv) state.empty_voltage_mv = state.protection_voltage_mv;
+    state.empty_voltage_mv = ClampU16(state.empty_voltage_mv, state.protection_voltage_mv, VBAT_EMPTY_MAX_MV);
     if (!Validate_SamplePeriod(state.sample_period_minutes)) state.sample_period_minutes = DEFAULT_SAMPLE_PERIOD_MIN;
     if (state.low_battery_percent > 100u) state.low_battery_percent = DEFAULT_LOW_BATTERY_PERCENT;
 
@@ -1264,24 +1330,18 @@ void UpdateBatteryMinMax(void)
 {
     if (state.battery_params_self_programmed == 1)
     {
-        if (state.battery_voltage_mv > state.full_voltage_mv)
-            state.battery_voltage_mv = state.full_voltage_mv;
-        if (state.battery_voltage_mv < state.empty_voltage_mv)
-            state.battery_voltage_mv = state.empty_voltage_mv;
+        state.battery_voltage_mv = ClampU16(state.battery_voltage_mv, state.empty_voltage_mv, state.full_voltage_mv);
     }
     else
     {
         if (!Charger_IsInfluencingVBAT(&sys_state))
         {
-            if (state.battery_voltage_mv > state.full_voltage_mv)
-                state.full_voltage_mv = state.battery_voltage_mv;
             if (state.battery_voltage_mv < state.empty_voltage_mv &&
                 state.battery_voltage_mv > state.protection_voltage_mv)
                 state.empty_voltage_mv = state.battery_voltage_mv;
         }
     }
-    if (state.empty_voltage_mv < state.protection_voltage_mv)
-        state.empty_voltage_mv = state.protection_voltage_mv;
+    state.empty_voltage_mv = ClampU16(state.empty_voltage_mv, state.protection_voltage_mv, VBAT_EMPTY_MAX_MV);
 }
 
 void UpdateBatteryPercentage(void)
@@ -1315,6 +1375,148 @@ void UpdateBatteryPercentage(void)
         else if (state.battery_percent == 0)
             state.battery_percent = (uint8_t)percentage;
     }
+}
+
+static void BatteryPlateau_UpdateBatteryFullClear(uint32_t now_ticks)
+{
+    if (sys_state.charger_state != CHARGER_STATE_PRESENT)
+    {
+        battery_full = 0;
+        battery_full_clear_start_ticks = 0;
+        return;
+    }
+    if (state.full_voltage_mv <= FULL_HYST_MV)
+    {
+        battery_full_clear_start_ticks = 0;
+        return;
+    }
+    if (filtered_vbat_mv < (uint16_t)(state.full_voltage_mv - FULL_HYST_MV))
+    {
+        if (battery_full_clear_start_ticks == 0u)
+            battery_full_clear_start_ticks = now_ticks;
+        if ((now_ticks - battery_full_clear_start_ticks) >= (uint32_t)(FULL_CLEAR_SEC * TICKS_PER_1S))
+            battery_full = 0;
+    }
+    else
+    {
+        battery_full_clear_start_ticks = 0;
+    }
+}
+
+static void BatteryPlateau_Tick1s(void)
+{
+    uint32_t now_ticks = sched_flags.tick_counter;
+    uint8_t charger_present = (sys_state.charger_state == CHARGER_STATE_PRESENT) ? 1u : 0u;
+
+    if (state.battery_params_self_programmed != 0u)
+    {
+        battery_full = 0;
+        battery_full_clear_start_ticks = 0;
+        BatteryPlateau_ResetSession();
+        plateau_last_charger_state = sys_state.charger_state;
+        return;
+    }
+
+    if (!charger_present)
+    {
+        battery_full = 0;
+        battery_full_clear_start_ticks = 0;
+        BatteryPlateau_ResetSession();
+        plateau_last_charger_state = sys_state.charger_state;
+        return;
+    }
+
+    if (plateau_last_charger_state != CHARGER_STATE_PRESENT && charger_present)
+        BatteryPlateau_ResetSession();
+    plateau_last_charger_state = sys_state.charger_state;
+
+    BatteryPlateau_UpdateBatteryFullClear(now_ticks);
+
+    plateau_eval_counter++;
+    if (plateau_eval_counter < PLATEAU_EVAL_PERIOD_SEC)
+        return;
+    plateau_eval_counter = 0;
+
+    plateau_samples[plateau_sample_index] = filtered_vbat_mv;
+    if (plateau_sample_count < PLATEAU_WINDOW_SAMPLES)
+        plateau_sample_count++;
+    plateau_sample_index++;
+    if (plateau_sample_index >= PLATEAU_WINDOW_SAMPLES)
+        plateau_sample_index = 0;
+
+    if (plateau_sample_count < PLATEAU_WINDOW_SAMPLES)
+        return;
+    if (plateau_suppressed)
+        return;
+    if (filtered_vbat_mv < PLATEAU_MIN_VBAT_MV)
+        return;
+    if (sys_state.power_state != POWER_STATE_RPI_ON)
+        return;
+
+    uint32_t window_ticks = (uint32_t)(PLATEAU_WINDOW_SEC * TICKS_PER_1S);
+    uint32_t stable_ticks = now_ticks - sys_state.power_state_entry_ticks;
+    if (stable_ticks < window_ticks || stable_ticks < (uint32_t)(PLATEAU_POWER_STABLE_SEC * TICKS_PER_1S))
+        return;
+
+    uint16_t min_v = 0xFFFFu;
+    uint16_t max_v = 0u;
+    uint32_t sum = 0u;
+    for (uint16_t i = 0; i < plateau_sample_count; i++)
+    {
+        uint16_t v = plateau_samples[i];
+        if (v < min_v)
+            min_v = v;
+        if (v > max_v)
+            max_v = v;
+        sum += v;
+    }
+
+    uint16_t start_idx = plateau_sample_index;
+    uint16_t end_idx = (plateau_sample_index == 0u) ? (uint16_t)(PLATEAU_WINDOW_SAMPLES - 1u)
+                                                    : (uint16_t)(plateau_sample_index - 1u);
+    uint16_t v_start = plateau_samples[start_idx];
+    uint16_t v_end = plateau_samples[end_idx];
+
+    if (v_end + DISCHARGE_DETECT_MV < v_start)
+        return;
+    if ((uint16_t)(max_v - min_v) > PLATEAU_DELTA_MV)
+        return;
+
+    if (state.full_voltage_mv < LEARNED_FULL_MIN_MV || state.full_voltage_mv > LEARNED_FULL_MAX_MV)
+        state.full_voltage_mv = PLATEAU_MIN_VBAT_MV;
+
+    uint16_t plateau_mean = (uint16_t)(sum / plateau_sample_count);
+    uint16_t learned_full = state.full_voltage_mv;
+    uint16_t old_full = state.full_voltage_mv;
+
+    if (AbsDiffU16(plateau_mean, learned_full) >= PLATEAU_MIN_CHANGE_MV)
+    {
+        uint32_t num = (uint32_t)learned_full * (uint32_t)(PLATEAU_ALPHA_DEN - PLATEAU_ALPHA_NUM) +
+                       (uint32_t)plateau_mean * (uint32_t)PLATEAU_ALPHA_NUM +
+                       (uint32_t)(PLATEAU_ALPHA_DEN / 2u);
+        uint16_t new_full = (uint16_t)(num / (uint32_t)PLATEAU_ALPHA_DEN);
+        uint16_t min_allowed = (uint16_t)(state.empty_voltage_mv + MIN_VOLTAGE_DELTA_MV);
+        if (new_full < min_allowed)
+            new_full = min_allowed;
+        new_full = ClampU16(new_full, LEARNED_FULL_MIN_MV, LEARNED_FULL_MAX_MV);
+
+        if (new_full != state.full_voltage_mv)
+        {
+            state.full_voltage_mv = new_full;
+            UpdateBatteryPercentage();
+            Snapshot_UpdateDerived();
+            if (!plateau_persisted_this_session &&
+                AbsDiffU16(old_full, new_full) >= PLATEAU_PERSIST_MIN_CHANGE_MV)
+            {
+                RequestFlashSave(0, 1);
+                plateau_persisted_this_session = 1;
+            }
+        }
+    }
+
+    battery_full = 1;
+    battery_full_clear_start_ticks = 0;
+    plateau_suppressed = 1;
 }
 
 /* DMA only sets adc_ready; main loop processes ADC and updates state */
