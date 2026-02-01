@@ -99,6 +99,9 @@ extern "C" {
 #define PROTECTION_HYSTERESIS_MV      50      /* Hysteresis for protection recovery (mV) */
 /* Note: PROTECTION_SAMPLES_REQUIRED counts ADC samples (adc_sample_seq), not 10ms ticks */
 #define PROTECTION_SAMPLES_REQUIRED   3       /* Consecutive ADC samples below threshold */
+/* Protection cut timeout: force MT_EN cut if flash save stalls */
+#define PROTECTION_FORCE_CUT_TIMEOUT_SEC   30u
+#define PROTECTION_FORCE_CUT_TIMEOUT_TICKS ((uint32_t)(PROTECTION_FORCE_CUT_TIMEOUT_SEC * TICKS_PER_1S))
 
 /* Battery Percentage */
 #define MIN_VOLTAGE_DELTA_MV          50      /* Minimum voltage range for valid % calculation */
@@ -325,6 +328,7 @@ typedef struct {
      * 4. ONLY AFTER commit attempt (success or failure), cut MT_EN LOW
      * This prevents cutting power before state is persisted. */
     uint8_t pending_power_cut;
+    uint32_t pending_power_cut_start_ticks;
 
     /* Boot brownout backoff (runtime-only, not persisted) */
     uint8_t boot_backoff_active;

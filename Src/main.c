@@ -97,6 +97,7 @@ static uint16_t restart_remaining_ticks = 0;
 static void InitAuthoritativeStateFromDefaults(void);
 static void ProcessI2CPendingWrite(void);
 static void Scheduler_Tick10ms(void);
+static void Protection_ForceCutIfTimedOut(void);
 static void PowerStateMachine_OnTick1s(void);
 static void Button_Init(void);
 static void Button_ProcessTick10ms(void);
@@ -594,6 +595,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     sys_state.factory_reset_requested = 0;
     sys_state.factory_test_selector = 0;
     sys_state.pending_power_cut = 0;
+    sys_state.pending_power_cut_start_ticks = 0;
     sys_state.boot_backoff_active = 0;
     sys_state.boot_attempt_start_ticks = 0;
 
@@ -734,6 +736,7 @@ int main(void)
                         sys_state.power_state = POWER_STATE_PROTECTION_LATCHED;
                         sys_state.power_state_entry_ticks = sched_flags.tick_counter;
                         sys_state.pending_power_cut = 0;
+                        sys_state.pending_power_cut_start_ticks = 0;
                     }
                 }
                 else
@@ -762,6 +765,9 @@ int main(void)
             }
             sys_state.factory_reset_requested = 0;
         }
+
+        /* Protection fallback: force cut if flash save stalls */
+        Protection_ForceCutIfTimedOut();
 
         /* Sample period clamp */
         if (state.sample_period_minutes < DEFAULT_SAMPLE_PERIOD_MIN)
@@ -864,6 +870,7 @@ void CheckPowerOnConditions(void)
             sys_state.power_state_entry_ticks = now_ticks;
             state.load_on_delay_remaining_sec = state.load_on_delay_config_sec;
             sys_state.pending_power_cut = 0;
+            sys_state.pending_power_cut_start_ticks = 0;
             prot_state.below_threshold_count = 0;
         }
         else
@@ -871,6 +878,7 @@ void CheckPowerOnConditions(void)
             sys_state.power_state = POWER_STATE_RPI_OFF;
             sys_state.power_state_entry_ticks = now_ticks;
             sys_state.pending_power_cut = 0;
+            sys_state.pending_power_cut_start_ticks = 0;
             prot_state.below_threshold_count = 0;
         }
         return;
@@ -924,6 +932,7 @@ void FactoryReset(void)
     sys_state.charger_state_entry_ticks = 0;
     sys_state.power_state_entry_ticks = 0;
     sys_state.pending_power_cut = 0;
+    sys_state.pending_power_cut_start_ticks = 0;
     sys_state.learning_mode = LEARNING_INACTIVE;
     sys_state.boot_backoff_active = 0;
     sys_state.boot_attempt_start_ticks = 0;
@@ -1293,9 +1302,9 @@ void UpdateBatteryPercentage(void)
     else if (percentage > 100)
         percentage = 100;
 
-    /* Per B8: voltage heuristic (not Charger_IsInfluencingVBAT) to avoid long stale percent when on charger.
-     * During FORCED_OFF_WINDOW VBUS may still be high; percent may treat as charging—intentional per B8. */
-    uint8_t charging = (state.microusb_voltage_mv > 4000 || state.usbc_voltage_mv > 4000);
+    /* Use charger state (not VBUS heuristic) so percent can fall on battery even
+     * if 5V rails are present or backfed. */
+    uint8_t charging = Charger_IsInfluencingVBAT(&sys_state);
     int32_t delta = percentage - (int32_t)state.battery_percent;
     if (delta >= (int32_t)BATTERY_PERCENT_HYSTERESIS || delta <= -(int32_t)BATTERY_PERCENT_HYSTERESIS)
     {
@@ -1387,9 +1396,24 @@ static void Protection_Step(void)
         return;
     /* Invariant A6: request flash, set pending_power_cut; main loop commits then sets PROTECTION_LATCHED */
     if (sys_state.pending_power_cut == 0u)
+    {
         BootBackoff_OnProtectionTrigger();
+        sys_state.pending_power_cut_start_ticks = sched_flags.tick_counter;
+    }
     RequestFlashSave(1, 1);
     sys_state.pending_power_cut = 1;
+}
+
+static void Protection_ForceCutIfTimedOut(void)
+{
+    if (sys_state.pending_power_cut == 0u)
+        return;
+    if ((sched_flags.tick_counter - sys_state.pending_power_cut_start_ticks) < PROTECTION_FORCE_CUT_TIMEOUT_TICKS)
+        return;
+    sys_state.power_state = POWER_STATE_PROTECTION_LATCHED;
+    sys_state.power_state_entry_ticks = sched_flags.tick_counter;
+    sys_state.pending_power_cut = 0;
+    sys_state.pending_power_cut_start_ticks = 0;
 }
 
 static void ChargerStateMachine_Step(void)
@@ -1710,6 +1734,7 @@ static void Button_DispatchActions(void)
                 sys_state.power_state_entry_ticks = sched_flags.tick_counter;
                 prot_state.below_threshold_count = 0;
                 sys_state.pending_power_cut = 0;
+                sys_state.pending_power_cut_start_ticks = 0;
                 state.load_on_delay_remaining_sec = 0;
                 BootBackoff_OnPowerOn();
                 Snapshot_UpdateDerived();
@@ -1723,6 +1748,7 @@ static void Button_DispatchActions(void)
             sys_state.power_state = POWER_STATE_RPI_OFF;
             sys_state.power_state_entry_ticks = sched_flags.tick_counter;
             sys_state.pending_power_cut = 0;
+            sys_state.pending_power_cut_start_ticks = 0;
             state.load_on_delay_remaining_sec = 0;
             Snapshot_UpdateDerived();
         }

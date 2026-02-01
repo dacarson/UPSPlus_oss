@@ -192,11 +192,14 @@ Key behaviors:
 ## 7. Battery Management
 
 - Battery percent is based on full/empty calibration.
+- Battery percent update direction uses charger state (charger path enabled), not VBUS voltage.
 - Protection voltage is enforced with hysteresis (50mV).
 - Protection latch requires multiple ADC samples below threshold (3 samples).
 - When protection triggers: pending power cut is set, flash save is attempted, then MT_EN is cut.
 - If flash save fails, power is still cut after the attempt. On next boot, defaults may apply,
   but the protection latch behavior remains effective.
+- If flash save continues to fail, MT_EN is force-cut after 30 seconds to avoid prolonged
+  operation below the protection threshold.
 - **Boot brownout backoff (load-on delay learning):**
   - **Boot attempt start:** when MT_EN is asserted (power_state enters `RPI_ON`).
   - **Boot failure event:** protection triggers (battery voltage <= configured protection threshold
