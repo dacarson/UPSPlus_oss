@@ -195,6 +195,49 @@ Key behaviors:
 - Battery percent update direction uses charger state (charger path enabled), not VBUS voltage.
 - Protection voltage is enforced with hysteresis (50mV).
 - Protection latch requires multiple ADC samples below threshold (3 samples).
+- **Charging plateau full detection (self-programming enabled):**
+  - All VBAT values in this algorithm refer to **filtered** VBAT.
+  - **Plateau definition (two knobs):** while charger state is `PRESENT`, a battery is
+    considered **full** when filtered VBAT remains within `PLATEAU_DELTA_MV` over a continuous
+    `PLATEAU_WINDOW_SEC` (i.e., `max(VBAT) - min(VBAT) <= PLATEAU_DELTA_MV` within the window).
+    Default `PLATEAU_WINDOW_SEC` is **1800 seconds (30 minutes)** and
+    default `PLATEAU_DELTA_MV` is **40 mV**.
+  - **Window evaluation:** use a sliding window evaluated every `PLATEAU_EVAL_PERIOD_SEC`.
+    Default `PLATEAU_EVAL_PERIOD_SEC` is **5 seconds**.
+  - **Gating conditions:** plateau detection is attempted only when all are true:
+    - Charger state is `PRESENT` **and** the battery is not in a discharge event.
+      A discharge event is detected when `VBAT_end < VBAT_start - DISCHARGE_DETECT_MV`
+      over the plateau window, where `VBAT_start` and `VBAT_end` are filtered VBAT
+      sampled at the window boundaries. Default `DISCHARGE_DETECT_MV` is **15 mV**.
+    - VBAT is above `PLATEAU_MIN_VBAT_MV` (near-full floor). Default
+      `PLATEAU_MIN_VBAT_MV` is **4050 mV**.
+    - Load state is stable: no `power_state_t` transitions during the window and
+      `power_state_t == RPI_ON` has been stable for at least `PLATEAU_POWER_STABLE_SEC`.
+      Default `PLATEAU_POWER_STABLE_SEC` is **60 seconds**.
+    - Optional: if charger/charge-current telemetry exists, require taper/CV region; otherwise
+      this condition is skipped.
+  - **Learning update rule:** on a plateau event, compute the plateau level as the mean of
+    filtered VBAT samples within the window.
+    If `abs(plateau - learned_full) >= PLATEAU_MIN_CHANGE_MV`, update learned full as:
+    `learned_full = (1 - PLATEAU_ALPHA) * learned_full + PLATEAU_ALPHA * plateau`.
+    Default `PLATEAU_MIN_CHANGE_MV` is **10 mV** and default `PLATEAU_ALPHA` is **0.2**.
+  - **Initialization / invalid learned_full:** if `learned_full` is unset, initialize it to
+    `PLATEAU_MIN_VBAT_MV` (or 4200 mV if a fixed default is preferred) and allow learning normally.
+  - **Clamping:** clamp `learned_full` to `[LEARNED_FULL_MIN_MV, LEARNED_FULL_MAX_MV]`.
+    Default bounds are **3900–4500 mV**.
+  - **Full state behavior:** on plateau detection, assert `battery_full=1`.
+    Clear `battery_full` when charger is not `PRESENT` or when
+    `VBAT < learned_full - FULL_HYST_MV` for `FULL_CLEAR_SEC`.
+    Default `FULL_HYST_MV` is **50 mV** and default `FULL_CLEAR_SEC` is **300 seconds**.
+  - **Re-trigger suppression:** after a plateau event, suppress further plateau detection
+    until the charger leaves `PRESENT`.
+  - **Persistence / flash wear:** persist the learned full voltage only if the
+    accepted change is >= `PLATEAU_PERSIST_MIN_CHANGE_MV` and at most once per
+    charger-present session. A charger-present session begins when the charger
+    state transitions to `PRESENT` and ends when it leaves `PRESENT`. Default
+    `PLATEAU_PERSIST_MIN_CHANGE_MV` is **20 mV**.
+  - If the battery is replaced and a different plateau level persists for the same window,
+    the learned full voltage automatically converges to the new plateau value.
 - When protection triggers: pending power cut is set, flash save is attempted, then MT_EN is cut.
 - If flash save fails, power is still cut after the attempt. On next boot, defaults may apply,
   but the protection latch behavior remains effective.
