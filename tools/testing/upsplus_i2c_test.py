@@ -207,6 +207,23 @@ def test_factory_test_pages(t: TestRunner, dev: I2CDevice) -> None:
                 button_state_ok and click_ok,
                 f"read {data}",
             )
+    dev.write_u8(REG["FACTORY_TEST_START"], 5)
+    if not wait_for_reg_value(dev, REG["FACTORY_TEST_START"], 5):
+        t.record("Factory test selector 5 timeout", False, "waited for 0xFC=0x05")
+        return
+    data = dev.read_block(REG["FACTORY_TEST_START"], 4)
+    t.record("Factory test selector 5 echoed", data[0] == 5, f"read {data}")
+    flash_status = data[1]
+    auto_info = data[2]
+    seq = data[3]
+    reserved_ok = (flash_status & 0xF8) == 0 and (auto_info & 0xFC) == 0
+    detail = (
+        f"flash_status=0x{flash_status:02X} auto_info=0x{auto_info:02X} seq={seq} "
+        f"(record_valid={flash_status & 0x01} save_attempted={(flash_status >> 1) & 0x01} "
+        f"save_success={(flash_status >> 2) & 0x01} "
+        f"auto_loaded={auto_info & 0x01} auto_effective={(auto_info >> 1) & 0x01})"
+    )
+    t.record("Factory test page 0x05 bitfields", reserved_ok, detail)
     dev.write_u8(REG["FACTORY_TEST_START"], 0)
 
 

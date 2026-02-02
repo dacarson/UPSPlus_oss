@@ -86,6 +86,11 @@ static uint8_t flash_dirty = 0;
 static uint16_t flash_sequence = 0;
 static uint32_t flash_last_write_sec = 0;
 static uint32_t flash_next_retry_sec = 0;
+/* Flash/persistence debug (factory test page 0x05) */
+static uint8_t flash_record_valid_boot = 0;
+static uint8_t flash_save_attempted = 0;
+static uint8_t flash_last_save_success = 0;
+static uint8_t flash_auto_power_on_loaded = 0;
 /* OTA requested via I2C write 127 to register 0x32 (50) */
 static volatile uint8_t ota_triggered = 0;
 
@@ -342,6 +347,20 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
             buf[REG_FACTORY_TEST_START + 2] = (uint8_t)protection_snapshot.below_threshold_count;
             buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(sys->pending_power_cut != 0u);
             break;
+        case 0x05u:
+        {
+            uint8_t flash_status = 0u;
+            uint8_t auto_power_info = 0u;
+            if (flash_record_valid_boot) flash_status |= 0x01u;
+            if (flash_save_attempted) flash_status |= 0x02u;
+            if (flash_last_save_success) flash_status |= 0x04u;
+            if (flash_auto_power_on_loaded) auto_power_info |= 0x01u;
+            if (auth->auto_power_on != 0u) auto_power_info |= 0x02u;
+            buf[REG_FACTORY_TEST_START + 1] = flash_status;
+            buf[REG_FACTORY_TEST_START + 2] = auto_power_info;
+            buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(flash_sequence & 0xFFu);
+            break;
+        }
         default:
             break;
         }
@@ -1193,6 +1212,10 @@ void Flash_Init(void)
     flash_dirty = 0;
     flash_sequence = 0;
     flash_last_write_sec = 0;
+    flash_record_valid_boot = 0;
+    flash_save_attempted = 0;
+    flash_last_save_success = 0;
+    flash_auto_power_on_loaded = 0;
 }
 
 void Flash_Load(void)
@@ -1207,10 +1230,13 @@ void Flash_Load(void)
         return;
     }
     memcpy(&rec, (const void *)FlashStorageStartPtr(), sizeof(rec));
+    flash_record_valid_boot = Flash_RecordIsValid(&rec);
+    flash_auto_power_on_loaded = 0u;
 
-    if (Flash_RecordIsValid(&rec))
+    if (flash_record_valid_boot)
     {
         Flash_ApplyRecordToState(&rec);
+        flash_auto_power_on_loaded = (rec.auto_power_on != 0u) ? 1u : 0u;
         UpdateDerivedState();
         flash_sequence = rec.sequence_number;
         flash_dirty = 0;
@@ -1241,6 +1267,9 @@ uint8_t Flash_Save(uint8_t bypass)
     if (storage_size < sizeof(rec))
         return 0u;
 
+    flash_save_attempted = 1u;
+    flash_last_save_success = 0u;
+
     Flash_FillRecordFromState(&rec, next_seq);
 
     primask = __get_PRIMASK();
@@ -1260,6 +1289,7 @@ uint8_t Flash_Save(uint8_t bypass)
     flash_sequence = next_seq;
     flash_last_write_sec = state.cumulative_runtime_sec;
     flash_dirty = 0;
+    flash_last_save_success = 1u;
     return 1u;
 }
 
