@@ -453,6 +453,7 @@ typedef struct {
     uint32_t snapshot_tick;            /* TIM1 tick when snapshot was taken */
     uint32_t last_true_vbat_sample_tick; /* Tick when last true-VBAT was captured.
                                            * Must remain uint32_t; do not reintroduce 8-bit tick fields for staleness. */
+    uint16_t last_true_vbat_mv;        /* Cached true-VBAT (charger not influencing) for percent calc. */
 } authoritative_state_t;
 
 /* Charger Voltage Helper - Locks MAX(VBUS, USBIN) rule in code.

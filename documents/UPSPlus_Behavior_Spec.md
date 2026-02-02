@@ -153,13 +153,14 @@ States:
 - `LOAD_ON_DELAY`
 
 Key transitions:
-- `RPI_OFF → LOAD_ON_DELAY`: battery percent > low threshold AND auto-power-on enabled.
+- `RPI_OFF → LOAD_ON_DELAY`: auto-power-on enabled AND charger present AND battery percent > low threshold AND battery voltage > protection threshold (+ hysteresis).
 - `LOAD_ON_DELAY → RPI_ON`: delay elapsed AND conditions still valid.
 - `LOAD_ON_DELAY → RPI_OFF`: conditions invalid.
 - `RPI_ON → PROTECTION_LATCHED`: battery below protection voltage for required samples.
 - `RPI_ON → RPI_OFF`: manual off (long press).
-- `PROTECTION_LATCHED → LOAD_ON_DELAY`: charger connected AND battery > threshold.
+- `PROTECTION_LATCHED → LOAD_ON_DELAY`: charger present AND battery percent > low threshold AND battery voltage > protection threshold (+ hysteresis).
 - `PROTECTION_LATCHED → RPI_OFF`: charger disconnected or conditions invalid.
+- Battery percent is derived from true-VBAT when the charger is influencing VBAT; if true-VBAT is stale, percent is held.
 
 ### 5.2 Charger State Machine (`charger_state_t`)
 States:

@@ -670,6 +670,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.version = 22;
     state.snapshot_tick = 0;
     state.last_true_vbat_sample_tick = 0;
+    state.last_true_vbat_mv = 0;
 
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.charger_state = CHARGER_STATE_ABSENT;
@@ -880,7 +881,10 @@ int main(void)
             /* True-VBAT sample tick when charger not influencing (for staleness gating).
              * Intentional mismatch: freshness uses Charger_IsInfluencingVBAT; percent uses VBUS heuristic per B8. */
             if (!Charger_IsInfluencingVBAT(&sys_state))
+            {
                 state.last_true_vbat_sample_tick = sched_flags.tick_counter;
+                state.last_true_vbat_mv = state.battery_voltage_mv;
+            }
             /* Protection: store last ADC reading; counting is done in Protection_Step with adc_sample_seq gating. */
             prot_state.last_adc_battery_mv = state.battery_voltage_mv;
             Snapshot_UpdateDerived();
@@ -928,6 +932,7 @@ void CheckPowerOnConditions(void)
 
     uint32_t now_ticks = sched_flags.tick_counter;
     uint8_t battery_ok = (state.battery_percent > state.low_battery_percent);
+    uint8_t battery_above_protection = (state.battery_voltage_mv > (uint16_t)(state.protection_voltage_mv + PROTECTION_HYSTERESIS_MV));
     /* Charger physically connected (PRESENT or FORCED_OFF_WINDOW); distinct from Charger_IsInfluencingVBAT */
     uint8_t charger_present = (sys_state.charger_state == CHARGER_STATE_PRESENT ||
                               sys_state.charger_state == CHARGER_STATE_FORCED_OFF_WINDOW);
@@ -948,7 +953,7 @@ void CheckPowerOnConditions(void)
     if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
     {
         /* Staleness: if charger present, require fresh true-VBAT for percent-based decision */
-        if (charger_present && battery_ok && true_vbat_fresh)
+        if (charger_present && battery_ok && battery_above_protection && true_vbat_fresh)
         {
             sys_state.power_state = POWER_STATE_LOAD_ON_DELAY;
             sys_state.power_state_entry_ticks = now_ticks;
@@ -985,7 +990,7 @@ void CheckPowerOnConditions(void)
         return;
 
     /* Allow transition when battery_ok (battery % > low) */
-    if (battery_ok)
+    if (battery_ok && battery_above_protection)
     {
         sys_state.power_state = POWER_STATE_LOAD_ON_DELAY;
         sys_state.power_state_entry_ticks = now_ticks;
@@ -1012,6 +1017,7 @@ void FactoryReset(void)
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
     state.last_true_vbat_sample_tick = 0;
+    state.last_true_vbat_mv = 0;
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.factory_test_selector = 0;
 
@@ -1383,7 +1389,13 @@ void UpdateBatteryPercentage(void)
     int32_t range = (int32_t)state.full_voltage_mv - (int32_t)state.empty_voltage_mv;
     if (range < MIN_VOLTAGE_DELTA_MV)
         return;
-    int32_t voltage = (int32_t)state.battery_voltage_mv;
+    uint32_t now_ticks = sched_flags.tick_counter;
+    uint8_t true_vbat_fresh = IsTrueVbatSampleFresh(now_ticks, state.last_true_vbat_sample_tick);
+    uint8_t charging = Charger_IsInfluencingVBAT(&sys_state);
+    if (charging && !true_vbat_fresh)
+        return;
+    int32_t voltage = charging ? (int32_t)state.last_true_vbat_mv
+                               : (int32_t)state.battery_voltage_mv;
     int32_t percentage;
     if (voltage <= (int32_t)state.empty_voltage_mv)
         percentage = 0;
@@ -1398,7 +1410,6 @@ void UpdateBatteryPercentage(void)
 
     /* Use charger state (not VBUS heuristic) so percent can fall on battery even
      * if 5V rails are present or backfed. */
-    uint8_t charging = Charger_IsInfluencingVBAT(&sys_state);
     int32_t delta = percentage - (int32_t)state.battery_percent;
     if (delta >= (int32_t)BATTERY_PERCENT_HYSTERESIS || delta <= -(int32_t)BATTERY_PERCENT_HYSTERESIS)
     {
