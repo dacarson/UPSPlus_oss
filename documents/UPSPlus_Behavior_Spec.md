@@ -129,6 +129,17 @@ It is intended as the source of truth for feature development and future changes
   - 0xFD: protection active (0/1)
   - 0xFE: below-threshold count
   - 0xFF: pending power cut (0/1)
+- Selector 0x05: Flash/Persistence page  
+  - 0xFD: `flash_status` (bitfield)  
+    - bit0: record_valid (1 = valid record accepted at boot)  
+    - bit1: save_attempted (1 = at least one save attempt since boot)  
+    - bit2: save_success (1 = last save succeeded)  
+    - bits3–7: reserved (0)  
+  - 0xFE: `auto_power_on_info` (bitfield)  
+    - bit0: auto_power_on_loaded (value loaded from flash)  
+    - bit1: auto_power_on_effective (current active value in RAM)  
+    - bits2–7: reserved (0)  
+  - 0xFF: flash_sequence_lsb (0–255, increments on each successful commit, wraps)
 
 ---
 
