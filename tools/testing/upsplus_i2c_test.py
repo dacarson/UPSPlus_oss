@@ -52,6 +52,9 @@ REG = {
     "AUTO_POWER_ON": 0x19,
     "RESTART_COUNTDOWN": 0x1A,
     "FACTORY_RESET": 0x1B,
+    "RUNTIME_ALL_L": 0x1C,
+    "RUNTIME_CHARGING_L": 0x20,
+    "RUNTIME_CURRENT_L": 0x24,
     "VERSION_L": 0x28,
     "VERSION_H": 0x29,
     "BATTERY_SELF_PROG": 0x2A,
@@ -107,6 +110,10 @@ class I2CDevice:
 
     def write_u16(self, reg_l: int, value: int) -> None:
         self.write_block(reg_l, [value & 0xFF, (value >> 8) & 0xFF])
+
+    def read_u32(self, reg_l: int) -> int:
+        data = self.read_block(reg_l, 4)
+        return (data[3] << 24) | (data[2] << 16) | (data[1] << 8) | data[0]
 
 
 class TestRunner:
@@ -460,22 +467,90 @@ def test_optional_load_on_delay(t: TestRunner, dev: I2CDevice) -> None:
     t.record("Load on delay restore", restored, f"restored {orig}")
 
 
-def test_destructive(t: TestRunner, dev: I2CDevice) -> None:
-    # Countdown-based tests can power cycle the Pi or cut power.
-    dev.write_u8(REG["SHUTDOWN_COUNTDOWN"], 10)
-    t.record("Shutdown countdown started (destructive)", True, "wrote 10")
-    time.sleep(0.2)
+def record_timer_accuracy(
+    t: TestRunner, label: str, actual: int, expected: int, tolerance: float
+) -> None:
+    ok = abs(actual - expected) <= tolerance
+    detail = f"actual={actual}s expected~{expected}s tol={tolerance}s"
+    t.record(label, ok, detail)
+
+
+def test_timer_accuracy(t: TestRunner, dev: I2CDevice, duration_s: float, tolerance_s: float) -> None:
+    power_status = dev.read_u8(REG["POWER_STATUS"])
+    power_on = bool(power_status & 0x01)
+
+    start_all = dev.read_u32(REG["RUNTIME_ALL_L"])
+    start_charge = dev.read_u32(REG["RUNTIME_CHARGING_L"])
+    start_current = dev.read_u32(REG["RUNTIME_CURRENT_L"])
+
+    start = time.monotonic()
+    time.sleep(duration_s)
+    elapsed = time.monotonic() - start
+    expected = int(round(elapsed))
+
+    end_all = dev.read_u32(REG["RUNTIME_ALL_L"])
+    end_charge = dev.read_u32(REG["RUNTIME_CHARGING_L"])
+    end_current = dev.read_u32(REG["RUNTIME_CURRENT_L"])
+
+    delta_all = end_all - start_all
+    delta_charge = end_charge - start_charge
+    delta_current = end_current - start_current
+
+    record_timer_accuracy(t, "Runtime all accuracy", delta_all, expected, tolerance_s)
+
+    page3 = read_factory_page(t, dev, 3)
+    if page3 is None:
+        t.record("Charging runtime accuracy skipped", True, "factory page read failed")
+        charger_present = False
+    else:
+        charger_present = page3[1] == 1
+    dev.write_u8(REG["FACTORY_TEST_START"], 0)
+    wait_for_reg_value(dev, REG["FACTORY_TEST_START"], 0)
+
+    if charger_present:
+        record_timer_accuracy(t, "Charging runtime accuracy", delta_charge, expected, tolerance_s)
+    else:
+        t.record("Charging runtime accuracy skipped", True, "charger not present")
+
+    if power_on:
+        record_timer_accuracy(t, "Current runtime accuracy", delta_current, expected, tolerance_s)
+    else:
+        t.record("Current runtime accuracy skipped", True, "power_status indicates power off")
+
+
+def test_countdown_accuracy(
+    t: TestRunner, dev: I2CDevice, countdown_duration_s: float, tolerance_s: float
+) -> None:
+    # Countdown-based tests are safe if canceled before completion.
+    start_value = int(round(countdown_duration_s)) + 10
+    start_value = max(15, min(start_value, 120))
+
+    dev.write_u8(REG["SHUTDOWN_COUNTDOWN"], start_value)
+    t.record("Shutdown countdown started", True, f"wrote {start_value}")
+    start = time.monotonic()
+    time.sleep(countdown_duration_s)
+    elapsed = time.monotonic() - start
+    expected = max(start_value - int(round(elapsed)), 0)
+    after = dev.read_u8(REG["SHUTDOWN_COUNTDOWN"])
+    record_timer_accuracy(t, "Shutdown countdown accuracy", after, expected, tolerance_s)
     dev.write_u8(REG["SHUTDOWN_COUNTDOWN"], 0)
     time.sleep(0.2)
     t.record("Shutdown countdown canceled", dev.read_u8(REG["SHUTDOWN_COUNTDOWN"]) == 0)
 
-    dev.write_u8(REG["RESTART_COUNTDOWN"], 10)
-    t.record("Restart countdown started (destructive)", True, "wrote 10")
-    time.sleep(0.2)
+    dev.write_u8(REG["RESTART_COUNTDOWN"], start_value)
+    t.record("Restart countdown started", True, f"wrote {start_value}")
+    start = time.monotonic()
+    time.sleep(countdown_duration_s)
+    elapsed = time.monotonic() - start
+    expected = max(start_value - int(round(elapsed)), 0)
+    after = dev.read_u8(REG["RESTART_COUNTDOWN"])
+    record_timer_accuracy(t, "Restart countdown accuracy", after, expected, tolerance_s)
     dev.write_u8(REG["RESTART_COUNTDOWN"], 0)
     time.sleep(0.2)
     t.record("Restart countdown canceled", dev.read_u8(REG["RESTART_COUNTDOWN"]) == 0)
 
+
+def test_destructive(t: TestRunner, dev: I2CDevice) -> None:
     # Factory reset triggers immediate reset of parameters.
     dev.write_u8(REG["FACTORY_RESET"], 1)
     t.record("Factory reset triggered (destructive)", True)
@@ -551,7 +626,7 @@ def main() -> int:
     parser.add_argument(
         "--allow-destructive",
         action="store_true",
-        help="Allow destructive tests (shutdown/restart countdowns, factory reset)",
+        help="Allow destructive tests (factory reset)",
     )
     parser.add_argument(
         "--state-monitor-seconds",
@@ -564,6 +639,24 @@ def main() -> int:
         type=float,
         default=0.2,
         help="Polling interval for state pages in seconds (default: 0.2)",
+    )
+    parser.add_argument(
+        "--timer-accuracy-seconds",
+        type=float,
+        default=6.0,
+        help="Seconds to measure runtime counters (default: 6.0)",
+    )
+    parser.add_argument(
+        "--timer-accuracy-tolerance",
+        type=float,
+        default=1.0,
+        help="Allowed timer error in seconds (default: 1.0)",
+    )
+    parser.add_argument(
+        "--countdown-accuracy-seconds",
+        type=float,
+        default=3.0,
+        help="Seconds to measure countdown accuracy (default: 3.0)",
     )
     args = parser.parse_args()
 
@@ -580,6 +673,8 @@ def main() -> int:
         test_rw_low_battery_percent(t, dev)
         test_rw_battery_voltages(t, dev)
         test_state_machine_monitor(t, dev, args.state_monitor_seconds, args.state_monitor_interval)
+        test_timer_accuracy(t, dev, args.timer_accuracy_seconds, args.timer_accuracy_tolerance)
+        test_countdown_accuracy(t, dev, args.countdown_accuracy_seconds, args.timer_accuracy_tolerance)
         if args.allow_power_actions:
             test_optional_power_controls(t, dev)
             test_optional_load_on_delay(t, dev)
@@ -588,7 +683,7 @@ def main() -> int:
         if args.allow_destructive:
             test_destructive(t, dev)
         else:
-            t.record("Destructive tests skipped", True, "use --allow-destructive")
+            t.record("Destructive tests skipped", True, "use --allow-destructive for factory reset")
     finally:
         dev.close()
     return t.summary()
