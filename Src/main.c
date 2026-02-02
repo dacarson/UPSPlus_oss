@@ -972,13 +972,17 @@ void CheckPowerOnConditions(void)
         return;
 
     /* Staleness gate: if charger present, require fresh true-VBAT before auto power-on */
-    if (sys_state.charger_state == CHARGER_STATE_PRESENT && !true_vbat_fresh)
+    if (charger_present && !true_vbat_fresh)
     {
         /* Plan: force measurement window ASAP so we get fresh true-VBAT */
         if (!window_mgr.window_active)
             window_mgr.window_due = 1;
         return;
     }
+
+    /* Do not auto power-on from battery-only; require charger present */
+    if (!charger_present)
+        return;
 
     /* Allow transition when battery_ok (battery % > low) */
     if (battery_ok)
