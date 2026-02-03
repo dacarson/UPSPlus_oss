@@ -46,6 +46,17 @@ class I2CDevice:
 def format_bool(value: int) -> str:
     return "yes" if value else "no"
 
+def s16_from_u16(value: int) -> int:
+    return value - 0x10000 if value & 0x8000 else value
+
+def format_current_flags(value: int) -> str:
+    output_valid = bool(value & 0x01)
+    battery_valid = bool(value & 0x02)
+    return (
+        f"0x{value:02X} (output_valid={format_bool(output_valid)}, "
+        f"battery_valid={format_bool(battery_valid)})"
+    )
+
 
 def format_power_status(value: int) -> str:
     power_on = bool(value & 0x01)
@@ -70,6 +81,11 @@ def main() -> int:
         print_kv("USB-C voltage (mV)", str(dev.read_u16(0x07)))
         print_kv("Micro-USB voltage (mV)", str(dev.read_u16(0x09)))
         print_kv("Temperature (C)", str(dev.read_u16(0x0B)))
+        output_current = s16_from_u16(dev.read_u16(0x2E))
+        battery_current = s16_from_u16(dev.read_u16(0x30))
+        print_kv("Output current (mA)", str(output_current))
+        print_kv("Battery current (mA)", str(battery_current))
+        print_kv("Current valid flags", format_current_flags(dev.read_u8(0x32)))
 
         print("\nConfiguration")
         print_kv("Full voltage (mV)", str(dev.read_u16(0x0D)))

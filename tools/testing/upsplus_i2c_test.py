@@ -61,13 +61,18 @@ REG = {
     "LOW_BATTERY_PERCENT": 0x2B,
     "LOAD_ON_DELAY_L": 0x2C,
     "LOAD_ON_DELAY_H": 0x2D,
+    "OUTPUT_CURRENT_L": 0x2E,
+    "OUTPUT_CURRENT_H": 0x2F,
+    "BATTERY_CURRENT_L": 0x30,
+    "BATTERY_CURRENT_H": 0x31,
+    "CURRENT_VALID_FLAGS": 0x32,
     "SERIAL_START": 0xF0,
     "SERIAL_END": 0xFB,
     "FACTORY_TEST_START": 0xFC,
     "FACTORY_TEST_END": 0xFF,
 }
 
-RESERVED_SAMPLES = [0x2E, 0x50, 0xEF]
+RESERVED_SAMPLES = [0x33, 0x50, 0xEF]
 
 VBAT_FULL_MAX_MV = 4500
 VBAT_EMPTY_MAX_MV = 4500
@@ -175,6 +180,13 @@ def test_reserved_reads_zero(t: TestRunner, dev: I2CDevice) -> None:
         t.record(f"Reserved read 0x{reg:02X} == 0x00", val == 0, f"read 0x{val:02X}")
 
 
+def test_reserved_write_ignored(t: TestRunner, dev: I2CDevice) -> None:
+    for reg in (0x33, 0x50):
+        dev.write_u8(reg, 0xA5)
+        val = dev.read_u8(reg)
+        t.record(f"Reserved write 0x{reg:02X} ignored", val == 0, f"read 0x{val:02X}")
+
+
 def test_factory_test_pages(t: TestRunner, dev: I2CDevice) -> None:
     dev.write_u8(REG["FACTORY_TEST_START"], 0)
     if not wait_for_reg_value(dev, REG["FACTORY_TEST_START"], 0):
@@ -270,6 +282,29 @@ def test_basic_reads(t: TestRunner, dev: I2CDevice) -> None:
     t.record("Firmware version readable", len(ver) == 2, f"read {ver}")
     serial = dev.read_block(REG["SERIAL_START"], 12)
     t.record("Serial number block readable", len(serial) == 12, f"read {serial}")
+
+
+def test_current_registers_readable(t: TestRunner, dev: I2CDevice) -> None:
+    data = dev.read_block(REG["OUTPUT_CURRENT_L"], 5)
+    t.record("Current registers block readable", len(data) == 5, f"read {data}")
+
+
+def test_current_registers_ro_write_ignored(t: TestRunner, dev: I2CDevice) -> None:
+    base = dev.read_block(REG["OUTPUT_CURRENT_L"], 5)
+    write_pattern = [
+        base[0] ^ 0xA5,
+        base[1] ^ 0x5A,
+        base[2] ^ 0xA5,
+        base[3] ^ 0x5A,
+        base[4] ^ 0xA5,
+    ]
+    for i, value in enumerate(write_pattern):
+        dev.write_u8(REG["OUTPUT_CURRENT_L"] + i, value)
+    time.sleep(0.05)
+    after = dev.read_block(REG["OUTPUT_CURRENT_L"], 5)
+    ok = after == base
+    detail = f"baseline {base} wrote {write_pattern} after {after}"
+    t.record("Current registers ignore writes", ok, detail)
 
 
 def test_ro_write_ignored(t: TestRunner, dev: I2CDevice) -> None:
@@ -665,6 +700,9 @@ def main() -> int:
     try:
         test_basic_reads(t, dev)
         test_reserved_reads_zero(t, dev)
+        test_reserved_write_ignored(t, dev)
+        test_current_registers_readable(t, dev)
+        test_current_registers_ro_write_ignored(t, dev)
         test_factory_test_pages(t, dev)
         test_factory_unknown_selector(t, dev)
         test_factory_writes_ignored(t, dev)

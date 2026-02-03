@@ -63,7 +63,10 @@ It is intended as the source of truth for feature development and future changes
 - **0x2A**: Battery parameters self-programmed (RW).
 - **0x2B**: Low battery percent threshold (RW).
 - **0x2C–0x2D**: Load on delay (RW, 16-bit).
-- **0x2E–0xEF**: Reserved (RO zero, writes ignored).
+- **0x2E–0x2F**: Output current (RO, int16, 1 mA/LSB).
+- **0x30–0x31**: Battery current (RO, int16, 1 mA/LSB).
+- **0x32**: Current valid flags (RO, bit0=output, bit1=battery).
+- **0x33–0xEF**: Reserved (RO zero, writes ignored).
 - **0xF0–0xFB**: MCU serial number (RO).
 - **0xFC–0xFF**: Factory Testing (runtime selector + pages).
 

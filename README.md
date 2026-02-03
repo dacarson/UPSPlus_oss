@@ -18,7 +18,7 @@ The code has been re-written from the ground up using a combination of ChatGPT a
 - Boot brownout backoff learning (see [Boot Brownout Backoff](#boot-brownout-backoff)).
 - Charging plateau detection for adaptive full-battery learning.
 - Factory Testing pages (0xFC–0xFF) for diagnostics.
-- OTA firmware update support.
+- OTA firmware update support (legacy bootloader mode only; not part of this runtime firmware).
 
 ## Button Behavior
 
@@ -38,7 +38,10 @@ learned delay is clamped to 60 minutes, persists across power cycles, and is cle
 factory reset. A user write to `load.on.delay` becomes the new baseline; any further learning
 adds minutes on top of that value.
 
-## Firmware Update (OTA)
+## Firmware Update (OTA - Legacy Bootloader)
+
+This workflow targets the legacy bootloader mode and is not supported by the
+runtime firmware register map in this branch.
 
 1. Ensure the UPSPlus is connected to your Raspberry Pi.
 2. Put the UPSPlus into OTA mode by removing all power supplies and batteries.
@@ -93,7 +96,10 @@ Note: multi-byte registers are little-endian (LSB at lower address).
 - `0x2A` Battery parameters self-programmed (RW; 0=self-program, 1=manual)
 - `0x2B` Low battery percent threshold (RW)
 - `0x2C–0x2D` Load on delay (RW, seconds)
-- `0x2E–0xEF` Reserved (RO 0x00, writes ignored)
+- `0x2E–0x2F` Output current (RO, int16, 1 mA/LSB)
+- `0x30–0x31` Battery current (RO, int16, 1 mA/LSB)
+- `0x32` Current valid flags (RO; bit0=output, bit1=battery)
+- `0x33–0xEF` Reserved (RO 0x00, writes ignored)
 - `0xF0–0xFB` MCU serial number (RO)
 - `0xFC–0xFF` Factory Testing (RW selector + RO pages)
   - `0xFC` Selector (0=disabled)

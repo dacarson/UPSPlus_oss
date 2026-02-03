@@ -143,6 +143,9 @@ If a read is skipped or fails, cached current values are not overwritten; the va
 flag indicates whether the cached value is fresh. When valid=0, registers still
 return the last cached value; consumers must consult valid.
 
+Phase 1 allocates registers only; current values remain 0 until phases 2-4
+implement INA sampling and snapshot population.
+
 Expose age via Factory Testing selector:
 - Selector `0x06`: Current age page
   - `0xFD`: `output_current_age_10ms` (uint8, age in 10 ms units, saturates at 255)
@@ -186,7 +189,9 @@ Required bus recovery (guarded):
 ### Phase 1: Plan and Register Allocation
 - Confirm register addresses do not collide with existing map.
 - Decide validity/age metadata exposure (flags + Factory Testing age page).
-- Update plan and test scripts for new registers.
+- Document Factory Testing selector 0x06 and tests when implemented (Phase 4).
+
+Status: Phase 1 complete (register allocation, docs/test updates, reserved-region alignment).
 
 ### Phase 2: Boot-Time Master Setup
 - Add master-mode init before slave enable.

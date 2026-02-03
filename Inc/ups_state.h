@@ -27,7 +27,8 @@
  *
  * - VBUS/USBIN ADC scaling: __LL_ADC_CALC_DATA_TO_VOLTAGE produces connector-
  *   referenced millivolts; charger thresholds (CHARGER_PRESENT_ON/OFF_MV) are correct.
- * - Reserved region reads (0x2E-0xEF, 0xFC-0xFF): legacy returns 0x00; writes ACK'd but discarded.
+ * - Reserved region reads (0x33-0xEF): legacy returns 0x00; writes ACK'd but discarded.
+ * - Factory Test region (0xFC-0xFF): selector-based semantics; non-selector reads return 0x00.
  * - Register 0x14 (battery percent MSB): legacy always returns 0x00.
  * - Temperature (0x0B-0x0C): integer degrees Celsius (°C); __LL_ADC_CALC_TEMPERATURE yields °C.
  * - ADC channel ordering: matches MX_ADC_Init sequence (see ADC section).
@@ -698,14 +699,23 @@ extern volatile uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]; /* 
 /* Load On Delay (0x2C-0x2D): Read has no side effects; decrement occurs only on tick_1s in main loop */
 #define REG_LOAD_ON_DELAY_L     0x2C  /* Current countdown value (read from snapshot, no side effects) */
 #define REG_LOAD_ON_DELAY_H     0x2D  /* Current countdown value (read from snapshot, no side effects) */
+/* Current measurement registers (INA219 plan, phase 1 allocation) */
+#define REG_OUTPUT_CURRENT_L    0x2E
+#define REG_OUTPUT_CURRENT_H    0x2F
+#define REG_BATTERY_CURRENT_L   0x30
+#define REG_BATTERY_CURRENT_H   0x31
+#define REG_CURRENT_VALID_FLAGS 0x32  /* bit0=output valid, bit1=battery valid */
 
 /* Reserved Regions - Behavior: ACK writes but discard; reads return 0x00.
  * Characterization: legacy returns 0x00 for reserved reads (see block at top).
- * Snapshot mapping MUST explicitly return 0x00 for any reg in [0x2E-0xEF] and [0xFC-0xFF];
+ * Snapshot mapping MUST explicitly return 0x00 for any reg in [0x33-0xEF];
  * do not fall through to memory.
  * Future risk: I2C write path must NOT store "last written value" for reserved
- * regs—writes are ACK'd but discarded; reserved reads always return 0x00. */
-#define REG_RESERVED_START      0x2E  /* Start of reserved region */
+ * regs—writes are ACK'd but discarded; reserved reads always return 0x00.
+ *
+ * Factory Test Region (0xFC-0xFF): 0xFC is the selector; 0xFD-0xFF return
+ * selector-defined page data when enabled, otherwise 0x00. */
+#define REG_RESERVED_START      0x33  /* Start of reserved region */
 #define REG_RESERVED_END        0xEF  /* End of reserved region */
 #define REG_SERIAL_START        0xF0
 #define REG_SERIAL_END          0xFB

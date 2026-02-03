@@ -42,7 +42,6 @@ __IO uint8_t sKeyFlag = 0;         /* Button activity (EXTI edge) */
 __IO uint16_t sIPIdleTicks = 0;
 __IO uint8_t MustRefreshVDD = 1;
 /* Countdowns decremented in main loop on tick_1s (removed from ISR) */
-__IO uint8_t OTAShot = 0;
 
 #define BL_START_ADDRESS 0x8000000
 
@@ -91,8 +90,6 @@ static uint8_t flash_record_valid_boot = 0;
 static uint8_t flash_save_attempted = 0;
 static uint8_t flash_last_save_success = 0;
 static uint8_t flash_auto_power_on_loaded = 0;
-/* OTA requested via I2C write 127 to register 0x32 (50) */
-static volatile uint8_t ota_triggered = 0;
 
 /* Battery plateau full detection (self-programming enabled) */
 static uint16_t filtered_vbat_mv = 0;
@@ -307,6 +304,12 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
     u16 = (auth->load_on_delay_remaining_sec != 0u) ? auth->load_on_delay_remaining_sec : auth->load_on_delay_config_sec;
     buf[REG_LOAD_ON_DELAY_L]     = (uint8_t)(u16 & 0xFFu);
     buf[REG_LOAD_ON_DELAY_H]     = (uint8_t)((u16 >> 8) & 0xFFu);
+    /* INA219 current registers (phase 1 allocation; values populated in later phases). */
+    buf[REG_OUTPUT_CURRENT_L]    = 0x00u;
+    buf[REG_OUTPUT_CURRENT_H]    = 0x00u;
+    buf[REG_BATTERY_CURRENT_L]   = 0x00u;
+    buf[REG_BATTERY_CURRENT_H]   = 0x00u;
+    buf[REG_CURRENT_VALID_FLAGS] = 0x00u;
     for (i = REG_RESERVED_START; i <= REG_RESERVED_END; i++)
         buf[i] = 0x00u;
     buf[REG_SERIAL_START + 0]  = (uint8_t)(LL_GetUID_Word0() & 0xFFu);
@@ -468,6 +471,7 @@ static uint8_t IsReadOnlyRegister(uint8_t reg)
     if (reg == REG_POWER_STATUS) return 1; /* 0x17 */
     if (reg >= REG_RUNTIME_ALL_0 && reg <= REG_RUNTIME_CURRENT_3) return 1; /* 0x1C-0x27 */
     if (reg >= REG_VERSION_L && reg <= REG_VERSION_H) return 1; /* 0x28-0x29 */
+    if (reg >= REG_OUTPUT_CURRENT_L && reg <= REG_CURRENT_VALID_FLAGS) return 1; /* 0x2E-0x32 */
     if (reg >= REG_SERIAL_START && reg <= REG_SERIAL_END) return 1; /* 0xF0-0xFB */
     return 0;
 }
@@ -482,10 +486,6 @@ static void ProcessI2CPendingWrite(void)
     uint8_t persist_changed = 0;
 
     if (!i2c_pending_write.pending) return;
-
-    /* OTA trigger: write 127 to reg 0x32 (50) - accept before reserved discard */
-    if (reg == 50 && len >= 1 && i2c_pending_write.data[0] == 127)
-        ota_triggered = 1;
 
     /* Reserved: ACK but discard */
     if (IS_RESERVED_REG(reg) || (IS_FACTORY_TEST_REG(reg) && reg != REG_FACTORY_TEST_START)) {
@@ -894,26 +894,6 @@ int main(void)
 
         if (state.auto_power_on)
             CheckPowerOnConditions();
-
-        if (ota_triggered && OTAShot == 0)
-        {
-            ota_triggered = 0;
-            Snapshot_UpdateDerived();
-            flash_save_bypass = 1;
-            flash_dirty = 1;
-            if (Flash_Save(1u))
-            {
-                flash_save_requested = 0;
-                flash_save_bypass = 0;
-            }
-            else
-            {
-                flash_save_requested = 1;
-            }
-            OTAShot = 1;
-            while (1)
-                ;
-        }
 
         /* Button actions (short/long press) */
         Button_DispatchActions();
