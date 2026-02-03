@@ -63,8 +63,8 @@ It is intended as the source of truth for feature development and future changes
 - **0x2A**: Battery parameters self-programmed (RW).
 - **0x2B**: Low battery percent threshold (RW).
 - **0x2C–0x2D**: Load on delay (RW, 16-bit).
-- **0x2E–0x2F**: Output current (RO, int16, 1 mA/LSB).
-- **0x30–0x31**: Battery current (RO, int16, 1 mA/LSB).
+- **0x2E–0x2F**: Output current (RO, signed int16, 1 mA/LSB).
+- **0x30–0x31**: Battery current (RO, signed int16, 1 mA/LSB).
 - **0x32**: Current valid flags (RO, bit0=output, bit1=battery).
 - **0x33–0xEF**: Reserved (RO zero, writes ignored).
 - **0xF0–0xFB**: MCU serial number (RO).
@@ -143,6 +143,14 @@ It is intended as the source of truth for feature development and future changes
     - bit1: auto_power_on_effective (current active value in RAM)  
     - bits2–7: reserved (0)  
   - 0xFF: flash_sequence_lsb (0–255, increments on each successful commit, wraps)
+- Selector 0x06: INA219 boot presence page  
+  - 0xFD: bitfield (bit0=output INA at 0x40 present, bit1=battery INA at 0x45 present)  
+  - 0xFE: 0  
+  - 0xFF: 0  
+- Selector 0x07: INA219 current age page  
+  - 0xFD: output_current_age_10ms (uint8, min(age_10ms, 255))  
+  - 0xFE: battery_current_age_10ms (uint8, min(age_10ms, 255))  
+  - 0xFF: 0  
 
 ---
 

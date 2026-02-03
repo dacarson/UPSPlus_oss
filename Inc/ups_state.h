@@ -178,6 +178,10 @@ STATIC_ASSERT((PLATEAU_WINDOW_SEC % PLATEAU_EVAL_PERIOD_SEC) == 0,
 /* Explicit uint32_t for overflow safety; use UINT32_C for literal if needed in expressions */
 #define TRUE_VBAT_MAX_AGE_TICKS       ((uint32_t)((uint32_t)(TRUE_VBAT_MAX_AGE_SEC) * (uint32_t)(TICKS_PER_1S)))
 
+/* INA219 current validity */
+#define CURRENT_VALID_AGE_SEC         2u
+#define CURRENT_VALID_AGE_TICKS       ((uint32_t)((uint32_t)(CURRENT_VALID_AGE_SEC) * (uint32_t)(TICKS_PER_1S)))
+
 /*===========================================================================*/
 /*                         STATE MACHINE ENUMERATIONS                         */
 /*===========================================================================*/
@@ -441,6 +445,14 @@ typedef struct {
      * - When countdown active (power_state == LOAD_ON_DELAY): Returns load_on_delay_remaining_sec */
     uint16_t load_on_delay_config_sec; /* 0x2C-0x2D: Configured delay (0-65535) */
     uint16_t load_on_delay_remaining_sec; /* Remaining seconds when countdown active (0 when inactive) */
+
+    /* INA219 current cache (1 mA/LSB) and freshness metadata */
+    int16_t output_current_mA;         /* 0x2E-0x2F: Output current */
+    int16_t battery_current_mA;        /* 0x30-0x31: Battery current */
+    uint8_t output_current_valid;      /* 0x32 bit0: Fresh within 2s */
+    uint8_t battery_current_valid;     /* 0x32 bit1: Fresh within 2s */
+    uint16_t output_current_age_10ms;  /* Age in 10ms units; saturates at 0xFFFF */
+    uint16_t battery_current_age_10ms; /* Age in 10ms units; saturates at 0xFFFF */
     
     /* Runtime counters */
     uint32_t cumulative_runtime_sec;   /* 0x1C-0x1F: RuntimeAtAll */

@@ -110,6 +110,9 @@ Factory Testing selectors:
 - `0x02` Button page: button_state, click, hold_ticks (LSB)
 - `0x03` Charger/window page: charger_present, window_active, window_due
 - `0x04` Protection page: protection_active, below_count, pending_power_cut
+- `0x05` Flash/persistence page: flash_status, auto_power_on_info, flash_sequence_lsb
+- `0x06` INA boot presence page: bit0=output(0x40), bit1=battery(0x45)
+- `0x07` INA current age page: output_age_10ms, battery_age_10ms (each saturated to 255)
 
 ## Documentation
 

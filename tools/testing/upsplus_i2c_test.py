@@ -226,6 +226,20 @@ def test_factory_test_pages(t: TestRunner, dev: I2CDevice) -> None:
                 button_state_ok and click_ok,
                 f"read {data}",
             )
+            detail = (
+                f"read {data} "
+                f"(output={'yes' if output_present else 'no'} "
+                f"battery={'yes' if battery_present else 'no'})"
+            )
+            t.record("Factory test page 0x06 bitfield", reserved_ok, detail)
+        else:
+            reserved_ok = data[3] == 0
+            detail = f"read {data}"
+            if output_present:
+                detail += f" output_age_10ms={data[1]}"
+            if battery_present:
+                detail += f" battery_age_10ms={data[2]}"
+            t.record("Factory test page 0x07 age bytes", reserved_ok, detail)
     dev.write_u8(REG["FACTORY_TEST_START"], 5)
     if not wait_for_reg_value(dev, REG["FACTORY_TEST_START"], 5):
         t.record("Factory test selector 5 timeout", False, "waited for 0xFC=0x05")

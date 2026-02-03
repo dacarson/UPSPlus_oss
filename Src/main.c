@@ -94,8 +94,6 @@ static volatile uint8_t ina_probe_requested = 0;
 static uint32_t ina_probe_due_ticks = 0;
 static uint8_t ina_probe_is_output = 1u;
 static uint8_t ina_next_is_output = 1u;
-static int16_t ina_last_shunt_output = 0;
-static int16_t ina_last_shunt_battery = 0;
 
 static void MX_TIM3_Init(void);
 static uint8_t I2C1_GuardWindowReady(void);
@@ -130,6 +128,7 @@ static void Button_DispatchActions(void);
 static void BatteryPlateau_Init(void);
 static void BatteryPlateau_OnAdcSample(uint16_t raw_vbat_mv);
 static void BatteryPlateau_Tick1s(void);
+static void CurrentAge_Tick10ms(void);
 
 /*===========================================================================*/
 /* Validation functions (register bounds, RO enforcement in apply)           */
@@ -315,12 +314,13 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
     u16 = (auth->load_on_delay_remaining_sec != 0u) ? auth->load_on_delay_remaining_sec : auth->load_on_delay_config_sec;
     buf[REG_LOAD_ON_DELAY_L]     = (uint8_t)(u16 & 0xFFu);
     buf[REG_LOAD_ON_DELAY_H]     = (uint8_t)((u16 >> 8) & 0xFFu);
-    /* INA219 current registers (phase 1 allocation; values populated in later phases). */
-    buf[REG_OUTPUT_CURRENT_L]    = 0x00u;
-    buf[REG_OUTPUT_CURRENT_H]    = 0x00u;
-    buf[REG_BATTERY_CURRENT_L]   = 0x00u;
-    buf[REG_BATTERY_CURRENT_H]   = 0x00u;
-    buf[REG_CURRENT_VALID_FLAGS] = 0x00u;
+    /* INA219 current registers (cached values + validity). */
+    buf[REG_OUTPUT_CURRENT_L]    = (uint8_t)(auth->output_current_mA & 0xFFu);
+    buf[REG_OUTPUT_CURRENT_H]    = (uint8_t)(((uint16_t)auth->output_current_mA >> 8) & 0xFFu);
+    buf[REG_BATTERY_CURRENT_L]   = (uint8_t)(auth->battery_current_mA & 0xFFu);
+    buf[REG_BATTERY_CURRENT_H]   = (uint8_t)(((uint16_t)auth->battery_current_mA >> 8) & 0xFFu);
+    buf[REG_CURRENT_VALID_FLAGS] = (uint8_t)((auth->output_current_valid ? 0x01u : 0x00u) |
+                                             (auth->battery_current_valid ? 0x02u : 0x00u));
     for (i = REG_RESERVED_START; i <= REG_RESERVED_END; i++)
         buf[i] = 0x00u;
     buf[REG_SERIAL_START + 0]  = (uint8_t)(LL_GetUID_Word0() & 0xFFu);
@@ -380,6 +380,14 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
             buf[REG_FACTORY_TEST_START + 1] = (uint8_t)((I2C1_GetInaProbeOutputPresent() ? 0x01u : 0x00u) |
                                                        (I2C1_GetInaProbeBatteryPresent() ? 0x02u : 0x00u));
             buf[REG_FACTORY_TEST_START + 2] = 0x00u;
+            buf[REG_FACTORY_TEST_START + 3] = 0x00u;
+            break;
+        case 0x07u:
+            /* INA219 current age (10ms units), saturated to 8-bit for factory test readout. */
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)((auth->output_current_age_10ms <= 255u) ?
+                                                        auth->output_current_age_10ms : 255u);
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)((auth->battery_current_age_10ms <= 255u) ?
+                                                        auth->battery_current_age_10ms : 255u);
             buf[REG_FACTORY_TEST_START + 3] = 0x00u;
             break;
         default:
@@ -682,6 +690,12 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.low_battery_percent = DEFAULT_LOW_BATTERY_PERCENT;
     state.load_on_delay_config_sec = DEFAULT_LOAD_ON_DELAY_SEC;
     state.load_on_delay_remaining_sec = 0;
+    state.output_current_mA = 0;
+    state.battery_current_mA = 0;
+    state.output_current_valid = 0;
+    state.battery_current_valid = 0;
+    state.output_current_age_10ms = 0xFFFFu;
+    state.battery_current_age_10ms = 0xFFFFu;
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
@@ -840,9 +854,18 @@ int main(void)
                 if (I2C1_ReadIna219Shunt(ina_probe_is_output, &shunt_raw))
                 {
                     if (ina_probe_is_output)
-                        ina_last_shunt_output = shunt_raw;
+                    {
+                        state.output_current_mA = shunt_raw;
+                        state.output_current_age_10ms = 0u;
+                        state.output_current_valid = 1u;
+                    }
                     else
-                        ina_last_shunt_battery = shunt_raw;
+                    {
+                        state.battery_current_mA = shunt_raw;
+                        state.battery_current_age_10ms = 0u;
+                        state.battery_current_valid = 1u;
+                    }
+                    Snapshot_UpdateDerived();
                 }
             }
         }
@@ -1924,6 +1947,28 @@ static void PowerStateMachine_OnTick1s(void)
     BootBackoff_CheckSuccess();
 }
 
+static void CurrentAge_Tick10ms(void)
+{
+    uint8_t prev_output_valid = state.output_current_valid;
+    uint8_t prev_battery_valid = state.battery_current_valid;
+
+    if (state.output_current_age_10ms < 0xFFFFu) {
+        state.output_current_age_10ms++;
+    }
+    if (state.battery_current_age_10ms < 0xFFFFu) {
+        state.battery_current_age_10ms++;
+    }
+
+    state.output_current_valid =
+        (((uint32_t)state.output_current_age_10ms) <= CURRENT_VALID_AGE_TICKS) ? 1u : 0u;
+    state.battery_current_valid =
+        (((uint32_t)state.battery_current_age_10ms) <= CURRENT_VALID_AGE_TICKS) ? 1u : 0u;
+
+    if (state.output_current_valid != prev_output_valid ||
+        state.battery_current_valid != prev_battery_valid)
+        Snapshot_UpdateDerived();
+}
+
 static void Scheduler_Tick10ms(void)
 {
     PowerStateMachine_Step();
@@ -1933,6 +1978,7 @@ static void Scheduler_Tick10ms(void)
 
     /* Button handling (tick_10ms) */
     Button_ProcessTick10ms();
+    CurrentAge_Tick10ms();
 }  /* end Scheduler_Tick10ms() */
 
 static void Button_ProcessTick10ms(void)

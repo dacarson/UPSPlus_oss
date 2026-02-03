@@ -225,6 +225,8 @@ Status: Phase 3 complete (runtime master window and timed guard logic).
 - Copy into snapshot without side effects on read.
 - Ensure multi-byte atomicity in snapshot layout.
 
+Status: Phase 4 complete (current cache/validity/age + snapshot mapping + factory age page).
+
 ### Phase 5: Fault Handling + Recovery
 - Handle NACK/arbitration/bus faults by abort + restore slave.
 - Optional GPIO clock-out recovery for stuck SDA.
