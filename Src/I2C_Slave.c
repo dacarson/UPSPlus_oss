@@ -1,5 +1,7 @@
 #include "I2C_Slave.h"
 
+#include <stddef.h>
+
 #include "stm32f0xx_ll_gpio.h"
 #include "stm32f0xx_ll_i2c.h"
 #include "stm32f0xx_ll_bus.h"
@@ -19,11 +21,14 @@ static uint8_t ignore_write = 0;             /* 1 = pending already set, drop th
 static volatile uint8_t latched_reg_image = 0;  /* Latched at ADDR+READ; TX uses reg_image[latched_reg_image] for whole transaction */
 
 /* INA219 probe/master setup (Phase 2 + minimal Phase 3) */
+#define I2C1_SLAVE_ADDR_7BIT    0x17u
 #define INA219_ADDR_OUTPUT      0x40u
 #define INA219_ADDR_BATTERY     0x45u
 #define INA219_REG_CONFIG       0x00u
+#define INA219_REG_SHUNT        0x01u
 #define INA219_CONFIG_VALUE     0x0B9Du
 #define I2C_BOOT_TIMEOUT_CYCLES 100000u
+#define I2C1_MASTER_WINDOW_TIMEOUT_US 2000u
 /* I2C1 kernel clock source is HSI (8 MHz) per SystemClock_Config().
  * If I2C1SW changes, regenerate timing and update this macro. */
 #define I2C1_TIMING_100KHZ_HSI8MHZ __LL_I2C_CONVERT_TIMINGS(1, 4, 1, 19, 19)
@@ -46,8 +51,14 @@ static uint8_t ina_probe_present_battery = 0u;
 
 static volatile uint8_t i2c_slave_txn_active = 0u;
 static volatile uint8_t i2c_addr_matched_since_stop = 0u;
-static volatile uint32_t i2c_last_addr_us = 0u;
-static volatile uint32_t i2c_last_stop_us = 0u;
+static volatile uint16_t i2c_last_addr_us = 0u;
+static volatile uint16_t i2c_last_stop_us = 0u;
+
+static uint32_t i2c1_slave_timing = 0u;
+static uint32_t i2c1_slave_cr1 = 0u;
+static uint32_t i2c1_slave_cr2 = 0u;
+static uint32_t i2c1_slave_oar1 = 0u;
+static uint32_t i2c1_slave_oar2 = 0u;
 
 
 static void I2C1_ClearErrorFlags(void)
@@ -86,6 +97,10 @@ static void I2C1_ClearAllFlags(void)
 {
     if (LL_I2C_IsActiveFlag_STOP(I2C1))
         LL_I2C_ClearFlag_STOP(I2C1);
+    if (LL_I2C_IsActiveFlag_ADDR(I2C1))
+        LL_I2C_ClearFlag_ADDR(I2C1);
+    while (LL_I2C_IsActiveFlag_RXNE(I2C1))
+        (void)LL_I2C_ReceiveData8(I2C1);
     if (LL_I2C_IsActiveFlag_NACK(I2C1))
         LL_I2C_ClearFlag_NACK(I2C1);
     if (LL_I2C_IsActiveFlag_BERR(I2C1))
@@ -254,6 +269,104 @@ static uint8_t I2C1_WaitForTC(uint32_t timeout_cycles)
     return 1u;
 }
 
+static uint8_t I2C1_WindowExpired(uint16_t start_us)
+{
+    return ((uint16_t)(LL_TIM_GetCounter(TIM3) - start_us) >= (uint16_t)I2C1_MASTER_WINDOW_TIMEOUT_US) ? 1u : 0u;
+}
+
+static uint8_t I2C1_WaitForTXIS_Window(uint16_t start_us)
+{
+    while (!LL_I2C_IsActiveFlag_TXIS(I2C1))
+    {
+        if (I2C1_CheckAndClearErrors())
+            return 0u;
+        if (LL_I2C_IsActiveFlag_NACK(I2C1))
+        {
+            LL_I2C_ClearFlag_NACK(I2C1);
+            return 0u;
+        }
+        if (I2C1_WindowExpired(start_us))
+            return 0u;
+    }
+    return 1u;
+}
+
+static uint8_t I2C1_WaitForRXNE_Window(uint16_t start_us)
+{
+    while (!LL_I2C_IsActiveFlag_RXNE(I2C1))
+    {
+        if (I2C1_CheckAndClearErrors())
+            return 0u;
+        if (LL_I2C_IsActiveFlag_NACK(I2C1))
+        {
+            LL_I2C_ClearFlag_NACK(I2C1);
+            return 0u;
+        }
+        if (I2C1_WindowExpired(start_us))
+            return 0u;
+    }
+    return 1u;
+}
+
+static uint8_t I2C1_WaitForSTOP_Window(uint16_t start_us)
+{
+    while (!LL_I2C_IsActiveFlag_STOP(I2C1))
+    {
+        if (I2C1_CheckAndClearErrors())
+            return 0u;
+        if (LL_I2C_IsActiveFlag_NACK(I2C1))
+        {
+            LL_I2C_ClearFlag_NACK(I2C1);
+            return 0u;
+        }
+        if (I2C1_WindowExpired(start_us))
+            return 0u;
+    }
+    return 1u;
+}
+
+static uint8_t I2C1_WaitForTC_Window(uint16_t start_us)
+{
+    while (!LL_I2C_IsActiveFlag_TC(I2C1))
+    {
+        if (I2C1_CheckAndClearErrors())
+            return 0u;
+        if (LL_I2C_IsActiveFlag_NACK(I2C1))
+        {
+            LL_I2C_ClearFlag_NACK(I2C1);
+            return 0u;
+        }
+        if (I2C1_WindowExpired(start_us))
+            return 0u;
+    }
+    return 1u;
+}
+
+static void I2C1_EnterMasterWindow(void)
+{
+    NVIC_DisableIRQ(I2C1_IRQn);
+    LL_I2C_Disable(I2C1);
+    LL_I2C_DisableOwnAddress1(I2C1);
+    LL_I2C_DisableOwnAddress2(I2C1);
+    I2C1_ClearAllFlags();
+    LL_I2C_SetTiming(I2C1, I2C1_TIMING_100KHZ_HSI8MHZ);
+    LL_I2C_Enable(I2C1);
+}
+
+static void I2C1_ExitMasterWindow(void)
+{
+    LL_I2C_Disable(I2C1);
+    I2C1_ClearAllFlags();
+    LL_I2C_SetTiming(I2C1, i2c1_slave_timing);
+    I2C1->CR2 = i2c1_slave_cr2;
+    I2C1->OAR1 = i2c1_slave_oar1;
+    I2C1->OAR2 = i2c1_slave_oar2;
+    I2C1->CR1 = i2c1_slave_cr1;
+    LL_I2C_EnableIT_RX(I2C1);
+    LL_I2C_EnableIT_TX(I2C1);
+    NVIC_EnableIRQ(I2C1_IRQn);
+}
+
 static uint8_t I2C1_MasterWriteReg16(uint8_t addr_7bit, uint8_t reg, uint16_t value)
 {
     uint8_t msb = (uint8_t)((value >> 8) & 0xFFu);
@@ -339,6 +452,42 @@ static uint8_t I2C1_MasterReadReg16(uint8_t addr_7bit, uint8_t reg, uint16_t *va
         I2C1_AbortBootTransfer();
         return 0u;
     }
+    LL_I2C_ClearFlag_STOP(I2C1);
+
+    *value = (uint16_t)(((uint16_t)msb << 8) | (uint16_t)lsb);
+    return 1u;
+}
+
+static uint8_t I2C1_MasterReadReg16_Window(uint8_t addr_7bit, uint8_t reg, uint16_t *value, uint16_t start_us)
+{
+    uint8_t msb = 0u;
+    uint8_t lsb = 0u;
+
+    I2C1_ClearAllFlags();
+    LL_I2C_HandleTransfer(I2C1, (uint32_t)(addr_7bit << 1), LL_I2C_ADDRSLAVE_7BIT, 1,
+                          LL_I2C_MODE_SOFTEND, LL_I2C_GENERATE_START_WRITE);
+
+    if (!I2C1_WaitForTXIS_Window(start_us))
+        return 0u;
+    LL_I2C_TransmitData8(I2C1, reg);
+
+    if (!I2C1_WaitForTC_Window(start_us))
+        return 0u;
+
+    I2C1_ClearErrorFlags();
+    LL_I2C_HandleTransfer(I2C1, (uint32_t)(addr_7bit << 1), LL_I2C_ADDRSLAVE_7BIT, 2,
+                          LL_I2C_MODE_AUTOEND, LL_I2C_GENERATE_START_READ);
+
+    if (!I2C1_WaitForRXNE_Window(start_us))
+        return 0u;
+    msb = LL_I2C_ReceiveData8(I2C1);
+
+    if (!I2C1_WaitForRXNE_Window(start_us))
+        return 0u;
+    lsb = LL_I2C_ReceiveData8(I2C1);
+
+    if (!I2C1_WaitForSTOP_Window(start_us))
+        return 0u;
     LL_I2C_ClearFlag_STOP(I2C1);
 
     *value = (uint16_t)(((uint16_t)msb << 8) | (uint16_t)lsb);
@@ -453,12 +602,12 @@ uint8_t I2C1_GetSlaveTxnActive(void)
     return i2c_slave_txn_active;
 }
 
-uint32_t I2C1_GetLastAddrUs(void)
+uint16_t I2C1_GetLastAddrUs(void)
 {
     return i2c_last_addr_us;
 }
 
-uint32_t I2C1_GetLastStopUs(void)
+uint16_t I2C1_GetLastStopUs(void)
 {
     return i2c_last_stop_us;
 }
@@ -510,7 +659,7 @@ void MX_I2C1_Slave_Init(void)
     /*
      * Program Own Address 1 
      */
-    LL_I2C_SetOwnAddress1(I2C1, 0x17 << 1, LL_I2C_OWNADDRESS1_7BIT);
+    LL_I2C_SetOwnAddress1(I2C1, I2C1_SLAVE_ADDR_7BIT << 1, LL_I2C_OWNADDRESS1_7BIT);
     LL_I2C_EnableOwnAddress1(I2C1);
 
     /* Enable interrupts: */
@@ -518,6 +667,14 @@ void MX_I2C1_Slave_Init(void)
     LL_I2C_EnableIT_NACK(I2C1);
     LL_I2C_EnableIT_STOP(I2C1);
     LL_I2C_EnableIT_ERR(I2C1);
+    LL_I2C_EnableIT_RX(I2C1);
+    LL_I2C_EnableIT_TX(I2C1);
+
+    i2c1_slave_timing = timing_100k;
+    i2c1_slave_cr1 = I2C1->CR1 | I2C_CR1_PE;
+    i2c1_slave_cr2 = I2C1->CR2;
+    i2c1_slave_oar1 = I2C1->OAR1;
+    i2c1_slave_oar2 = I2C1->OAR2;
 
     /* Enable peripheral */
     LL_I2C_Enable(I2C1);
@@ -546,10 +703,10 @@ void I2C1_IRQHandler(void)
     /* 1. ADDR: Address match - highest priority, must be handled first */
     if (LL_I2C_IsActiveFlag_ADDR(I2C1)) {
         uint32_t addr_match = LL_I2C_GetAddressMatchCode(I2C1);
-        if (addr_match == (0x17 << 1)) {
+        if (addr_match == (I2C1_SLAVE_ADDR_7BIT << 1)) {
             i2c_slave_txn_active = 1u;
             i2c_addr_matched_since_stop = 1u;
-            i2c_last_addr_us = (uint32_t)LL_TIM_GetCounter(TIM3);
+            i2c_last_addr_us = (uint16_t)LL_TIM_GetCounter(TIM3);
             if (LL_I2C_GetTransferDirection(I2C1) == LL_I2C_DIRECTION_READ) {
                 /* Read: latch which reg_image buffer to use for whole transaction */
                 latched_reg_image = active_reg_image;
@@ -640,10 +797,33 @@ void I2C1_IRQHandler(void)
         }
         write_byte_index = 0;
         if (i2c_addr_matched_since_stop) {
-            i2c_last_stop_us = (uint32_t)LL_TIM_GetCounter(TIM3);
+            i2c_last_stop_us = (uint16_t)LL_TIM_GetCounter(TIM3);
         }
         i2c_addr_matched_since_stop = 0u;
         i2c_slave_txn_active = 0u;
     }
+}
+
+uint8_t I2C1_ReadIna219Shunt(uint8_t is_output, int16_t *shunt_raw)
+{
+    uint16_t start_us = (uint16_t)LL_TIM_GetCounter(TIM3);
+    uint16_t raw = 0u;
+    uint8_t ok;
+    uint8_t addr = is_output ? INA219_ADDR_OUTPUT : INA219_ADDR_BATTERY;
+
+    I2C1_EnterMasterWindow();
+    ok = I2C1_MasterReadReg16_Window(addr, INA219_REG_SHUNT, &raw, start_us);
+    if (ok && I2C1_WindowExpired(start_us))
+        ok = 0u;
+    if (!ok)
+    {
+        LL_I2C_Disable(I2C1);
+        I2C1_ClearAllFlags();
+    }
+    I2C1_ExitMasterWindow();
+
+    if (ok && shunt_raw != NULL)
+        *shunt_raw = (int16_t)raw;
+    return ok;
 }
 

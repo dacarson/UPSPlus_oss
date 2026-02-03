@@ -92,6 +92,10 @@ static uint8_t flash_last_save_success = 0;
 static uint8_t flash_auto_power_on_loaded = 0;
 static volatile uint8_t ina_probe_requested = 0;
 static uint32_t ina_probe_due_ticks = 0;
+static uint8_t ina_probe_is_output = 1u;
+static uint8_t ina_next_is_output = 1u;
+static int16_t ina_last_shunt_output = 0;
+static int16_t ina_last_shunt_battery = 0;
 
 static void MX_TIM3_Init(void);
 static uint8_t I2C1_GuardWindowReady(void);
@@ -797,6 +801,8 @@ int main(void)
             {
                 ina_probe_requested = 1;
                 ina_probe_due_ticks = sched_flags.tick_counter + 1u; /* ~10 ms */
+                ina_probe_is_output = ina_next_is_output;
+                ina_next_is_output = (ina_next_is_output == 0u) ? 1u : 0u;
             }
             sched_flags.tick_500ms = 0;
         }
@@ -829,8 +835,15 @@ int main(void)
             if ((uint32_t)(now_ticks - ina_probe_due_ticks) < 0x80000000u &&
                 I2C1_GuardWindowReady())
             {
+                int16_t shunt_raw = 0;
                 ina_probe_requested = 0;
-                I2C1_RunIna219Probe();
+                if (I2C1_ReadIna219Shunt(ina_probe_is_output, &shunt_raw))
+                {
+                    if (ina_probe_is_output)
+                        ina_last_shunt_output = shunt_raw;
+                    else
+                        ina_last_shunt_battery = shunt_raw;
+                }
             }
         }
 
@@ -1470,21 +1483,21 @@ static uint8_t I2C1_BusIdleStable500us(void)
 
 static uint8_t I2C1_GuardWindowReady(void)
 {
-    uint32_t now_us = (uint32_t)LL_TIM_GetCounter(TIM3);
-    uint32_t last_stop_us = I2C1_GetLastStopUs();
-    uint32_t last_addr_us = I2C1_GetLastAddrUs();
+    uint16_t now_us = (uint16_t)LL_TIM_GetCounter(TIM3);
+    uint16_t last_stop_us = I2C1_GetLastStopUs();
+    uint16_t last_addr_us = I2C1_GetLastAddrUs();
     uint8_t txn_active = I2C1_GetSlaveTxnActive();
 
     if (txn_active)
         return 0u;
 
-    if ((uint32_t)(now_us - last_stop_us) > 50000u)
+    if ((uint16_t)(now_us - last_stop_us) > 50000u)
         return 0u;
 
-    if ((uint32_t)(now_us - last_addr_us) > 50000u)
+    if ((uint16_t)(now_us - last_addr_us) > 50000u)
         return 0u;
 
-    if ((uint32_t)(now_us - last_stop_us) < 500u)
+    if ((uint16_t)(now_us - last_stop_us) < 500u)
         return 0u;
 
     if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
