@@ -37,8 +37,10 @@ static volatile uint8_t latched_reg_image = 0;  /* Latched at ADDR+READ; TX uses
 #define I2C_PROBE_RETRY_DELAY_MS 10u
 #define I2C_PROBE_INTER_PROBE_DELAY_MS 20u
 #define I2C_PROBE_INITIAL_DELAY_MS 100u
-#define I2C_RECOVERY_PULSES     12u
+#define I2C_RECOVERY_PULSES     9u
 #define I2C_RECOVERY_DELAY_MS   1u
+#define I2C_RECOVERY_SDA_LOW_US 5000u
+#define I2C_RECOVERY_QUIET_US   5000u
 #if defined(RCC_CFGR3_I2C1SW)
 /* I2C1SW: 0 = HSI, 1 = SYSCLK. If this changes, regenerate timing. */
 #define I2C1_CLOCK_IS_HSI() (((RCC->CFGR3 & RCC_CFGR3_I2C1SW) == 0u) ? 1u : 0u)
@@ -185,16 +187,59 @@ static void I2C1_BusRecovery(void)
     I2C1_ClearAllFlags();
 }
 
+static uint8_t I2C1_ShouldAttemptRecovery(void)
+{
+    uint16_t now_us = (uint16_t)LL_TIM_GetCounter(TIM3);
+    uint16_t start_us;
+    uint8_t scl_high;
+    uint8_t sda_high;
+
+    /* PA9 = SCL, PA10 = SDA (AF4 mapping for I2C1 on this part). */
+    if (i2c_slave_txn_active)
+        return 0u;
+    scl_high = LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9);
+    sda_high = LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10);
+    if (!scl_high)
+        return 0u;
+    if (sda_high)
+        return 0u;
+    if ((uint16_t)(now_us - i2c_last_addr_us) <= (uint16_t)I2C_RECOVERY_QUIET_US)
+        return 0u;
+    if ((uint16_t)(now_us - i2c_last_stop_us) <= (uint16_t)I2C_RECOVERY_QUIET_US)
+        return 0u;
+
+    start_us = now_us;
+    while (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
+    {
+        if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9))
+            return 0u;
+        if ((uint16_t)(LL_TIM_GetCounter(TIM3) - start_us) >= (uint16_t)I2C_RECOVERY_SDA_LOW_US)
+            return 1u;
+    }
+    return 0u;
+}
+
+static void I2C1_TryBusRecovery(void)
+{
+    if (I2C1_ShouldAttemptRecovery())
+    {
+        I2C1_BusRecovery();
+    }
+}
+
 static uint8_t I2C1_WaitForBusIdle(uint32_t timeout_cycles)
 {
     while (LL_I2C_IsActiveFlag_BUSY(I2C1))
     {
         if (timeout_cycles-- == 0u)
         {
-            I2C1_BusRecovery();
+            I2C1_TryBusRecovery();
             I2C1_BootEnsureEnabled();
             if (LL_I2C_IsActiveFlag_BUSY(I2C1))
+            {
+                I2C1_AbortBootTransfer();
                 return 0u;
+            }
             return 1u;
         }
     }
@@ -819,6 +864,7 @@ uint8_t I2C1_ReadIna219Shunt(uint8_t is_output, int16_t *shunt_raw)
     {
         LL_I2C_Disable(I2C1);
         I2C1_ClearAllFlags();
+        I2C1_TryBusRecovery();
     }
     I2C1_ExitMasterWindow();
 

@@ -232,6 +232,8 @@ Status: Phase 4 complete (current cache/validity/age + snapshot mapping + factor
 - Optional GPIO clock-out recovery for stuck SDA.
 - Verify timeout always restores slave mode.
 
+Status: Phase 5 complete (guarded recovery + timeout restore).
+
 ### Phase 6: Validation
 - Verify bus responsiveness under repeated INA reads.
 - Confirm sign correctness and 1 mA/LSB scaling.

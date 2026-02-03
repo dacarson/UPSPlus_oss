@@ -15,10 +15,10 @@ try:
 except ImportError:
     try:
         from smbus import SMBus  # type: ignore
-    except ImportError as exc:
+    except ImportError:
         raise SystemExit(
             "Missing I2C library. Install smbus2 (pip install smbus2) or smbus."
-        ) from exc
+        )
 
 
 DEFAULT_BUS = 1
@@ -159,8 +159,11 @@ def choose_alternate_u8(value: int, min_v: int, max_v: int) -> int:
 def wait_for_reg_value(dev: I2CDevice, reg: int, value: int, timeout_s: float = 1.0) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if dev.read_u8(reg) == value:
-            return True
+        try:
+            if dev.read_u8(reg) == value:
+                return True
+        except OSError:
+            pass
         time.sleep(0.02)
     return False
 
@@ -168,8 +171,11 @@ def wait_for_reg_value(dev: I2CDevice, reg: int, value: int, timeout_s: float = 
 def wait_for_u16_value(dev: I2CDevice, reg_l: int, value: int, timeout_s: float = 1.0) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if dev.read_u16(reg_l) == value:
-            return True
+        try:
+            if dev.read_u16(reg_l) == value:
+                return True
+        except OSError:
+            pass
         time.sleep(0.02)
     return False
 
@@ -627,11 +633,18 @@ def test_destructive(t: TestRunner, dev: I2CDevice) -> None:
 
 
 def read_factory_page(t: TestRunner, dev: I2CDevice, selector: int) -> list[int] | None:
-    dev.write_u8(REG["FACTORY_TEST_START"], selector)
-    if not wait_for_reg_value(dev, REG["FACTORY_TEST_START"], selector):
-        t.record("Factory page selector timeout", False, f"waited for 0xFC={selector}")
-        return None
-    return dev.read_block(REG["FACTORY_TEST_START"], 4)
+    for attempt in range(3):
+        try:
+            dev.write_u8(REG["FACTORY_TEST_START"], selector)
+            if not wait_for_reg_value(dev, REG["FACTORY_TEST_START"], selector):
+                t.record("Factory page selector timeout", False, f"waited for 0xFC={selector}")
+                return None
+            return dev.read_block(REG["FACTORY_TEST_START"], 4)
+        except OSError as exc:
+            if attempt == 2:
+                t.record("Factory page I2C error", False, str(exc))
+                return None
+            time.sleep(0.05)
 
 
 def test_state_machine_monitor(t: TestRunner, dev: I2CDevice, duration_s: float, interval_s: float) -> None:
