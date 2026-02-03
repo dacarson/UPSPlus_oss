@@ -73,6 +73,7 @@ REG = {
 }
 
 RESERVED_SAMPLES = [0x33, 0x50, 0xEF]
+FACTORY_PAGE_CURRENT_AGE = 0x07
 
 VBAT_FULL_MAX_MV = 4500
 VBAT_EMPTY_MAX_MV = 4500
@@ -83,6 +84,13 @@ VBAT_MIN_DELTA_MV = 50
 
 def u16_from_le(lsb: int, msb: int) -> int:
     return (msb << 8) | lsb
+
+
+def s16_from_le(lsb: int, msb: int) -> int:
+    value = (msb << 8) | lsb
+    if value & 0x8000:
+        return value - 0x10000
+    return value
 
 
 class I2CDevice:
@@ -178,6 +186,169 @@ def wait_for_u16_value(dev: I2CDevice, reg_l: int, value: int, timeout_s: float 
             pass
         time.sleep(0.02)
     return False
+
+
+def try_read_factory_page(dev: I2CDevice, selector: int, timeout_s: float = 0.5) -> list[int] | None:
+    for attempt in range(3):
+        try:
+            dev.write_u8(REG["FACTORY_TEST_START"], selector)
+            if not wait_for_reg_value(dev, REG["FACTORY_TEST_START"], selector, timeout_s):
+                return None
+            return dev.read_block(REG["FACTORY_TEST_START"], 4)
+        except OSError:
+            if attempt == 2:
+                return None
+            time.sleep(0.05)
+    return None
+
+
+def test_current_validation(
+    t: TestRunner,
+    dev: I2CDevice,
+    duration_s: float,
+    interval_s: float,
+    expected_output_ma: int | None,
+    expected_battery_ma: int | None,
+    tolerance_ma: int,
+) -> None:
+    page = try_read_factory_page(dev, FACTORY_PAGE_CURRENT_AGE)
+    if page is None:
+        t.record("Current validation setup", False, "factory page 0x07 unavailable")
+        return
+
+    start = time.monotonic()
+    errors = 0
+    samples = 0
+    output_updates: list[float] = []
+    battery_updates: list[float] = []
+    last_output_age: int | None = None
+    last_battery_age: int | None = None
+    output_fresh_mismatch = 0
+    battery_fresh_mismatch = 0
+    output_values: list[int] = []
+    battery_values: list[int] = []
+    age_reset_high = 20
+    age_reset_low = 5
+
+    try:
+        while time.monotonic() - start < duration_s:
+            try:
+                data = dev.read_block(REG["OUTPUT_CURRENT_L"], 5)
+                output_values.append(s16_from_le(data[0], data[1]))
+                battery_values.append(s16_from_le(data[2], data[3]))
+                valid_output = (data[4] & 0x01) != 0
+                valid_battery = (data[4] & 0x02) != 0
+            except OSError:
+                errors += 1
+                time.sleep(interval_s)
+                continue
+
+            try:
+                page = dev.read_block(REG["FACTORY_TEST_START"], 4)
+                if page[0] != FACTORY_PAGE_CURRENT_AGE:
+                    dev.write_u8(REG["FACTORY_TEST_START"], FACTORY_PAGE_CURRENT_AGE)
+                    if not wait_for_reg_value(dev, REG["FACTORY_TEST_START"], FACTORY_PAGE_CURRENT_AGE, 0.2):
+                        errors += 1
+                        time.sleep(interval_s)
+                        continue
+                    page = dev.read_block(REG["FACTORY_TEST_START"], 4)
+                    if page[0] != FACTORY_PAGE_CURRENT_AGE:
+                        errors += 1
+                        time.sleep(interval_s)
+                        continue
+                output_age = page[1]
+                battery_age = page[2]
+            except OSError:
+                errors += 1
+                time.sleep(interval_s)
+                continue
+
+            if valid_output and output_age > 200:
+                output_fresh_mismatch += 1
+            if valid_battery and battery_age > 200:
+                battery_fresh_mismatch += 1
+            if output_age <= 200 and not valid_output:
+                output_fresh_mismatch += 1
+            if battery_age <= 200 and not valid_battery:
+                battery_fresh_mismatch += 1
+
+            if (
+                last_output_age is not None
+                and last_output_age >= age_reset_high
+                and output_age <= age_reset_low
+            ):
+                output_updates.append(time.monotonic() - start)
+            if (
+                last_battery_age is not None
+                and last_battery_age >= age_reset_high
+                and battery_age <= age_reset_low
+            ):
+                battery_updates.append(time.monotonic() - start)
+
+            last_output_age = output_age
+            last_battery_age = battery_age
+            samples += 1
+            time.sleep(interval_s)
+    finally:
+        dev.write_u8(REG["FACTORY_TEST_START"], 0)
+        wait_for_reg_value(dev, REG["FACTORY_TEST_START"], 0)
+
+    allowed_errors = max(1, int(samples * 0.001))
+    t.record(
+        "Current validation I2C errors",
+        errors <= allowed_errors,
+        f"errors={errors} allowed={allowed_errors} samples={samples}",
+    )
+    t.record(
+        "Current valid-flag freshness",
+        output_fresh_mismatch == 0 and battery_fresh_mismatch == 0,
+        f"output_mismatch={output_fresh_mismatch} battery_mismatch={battery_fresh_mismatch} samples={samples}",
+    )
+
+    if output_updates:
+        t.record("Output current updates observed", True, f"updates={len(output_updates)}")
+    else:
+        t.record("Output current updates observed", False, "no age reset observed")
+
+    if battery_updates:
+        t.record("Battery current updates observed", True, f"updates={len(battery_updates)}")
+    else:
+        t.record("Battery current updates observed", False, "no age reset observed")
+
+    cadence_events = [(tstamp, "output") for tstamp in output_updates] + [
+        (tstamp, "battery") for tstamp in battery_updates
+    ]
+    cadence_events.sort(key=lambda item: item[0])
+    if len(cadence_events) >= 6:
+        alternating_count = sum(
+            1 for i in range(1, len(cadence_events)) if cadence_events[i][1] != cadence_events[i - 1][1]
+        )
+        alternating_ratio = alternating_count / (len(cadence_events) - 1)
+        alternating_ok = alternating_ratio >= 0.8
+        detail = f"ratio={alternating_ratio:.2f} events={cadence_events}"
+        t.record("Current update alternating cadence", alternating_ok, detail)
+    else:
+        t.record(
+            "Current update alternating cadence",
+            True,
+            f"skipped (events={len(cadence_events)})",
+        )
+
+    if expected_output_ma is not None and output_values:
+        avg_output = int(round(sum(output_values) / len(output_values)))
+        ok_output = abs(avg_output - expected_output_ma) <= tolerance_ma
+        detail = f"avg={avg_output} expected={expected_output_ma} tol={tolerance_ma}"
+        t.record("Output current scaling/sign", ok_output, detail)
+    else:
+        t.record("Output current scaling/sign", True, "skipped (no expected value)")
+
+    if expected_battery_ma is not None and battery_values:
+        avg_battery = int(round(sum(battery_values) / len(battery_values)))
+        ok_battery = abs(avg_battery - expected_battery_ma) <= tolerance_ma
+        detail = f"avg={avg_battery} expected={expected_battery_ma} tol={tolerance_ma}"
+        t.record("Battery current scaling/sign", ok_battery, detail)
+    else:
+        t.record("Battery current scaling/sign", True, "skipped (no expected value)")
 
 
 def test_reserved_reads_zero(t: TestRunner, dev: I2CDevice) -> None:
@@ -741,6 +912,36 @@ def main() -> int:
         default=3.0,
         help="Seconds to measure countdown accuracy (default: 3.0)",
     )
+    parser.add_argument(
+        "--current-validation-seconds",
+        type=float,
+        default=8.0,
+        help="Seconds to validate current cadence/flags (default: 8.0)",
+    )
+    parser.add_argument(
+        "--current-validation-interval",
+        type=float,
+        default=0.1,
+        help="Interval for current validation polling (default: 0.1)",
+    )
+    parser.add_argument(
+        "--expected-output-current-ma",
+        type=int,
+        default=None,
+        help="Expected output current in mA for scaling/sign validation",
+    )
+    parser.add_argument(
+        "--expected-battery-current-ma",
+        type=int,
+        default=None,
+        help="Expected battery current in mA for scaling/sign validation",
+    )
+    parser.add_argument(
+        "--current-tolerance-ma",
+        type=int,
+        default=100,
+        help="Allowed current error in mA (default: 100)",
+    )
     args = parser.parse_args()
 
     t = TestRunner()
@@ -758,6 +959,15 @@ def main() -> int:
         test_rw_sample_period(t, dev)
         test_rw_low_battery_percent(t, dev)
         test_rw_battery_voltages(t, dev)
+        test_current_validation(
+            t,
+            dev,
+            args.current_validation_seconds,
+            args.current_validation_interval,
+            args.expected_output_current_ma,
+            args.expected_battery_current_ma,
+            args.current_tolerance_ma,
+        )
         test_state_machine_monitor(t, dev, args.state_monitor_seconds, args.state_monitor_interval)
         test_timer_accuracy(t, dev, args.timer_accuracy_seconds, args.timer_accuracy_tolerance)
         test_countdown_accuracy(t, dev, args.countdown_accuracy_seconds, args.timer_accuracy_tolerance)

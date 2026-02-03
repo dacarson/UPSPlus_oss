@@ -239,6 +239,8 @@ Status: Phase 5 complete (guarded recovery + timeout restore).
 - Confirm sign correctness and 1 mA/LSB scaling.
 - Validate alternating cadence and valid-flag behavior.
 
+Status: Phase 6 complete (validation checks added to `tools/testing/upsplus_i2c_test.py`).
+
 ## 12. Validation Checklist
 - I2C slave remains responsive during repeated INA reads.
 - Signed current direction matches physical flow.
