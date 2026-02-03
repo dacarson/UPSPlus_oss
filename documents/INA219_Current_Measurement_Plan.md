@@ -206,6 +206,8 @@ Status: Phase 1 complete (register allocation, docs/test updates, reserved-regio
 - Sanity reads to verify both devices respond.
 - Expose boot presence via Factory Test selector 0x06 (bit0=0x40, bit1=0x45).
 
+Status: Phase 2 complete (boot-time master setup and presence exposure).
+
 ### Phase 3: Runtime Master Window
 - Implement guard-time + bus-idle checks using **TIM3** for sub-ms timing.
 - Configure TIM3 as a free-running 1 MHz counter (1 us ticks).
@@ -215,6 +217,8 @@ Status: Phase 1 complete (register allocation, docs/test updates, reserved-regio
 - Alternate devices every 500 ms tick.
   - Temporary implementation: run guarded boot-probe on 500 ms tick to validate
     guard window under NUT traffic; replace with shunt reads in Phase 3/4.
+
+Status: Phase 3 complete (runtime master window and timed guard logic).
 
 ### Phase 4: Snapshot Integration
 - Add cached values + validity to authoritative state.
