@@ -5,6 +5,8 @@
 #include "stm32f0xx_ll_bus.h"
 #include "stm32f0xx_ll_rcc.h"
 #include "stm32f0xx_ll_cortex.h"
+#include "stm32f0xx_ll_utils.h"
+#include "stm32f0xx_ll_tim.h"
 #include "stm32f0xx.h"
 
 /* Pending write - ISR stores here; main loop applies to authoritative state */
@@ -15,6 +17,460 @@ static uint8_t uI2CRegIndex = 0;             /* Register pointer: set by first b
 static uint8_t write_byte_index = 0;         /* 0 = expect reg ptr, 1+ = data bytes */
 static uint8_t ignore_write = 0;             /* 1 = pending already set, drop this write until STOP */
 static volatile uint8_t latched_reg_image = 0;  /* Latched at ADDR+READ; TX uses reg_image[latched_reg_image] for whole transaction */
+
+/* INA219 probe/master setup (Phase 2 + minimal Phase 3) */
+#define INA219_ADDR_OUTPUT      0x40u
+#define INA219_ADDR_BATTERY     0x45u
+#define INA219_REG_CONFIG       0x00u
+#define INA219_CONFIG_VALUE     0x0B9Du
+#define I2C_BOOT_TIMEOUT_CYCLES 100000u
+/* I2C1 kernel clock source is HSI (8 MHz) per SystemClock_Config().
+ * If I2C1SW changes, regenerate timing and update this macro. */
+#define I2C1_TIMING_100KHZ_HSI8MHZ __LL_I2C_CONVERT_TIMINGS(1, 4, 1, 19, 19)
+#define I2C_PROBE_RETRIES  5u
+#define I2C_PROBE_IDLE_CYCLES    200000u
+#define I2C_PROBE_RETRY_DELAY_MS 10u
+#define I2C_PROBE_INTER_PROBE_DELAY_MS 20u
+#define I2C_PROBE_INITIAL_DELAY_MS 100u
+#define I2C_RECOVERY_PULSES     12u
+#define I2C_RECOVERY_DELAY_MS   1u
+#if defined(RCC_CFGR3_I2C1SW)
+/* I2C1SW: 0 = HSI, 1 = SYSCLK. If this changes, regenerate timing. */
+#define I2C1_CLOCK_IS_HSI() (((RCC->CFGR3 & RCC_CFGR3_I2C1SW) == 0u) ? 1u : 0u)
+#else
+#define I2C1_CLOCK_IS_HSI() 1u
+#endif
+
+static uint8_t ina_probe_present_output = 0u;
+static uint8_t ina_probe_present_battery = 0u;
+
+static volatile uint8_t i2c_slave_txn_active = 0u;
+static volatile uint8_t i2c_addr_matched_since_stop = 0u;
+static volatile uint32_t i2c_last_addr_us = 0u;
+static volatile uint32_t i2c_last_stop_us = 0u;
+
+
+static void I2C1_ClearErrorFlags(void)
+{
+    if (LL_I2C_IsActiveFlag_NACK(I2C1))
+        LL_I2C_ClearFlag_NACK(I2C1);
+    if (LL_I2C_IsActiveFlag_BERR(I2C1))
+        LL_I2C_ClearFlag_BERR(I2C1);
+    if (LL_I2C_IsActiveFlag_ARLO(I2C1))
+        LL_I2C_ClearFlag_ARLO(I2C1);
+    if (LL_I2C_IsActiveFlag_OVR(I2C1))
+        LL_I2C_ClearFlag_OVR(I2C1);
+}
+
+static uint8_t I2C1_CheckAndClearErrors(void)
+{
+    if (LL_I2C_IsActiveFlag_BERR(I2C1))
+    {
+        LL_I2C_ClearFlag_BERR(I2C1);
+        return 1u;
+    }
+    if (LL_I2C_IsActiveFlag_ARLO(I2C1))
+    {
+        LL_I2C_ClearFlag_ARLO(I2C1);
+        return 1u;
+    }
+    if (LL_I2C_IsActiveFlag_OVR(I2C1))
+    {
+        LL_I2C_ClearFlag_OVR(I2C1);
+        return 1u;
+    }
+    return 0u;
+}
+
+static void I2C1_ClearAllFlags(void)
+{
+    if (LL_I2C_IsActiveFlag_STOP(I2C1))
+        LL_I2C_ClearFlag_STOP(I2C1);
+    if (LL_I2C_IsActiveFlag_NACK(I2C1))
+        LL_I2C_ClearFlag_NACK(I2C1);
+    if (LL_I2C_IsActiveFlag_BERR(I2C1))
+        LL_I2C_ClearFlag_BERR(I2C1);
+    if (LL_I2C_IsActiveFlag_ARLO(I2C1))
+        LL_I2C_ClearFlag_ARLO(I2C1);
+    if (LL_I2C_IsActiveFlag_OVR(I2C1))
+        LL_I2C_ClearFlag_OVR(I2C1);
+}
+
+static void I2C1_AbortBootTransfer(void)
+{
+    LL_I2C_Disable(I2C1);
+    I2C1_ClearAllFlags();
+    LL_I2C_Enable(I2C1);
+    I2C1_ClearAllFlags();
+    LL_I2C_Disable(I2C1);
+}
+
+static void I2C1_BootEnsureEnabled(void)
+{
+    if (!LL_I2C_IsEnabled(I2C1))
+    {
+        LL_I2C_Enable(I2C1);
+        I2C1_ClearAllFlags();
+    }
+}
+
+static void I2C1_BusRecovery(void)
+{
+    uint8_t pulse = 0u;
+
+    LL_I2C_Disable(I2C1);
+
+    /* SCL as GPIO open-drain output; SDA as input pull-up (released). */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_9, LL_GPIO_MODE_OUTPUT);
+    LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_9, LL_GPIO_PULL_UP);
+    LL_GPIO_SetPinOutputType(GPIOA, LL_GPIO_PIN_9, LL_GPIO_OUTPUT_OPENDRAIN);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_9, LL_GPIO_SPEED_FREQ_LOW);
+
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_10, LL_GPIO_MODE_INPUT);
+    LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_10, LL_GPIO_PULL_UP);
+
+    /* Ensure SCL high, SDA released before clocking. */
+    LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_9);
+    LL_mDelay(I2C_RECOVERY_DELAY_MS);
+
+    /* Clock SCL low->high to free a stuck slave. */
+    for (pulse = 0u; pulse < I2C_RECOVERY_PULSES; pulse++)
+    {
+        LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_9);
+        LL_mDelay(I2C_RECOVERY_DELAY_MS);
+        LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_9);
+        LL_mDelay(I2C_RECOVERY_DELAY_MS);
+    }
+
+    /* Generate STOP: drive SDA low (open-drain), then release high while SCL high. */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_10, LL_GPIO_MODE_OUTPUT);
+    LL_GPIO_SetPinOutputType(GPIOA, LL_GPIO_PIN_10, LL_GPIO_OUTPUT_OPENDRAIN);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_10, LL_GPIO_SPEED_FREQ_LOW);
+    LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_10);
+    LL_mDelay(I2C_RECOVERY_DELAY_MS);
+    LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_9);
+    LL_mDelay(I2C_RECOVERY_DELAY_MS);
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_10, LL_GPIO_MODE_INPUT);
+    LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_10, LL_GPIO_PULL_UP);
+    LL_mDelay(I2C_RECOVERY_DELAY_MS);
+
+    /* Restore AF4 I2C pins. */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_9, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_8_15(GPIOA, LL_GPIO_PIN_9, LL_GPIO_AF_4);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_9, LL_GPIO_SPEED_FREQ_HIGH);
+    LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_9, LL_GPIO_PULL_UP);
+    LL_GPIO_SetPinOutputType(GPIOA, LL_GPIO_PIN_9, LL_GPIO_OUTPUT_OPENDRAIN);
+
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_10, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_8_15(GPIOA, LL_GPIO_PIN_10, LL_GPIO_AF_4);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_10, LL_GPIO_SPEED_FREQ_HIGH);
+    LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_10, LL_GPIO_PULL_UP);
+    LL_GPIO_SetPinOutputType(GPIOA, LL_GPIO_PIN_10, LL_GPIO_OUTPUT_OPENDRAIN);
+
+    I2C1_ClearAllFlags();
+}
+
+static uint8_t I2C1_WaitForBusIdle(uint32_t timeout_cycles)
+{
+    while (LL_I2C_IsActiveFlag_BUSY(I2C1))
+    {
+        if (timeout_cycles-- == 0u)
+        {
+            I2C1_BusRecovery();
+            I2C1_BootEnsureEnabled();
+            if (LL_I2C_IsActiveFlag_BUSY(I2C1))
+                return 0u;
+            return 1u;
+        }
+    }
+    return 1u;
+}
+
+static uint8_t I2C1_WaitForTXIS(uint32_t timeout_cycles)
+{
+    while (!LL_I2C_IsActiveFlag_TXIS(I2C1))
+    {
+        if (I2C1_CheckAndClearErrors())
+            return 0u;
+        if (LL_I2C_IsActiveFlag_NACK(I2C1))
+        {
+            LL_I2C_ClearFlag_NACK(I2C1);
+            return 0u;
+        }
+        if (timeout_cycles-- == 0u)
+            return 0u;
+    }
+    return 1u;
+}
+
+static uint8_t I2C1_WaitForRXNE(uint32_t timeout_cycles)
+{
+    while (!LL_I2C_IsActiveFlag_RXNE(I2C1))
+    {
+        if (I2C1_CheckAndClearErrors())
+            return 0u;
+        if (LL_I2C_IsActiveFlag_NACK(I2C1))
+        {
+            LL_I2C_ClearFlag_NACK(I2C1);
+            return 0u;
+        }
+        if (timeout_cycles-- == 0u)
+            return 0u;
+    }
+    return 1u;
+}
+
+static uint8_t I2C1_WaitForSTOP(uint32_t timeout_cycles)
+{
+    while (!LL_I2C_IsActiveFlag_STOP(I2C1))
+    {
+        if (I2C1_CheckAndClearErrors())
+            return 0u;
+        if (LL_I2C_IsActiveFlag_NACK(I2C1))
+        {
+            LL_I2C_ClearFlag_NACK(I2C1);
+            return 0u;
+        }
+        if (timeout_cycles-- == 0u)
+            return 0u;
+    }
+    return 1u;
+}
+
+static uint8_t I2C1_WaitForTC(uint32_t timeout_cycles)
+{
+    while (!LL_I2C_IsActiveFlag_TC(I2C1))
+    {
+        if (I2C1_CheckAndClearErrors())
+            return 0u;
+        if (LL_I2C_IsActiveFlag_NACK(I2C1))
+        {
+            LL_I2C_ClearFlag_NACK(I2C1);
+            return 0u;
+        }
+        if (timeout_cycles-- == 0u)
+            return 0u;
+    }
+    return 1u;
+}
+
+static uint8_t I2C1_MasterWriteReg16(uint8_t addr_7bit, uint8_t reg, uint16_t value)
+{
+    uint8_t msb = (uint8_t)((value >> 8) & 0xFFu);
+    uint8_t lsb = (uint8_t)(value & 0xFFu);
+
+    I2C1_ClearAllFlags();
+    LL_I2C_HandleTransfer(I2C1, (uint32_t)(addr_7bit << 1), LL_I2C_ADDRSLAVE_7BIT, 3,
+                          LL_I2C_MODE_AUTOEND, LL_I2C_GENERATE_START_WRITE);
+
+    if (!I2C1_WaitForTXIS(I2C_BOOT_TIMEOUT_CYCLES))
+    {
+        I2C1_AbortBootTransfer();
+        return 0u;
+    }
+    LL_I2C_TransmitData8(I2C1, reg);
+
+    if (!I2C1_WaitForTXIS(I2C_BOOT_TIMEOUT_CYCLES))
+    {
+        I2C1_AbortBootTransfer();
+        return 0u;
+    }
+    LL_I2C_TransmitData8(I2C1, msb);
+
+    if (!I2C1_WaitForTXIS(I2C_BOOT_TIMEOUT_CYCLES))
+    {
+        I2C1_AbortBootTransfer();
+        return 0u;
+    }
+    LL_I2C_TransmitData8(I2C1, lsb);
+
+    if (!I2C1_WaitForSTOP(I2C_BOOT_TIMEOUT_CYCLES))
+    {
+        I2C1_AbortBootTransfer();
+        return 0u;
+    }
+    LL_I2C_ClearFlag_STOP(I2C1);
+    return 1u;
+}
+
+static uint8_t I2C1_MasterReadReg16(uint8_t addr_7bit, uint8_t reg, uint16_t *value)
+{
+    uint8_t msb = 0u;
+    uint8_t lsb = 0u;
+
+    I2C1_ClearAllFlags();
+    LL_I2C_HandleTransfer(I2C1, (uint32_t)(addr_7bit << 1), LL_I2C_ADDRSLAVE_7BIT, 1,
+                          LL_I2C_MODE_SOFTEND, LL_I2C_GENERATE_START_WRITE);
+
+    if (!I2C1_WaitForTXIS(I2C_BOOT_TIMEOUT_CYCLES))
+    {
+        I2C1_AbortBootTransfer();
+        return 0u;
+    }
+    LL_I2C_TransmitData8(I2C1, reg);
+
+    if (!I2C1_WaitForTC(I2C_BOOT_TIMEOUT_CYCLES))
+    {
+        I2C1_AbortBootTransfer();
+        return 0u;
+    }
+
+    /* Only clear error/NACK flags between pointer write and repeated-start read. */
+    I2C1_ClearErrorFlags();
+    LL_I2C_HandleTransfer(I2C1, (uint32_t)(addr_7bit << 1), LL_I2C_ADDRSLAVE_7BIT, 2,
+                          LL_I2C_MODE_AUTOEND, LL_I2C_GENERATE_START_READ);
+
+    if (!I2C1_WaitForRXNE(I2C_BOOT_TIMEOUT_CYCLES))
+    {
+        I2C1_AbortBootTransfer();
+        return 0u;
+    }
+    msb = LL_I2C_ReceiveData8(I2C1);
+
+    if (!I2C1_WaitForRXNE(I2C_BOOT_TIMEOUT_CYCLES))
+    {
+        I2C1_AbortBootTransfer();
+        return 0u;
+    }
+    lsb = LL_I2C_ReceiveData8(I2C1);
+
+    if (!I2C1_WaitForSTOP(I2C_BOOT_TIMEOUT_CYCLES))
+    {
+        I2C1_AbortBootTransfer();
+        return 0u;
+    }
+    LL_I2C_ClearFlag_STOP(I2C1);
+
+    *value = (uint16_t)(((uint16_t)msb << 8) | (uint16_t)lsb);
+    return 1u;
+}
+
+void MX_I2C1_ProbeMasterSetup(void)
+{
+    uint32_t timing_100k;
+    uint16_t readback = 0u;
+    uint8_t ok = 0u;
+    uint8_t attempt = 0u;
+
+    /* GPIOA + I2C1 clocks */
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_I2C1);
+
+    /* Configure PA9/PA10 for I2C1 AF4 (master pre-init) */
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_9, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_8_15(GPIOA, LL_GPIO_PIN_9, LL_GPIO_AF_4);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_9, LL_GPIO_SPEED_FREQ_HIGH);
+    LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_9, LL_GPIO_PULL_UP);
+    LL_GPIO_SetPinOutputType(GPIOA, LL_GPIO_PIN_9, LL_GPIO_OUTPUT_OPENDRAIN);
+
+    LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_10, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetAFPin_8_15(GPIOA, LL_GPIO_PIN_10, LL_GPIO_AF_4);
+    LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_10, LL_GPIO_SPEED_FREQ_HIGH);
+    LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_10, LL_GPIO_PULL_UP);
+    LL_GPIO_SetPinOutputType(GPIOA, LL_GPIO_PIN_10, LL_GPIO_OUTPUT_OPENDRAIN);
+
+    LL_I2C_Disable(I2C1);
+    /* Do not enable own address/ACK or interrupts until slave init runs. */
+    LL_I2C_DisableOwnAddress1(I2C1);
+    LL_I2C_DisableOwnAddress2(I2C1);
+    NVIC_DisableIRQ(I2C1_IRQn);
+    LL_I2C_DisableIT_ADDR(I2C1);
+    LL_I2C_DisableIT_NACK(I2C1);
+    LL_I2C_DisableIT_STOP(I2C1);
+    LL_I2C_DisableIT_ERR(I2C1);
+    if (!I2C1_CLOCK_IS_HSI())
+    {
+        I2C1_ClearAllFlags();
+        return;
+    }
+    timing_100k = I2C1_TIMING_100KHZ_HSI8MHZ;
+    LL_I2C_SetTiming(I2C1, timing_100k);
+    LL_I2C_Enable(I2C1);
+    LL_mDelay(I2C_PROBE_INITIAL_DELAY_MS);
+
+    /* Configure INA219s and verify with a readback for probe presence. */
+    ok = 0u;
+    for (attempt = 0u; attempt < I2C_PROBE_RETRIES && ok == 0u; attempt++)
+    {
+        I2C1_BootEnsureEnabled();
+        if (!I2C1_WaitForBusIdle(I2C_PROBE_IDLE_CYCLES))
+        {
+            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
+            continue;
+        }
+        ok = I2C1_MasterWriteReg16(INA219_ADDR_OUTPUT, INA219_REG_CONFIG, INA219_CONFIG_VALUE);
+        if (ok)
+        {
+            ok = I2C1_MasterReadReg16(INA219_ADDR_OUTPUT, INA219_REG_CONFIG, &readback);
+        }
+        if (ok && readback != INA219_CONFIG_VALUE)
+        {
+            ok = 0u;
+        }
+        if (ok == 0u)
+            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
+    }
+    ina_probe_present_output = ok;
+
+    ok = 0u;
+    for (attempt = 0u; attempt < I2C_PROBE_RETRIES && ok == 0u; attempt++)
+    {
+        I2C1_BootEnsureEnabled();
+        if (!I2C1_WaitForBusIdle(I2C_PROBE_IDLE_CYCLES))
+        {
+            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
+            continue;
+        }
+        ok = I2C1_MasterWriteReg16(INA219_ADDR_BATTERY, INA219_REG_CONFIG, INA219_CONFIG_VALUE);
+        if (ok)
+        {
+            ok = I2C1_MasterReadReg16(INA219_ADDR_BATTERY, INA219_REG_CONFIG, &readback);
+        }
+        if (ok && readback != INA219_CONFIG_VALUE)
+        {
+            ok = 0u;
+        }
+        if (ok == 0u)
+            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
+    }
+    ina_probe_present_battery = ok;
+
+    LL_I2C_Disable(I2C1);
+}
+
+uint8_t I2C1_GetInaProbeOutputPresent(void)
+{
+    return ina_probe_present_output;
+}
+
+uint8_t I2C1_GetInaProbeBatteryPresent(void)
+{
+    return ina_probe_present_battery;
+}
+
+uint8_t I2C1_GetSlaveTxnActive(void)
+{
+    return i2c_slave_txn_active;
+}
+
+uint32_t I2C1_GetLastAddrUs(void)
+{
+    return i2c_last_addr_us;
+}
+
+uint32_t I2C1_GetLastStopUs(void)
+{
+    return i2c_last_stop_us;
+}
+
+void I2C1_RunIna219Probe(void)
+{
+    /* Re-run INA219 probe safely by reinitializing the slave afterward. */
+    NVIC_DisableIRQ(I2C1_IRQn);
+    LL_I2C_Disable(I2C1);
+    MX_I2C1_ProbeMasterSetup();
+    MX_I2C1_Slave_Init();
+}
 
 /**
  * @brief I2C1 Slave Initialization Function
@@ -40,21 +496,15 @@ void MX_I2C1_Slave_Init(void)
     LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_10, LL_GPIO_PULL_UP);
     LL_GPIO_SetPinOutputType(GPIOA, LL_GPIO_PIN_10, LL_GPIO_OUTPUT_OPENDRAIN);
 
-    /* NVIC (enable before PE so we don't miss the first address match) */
+    /* NVIC (enable after flags/ITs are configured) */
     NVIC_SetPriority(I2C1_IRQn, 0);
-    NVIC_EnableIRQ(I2C1_IRQn);
 
     // Disable I2C1 before configuring it
-    LL_I2C_Disable(I2C1); 
+    LL_I2C_Disable(I2C1);
+    I2C1_ClearAllFlags();
 
     /* Program TIMINGR 100 kHz timing values */
-    uint32_t timing_100k = __LL_I2C_CONVERT_TIMINGS(
-        1,   /* PRESC  -> tPRESC = 250ns */
-        4,   /* SCLDEL -> ~1.25us */
-        1,   /* SDADEL -> ~0.25us */
-        19,  /* SCLH   -> 5.0us */
-        19   /* SCLL   -> 5.0us */
-    );
+    uint32_t timing_100k = I2C1_TIMING_100KHZ_HSI8MHZ;
     LL_I2C_SetTiming(I2C1, timing_100k);
 
     /*
@@ -63,16 +513,15 @@ void MX_I2C1_Slave_Init(void)
     LL_I2C_SetOwnAddress1(I2C1, 0x17 << 1, LL_I2C_OWNADDRESS1_7BIT);
     LL_I2C_EnableOwnAddress1(I2C1);
 
-    /*
-     * Enable interrupts:
-     */
+    /* Enable interrupts: */
     LL_I2C_EnableIT_ADDR(I2C1);
     LL_I2C_EnableIT_NACK(I2C1);
     LL_I2C_EnableIT_STOP(I2C1);
     LL_I2C_EnableIT_ERR(I2C1);
 
     /* Enable peripheral */
-    LL_I2C_Enable(I2C1); 
+    LL_I2C_Enable(I2C1);
+    NVIC_EnableIRQ(I2C1_IRQn);
 }
 
 /**
@@ -98,6 +547,9 @@ void I2C1_IRQHandler(void)
     if (LL_I2C_IsActiveFlag_ADDR(I2C1)) {
         uint32_t addr_match = LL_I2C_GetAddressMatchCode(I2C1);
         if (addr_match == (0x17 << 1)) {
+            i2c_slave_txn_active = 1u;
+            i2c_addr_matched_since_stop = 1u;
+            i2c_last_addr_us = (uint32_t)LL_TIM_GetCounter(TIM3);
             if (LL_I2C_GetTransferDirection(I2C1) == LL_I2C_DIRECTION_READ) {
                 /* Read: latch which reg_image buffer to use for whole transaction */
                 latched_reg_image = active_reg_image;
@@ -187,6 +639,11 @@ void I2C1_IRQHandler(void)
             i2c_pending_write.pending = 1;
         }
         write_byte_index = 0;
+        if (i2c_addr_matched_since_stop) {
+            i2c_last_stop_us = (uint32_t)LL_TIM_GetCounter(TIM3);
+        }
+        i2c_addr_matched_since_stop = 0u;
+        i2c_slave_txn_active = 0u;
     }
 }
 

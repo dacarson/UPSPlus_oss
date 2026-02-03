@@ -146,8 +146,15 @@ return the last cached value; consumers must consult valid.
 Phase 1 allocates registers only; current values remain 0 until phases 2-4
 implement INA sampling and snapshot population.
 
+Expose boot presence via Factory Testing selector:
+- Selector `0x06`: INA boot presence page
+  - `0xFD`: bit0=output(0x40) present, bit1=battery(0x45) present
+  - `0xFE`: 0
+  - `0xFF`: 0
+
+
 Expose age via Factory Testing selector:
-- Selector `0x06`: Current age page
+- Selector `0x07`: Current age page
   - `0xFD`: `output_current_age_10ms` (uint8, age in 10 ms units, saturates at 255)
   - `0xFE`: `battery_current_age_10ms` (uint8, age in 10 ms units, saturates at 255)
   - `0xFF`: reserved (0)
@@ -189,7 +196,7 @@ Required bus recovery (guarded):
 ### Phase 1: Plan and Register Allocation
 - Confirm register addresses do not collide with existing map.
 - Decide validity/age metadata exposure (flags + Factory Testing age page).
-- Document Factory Testing selector 0x06 and tests when implemented (Phase 4).
+- Document Factory Testing selector 0x06 (INA boot presence) when implemented.
 
 Status: Phase 1 complete (register allocation, docs/test updates, reserved-region alignment).
 
@@ -197,6 +204,7 @@ Status: Phase 1 complete (register allocation, docs/test updates, reserved-regio
 - Add master-mode init before slave enable.
 - Program INA219 configuration register (0x00) to a known mode (bitfield defined above).
 - Sanity reads to verify both devices respond.
+- Expose boot presence via Factory Test selector 0x06 (bit0=0x40, bit1=0x45).
 
 ### Phase 3: Runtime Master Window
 - Implement guard-time + bus-idle checks using **TIM3** for sub-ms timing.
@@ -205,6 +213,8 @@ Status: Phase 1 complete (register allocation, docs/test updates, reserved-regio
   **in the main loop only**.
 - Switch slave->master->slave with hard timeout.
 - Alternate devices every 500 ms tick.
+  - Temporary implementation: run guarded boot-probe on 500 ms tick to validate
+    guard window under NUT traffic; replace with shunt reads in Phase 3/4.
 
 ### Phase 4: Snapshot Integration
 - Add cached values + validity to authoritative state.

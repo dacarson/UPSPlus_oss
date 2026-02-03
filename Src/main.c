@@ -90,6 +90,13 @@ static uint8_t flash_record_valid_boot = 0;
 static uint8_t flash_save_attempted = 0;
 static uint8_t flash_last_save_success = 0;
 static uint8_t flash_auto_power_on_loaded = 0;
+static volatile uint8_t ina_probe_requested = 0;
+static uint32_t ina_probe_due_ticks = 0;
+
+static void MX_TIM3_Init(void);
+static uint8_t I2C1_GuardWindowReady(void);
+static uint8_t I2C1_BusIdleStable500us(void);
+static void WaitUs(uint16_t us);
 
 /* Battery plateau full detection (self-programming enabled) */
 static uint16_t filtered_vbat_mv = 0;
@@ -364,6 +371,13 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
             buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(flash_sequence & 0xFFu);
             break;
         }
+        case 0x06u:
+            /* INA219 boot presence: bit0=output(0x40), bit1=battery(0x45). */
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)((I2C1_GetInaProbeOutputPresent() ? 0x01u : 0x00u) |
+                                                       (I2C1_GetInaProbeBatteryPresent() ? 0x02u : 0x00u));
+            buf[REG_FACTORY_TEST_START + 2] = 0x00u;
+            buf[REG_FACTORY_TEST_START + 3] = 0x00u;
+            break;
         default:
             break;
         }
@@ -739,9 +753,11 @@ int main(void)
 
     SystemClock_Config();
 
+    MX_TIM3_Init();
     MX_GPIO_Init();
     MX_DMA_Init();
     MX_ADC_Init();
+    MX_I2C1_ProbeMasterSetup();
     MX_I2C1_Slave_Init();
 
     /* Single source of truth; load from defaults then from flash */
@@ -777,6 +793,11 @@ int main(void)
         {
             if (!adc_ready)
                 LL_ADC_REG_StartConversion(ADC1);
+            if (!ina_probe_requested)
+            {
+                ina_probe_requested = 1;
+                ina_probe_due_ticks = sched_flags.tick_counter + 1u; /* ~10 ms */
+            }
             sched_flags.tick_500ms = 0;
         }
         if (sched_flags.tick_1s)
@@ -801,6 +822,17 @@ int main(void)
 
         /* Apply I2C writes to authoritative state (RO rejected, bounds checked) */
         ProcessI2CPendingWrite();
+
+        if (ina_probe_requested)
+        {
+            uint32_t now_ticks = sched_flags.tick_counter;
+            if ((uint32_t)(now_ticks - ina_probe_due_ticks) < 0x80000000u &&
+                I2C1_GuardWindowReady())
+            {
+                ina_probe_requested = 0;
+                I2C1_RunIna219Probe();
+            }
+        }
 
         /* Invariant A6: attempt flash commit first; only then cut MT_EN (set PROTECTION_LATCHED) */
         if (flash_save_requested)
@@ -1343,6 +1375,7 @@ void SystemClock_Config(void)
     LL_SYSTICK_EnableIT();
     LL_SetSystemCoreClock(48000000);
     LL_RCC_HSI14_EnableADCControl();
+    /* I2C1 timing assumes HSI (8 MHz). Update timing if I2C1SW changes. */
     LL_RCC_SetI2CClockSource(LL_RCC_I2C1_CLKSOURCE_HSI);
 }
 
@@ -1400,6 +1433,68 @@ void UpdateBatteryPercentage(void)
         else if (state.battery_percent == 0)
             state.battery_percent = (uint8_t)percentage;
     }
+}
+
+static void MX_TIM3_Init(void)
+{
+    /* TIM3 free-running 1 MHz counter (1 us ticks), no ISR. */
+    LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM3);
+    LL_TIM_DisableCounter(TIM3);
+    LL_TIM_SetPrescaler(TIM3, 48u - 1u);
+    LL_TIM_SetAutoReload(TIM3, 0xFFFFu);
+    LL_TIM_SetCounter(TIM3, 0u);
+    LL_TIM_SetCounterMode(TIM3, LL_TIM_COUNTERMODE_UP);
+    LL_TIM_EnableCounter(TIM3);
+}
+
+static void WaitUs(uint16_t us)
+{
+    uint16_t start = (uint16_t)LL_TIM_GetCounter(TIM3);
+    while ((uint16_t)(LL_TIM_GetCounter(TIM3) - start) < us)
+    {
+    }
+}
+
+static uint8_t I2C1_BusIdleStable500us(void)
+{
+    uint8_t i;
+    for (i = 0u; i < 50u; i++)
+    {
+        if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
+            !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
+            return 0u;
+        WaitUs(10u);
+    }
+    return 1u;
+}
+
+static uint8_t I2C1_GuardWindowReady(void)
+{
+    uint32_t now_us = (uint32_t)LL_TIM_GetCounter(TIM3);
+    uint32_t last_stop_us = I2C1_GetLastStopUs();
+    uint32_t last_addr_us = I2C1_GetLastAddrUs();
+    uint8_t txn_active = I2C1_GetSlaveTxnActive();
+
+    if (txn_active)
+        return 0u;
+
+    if ((uint32_t)(now_us - last_stop_us) > 50000u)
+        return 0u;
+
+    if ((uint32_t)(now_us - last_addr_us) > 50000u)
+        return 0u;
+
+    if ((uint32_t)(now_us - last_stop_us) < 500u)
+        return 0u;
+
+    if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
+        !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
+        return 0u;
+
+    if (!I2C1_BusIdleStable500us())
+        return 0u;
+
+    return 1u;
 }
 
 static void BatteryPlateau_UpdateBatteryFullClear(uint32_t now_ticks)

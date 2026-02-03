@@ -16,6 +16,13 @@ extern "C" {
 extern i2c_pending_write_t i2c_pending_write;
 
 void MX_I2C1_Slave_Init(void);
+void MX_I2C1_ProbeMasterSetup(void);
+void I2C1_RunIna219Probe(void);
+uint8_t I2C1_GetInaProbeOutputPresent(void);
+uint8_t I2C1_GetInaProbeBatteryPresent(void);
+uint8_t I2C1_GetSlaveTxnActive(void);
+uint32_t I2C1_GetLastAddrUs(void);
+uint32_t I2C1_GetLastStopUs(void);
 
 #ifdef __cplusplus
 }
