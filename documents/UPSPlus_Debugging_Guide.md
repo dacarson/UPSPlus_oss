@@ -70,6 +70,16 @@ Options:
   - Allowed timer error in seconds.
 - `--countdown-accuracy-seconds` (default: 3.0)
   - Duration to measure countdown timer accuracy (tests are canceled before completion).
+- `--current-validation-seconds` (default: 8.0)
+  - Duration to validate current cadence and freshness.
+- `--current-validation-interval` (default: 0.1)
+  - Polling interval during current validation.
+- `--expected-output-current-ma`
+  - Expected output current in mA for scaling/sign validation.
+- `--expected-battery-current-ma`
+  - Expected battery current in mA for scaling/sign validation.
+- `--current-tolerance-ma` (default: 100)
+  - Allowed current error in mA for scaling/sign validation.
 
 Examples:
 ```
@@ -129,6 +139,8 @@ Factory test pages:
 - Selector 0 returns zeros.
 - Selectors 1-4 return expected range values.
 - Selector 5 validates flash status and auto power on bitfields.
+- Selector 6 reports INA boot presence bits.
+- Selector 7 reports output/battery age in 10 ms units (saturated to 255).
 - Unknown selector returns zeros for page data.
 - Writes to 0xFD-0xFF are ignored.
 

@@ -152,6 +152,21 @@ It is intended as the source of truth for feature development and future changes
   - 0xFE: battery_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFF: 0  
 
+### 4.5 Current Measurement Behavior
+- Output and battery current values come from the INA219 **shunt voltage** register (0x01).
+- The raw signed 16-bit shunt value is used directly as milliamps (1 LSB = 1 mA).
+- Cached values update **only** on a successful INA read; failed/skip attempts do not overwrite.
+- `current_valid` flags indicate freshness within the last **2 seconds** (age <= 200 * 10 ms).
+- Ages increment on each 10 ms tick, **saturate** (never wrap), and start at **0xFFFF** on boot.
+- Valid flags start at 0 until the first successful read.
+- Snapshot values reflect the cached values and validity only; I2C reads never mutate state.
+- Sampling is time-sliced and non-intrusive: INA reads are opportunistic and do not preempt
+  STM32 slave responsiveness; if bus activity prevents sampling, updates pause until safe.
+- Runtime INA reads occur in short master windows: the STM32 temporarily switches
+  **slave → master → slave** and restores slave mode immediately after the read.
+- Sampling cadence alternates channels at 500 ms intervals (each channel updates ~1 Hz) when
+  the master window can be safely entered.
+
 ---
 
 ## 5. State Machines

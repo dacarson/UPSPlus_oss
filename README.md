@@ -12,12 +12,15 @@ The code has been re-written from the ground up using a combination of ChatGPT a
 
 ## Firmware Features
 
+Items marked with `(*)` did not exist in the original factory firmware.
+
 - Battery monitoring via I2C register map.
 - Protection shutdown at configured protection voltage.
-- Auto power-on with configurable low-battery threshold and load-on delay.
-- Boot brownout backoff learning (see [Boot Brownout Backoff](#boot-brownout-backoff)).
-- Charging plateau detection for adaptive full-battery learning.
-- Factory Testing pages (0xFC–0xFF) for diagnostics.
+- Auto power-on with configurable low-battery threshold and load-on delay.(*)
+- Boot brownout backoff learning (see [Boot Brownout Backoff](#boot-brownout-backoff)).(*)
+- Charging plateau detection for adaptive full-battery learning.(*)
+- INA219 current reporting via the 0x17 I2C registers (no separate INA bus reads required).(*)
+- Factory Testing pages (0xFC–0xFF) for diagnostics.(*)
 - OTA firmware update support (legacy bootloader mode only; not part of this runtime firmware).
 
 ## Button Behavior
@@ -70,55 +73,45 @@ Note: multi-byte registers are little-endian (LSB at lower address).
 
 ### Register Summary
 
-- `0x01–0x0C` Voltages and temperature (RO)
-  - `0x01–0x02` MCU voltage (mV)
-  - `0x03–0x04` Pogopin voltage (mV)
-  - `0x05–0x06` Battery voltage (mV)
-  - `0x07–0x08` USB-C voltage (mV)
-  - `0x09–0x0A` Micro-USB voltage (mV)
-  - `0x0B–0x0C` Temperature (°C, integer)
-- `0x0D–0x12` Battery thresholds (RW)
-  - `0x0D–0x0E` Full voltage (mV)
-  - `0x0F–0x10` Empty voltage (mV)
-  - `0x11–0x12` Protection voltage (mV)
-- `0x13–0x14` Battery percent (RO; LSB=percent, MSB=0x00)
-- `0x15–0x16` Sample period minutes (RW)
-- `0x17` Power status (RO; bit0=power, bit1=calibration window active)
-- `0x18` Shutdown countdown seconds (RW)
-- `0x19` Auto power on (RW; 0/1)
-- `0x1A` Restart countdown seconds (RW)
-- `0x1B` Factory reset (RW; write 1 to reset)
-- `0x1C–0x27` Runtime counters (RO)
-  - `0x1C–0x1F` Cumulative runtime (s)
-  - `0x20–0x23` Charging time (s)
-  - `0x24–0x27` Current runtime (s)
-- `0x28–0x29` Firmware version (RO)
-- `0x2A` Battery parameters self-programmed (RW; 0=self-program, 1=manual)
-- `0x2B` Low battery percent threshold (RW)
-- `0x2C–0x2D` Load on delay (RW, seconds)
-- `0x2E–0x2F` Output current (RO, int16, 1 mA/LSB)
-- `0x30–0x31` Battery current (RO, int16, 1 mA/LSB)
-- `0x32` Current valid flags (RO; bit0=output, bit1=battery)
-- `0x33–0xEF` Reserved (RO 0x00, writes ignored)
-- `0xF0–0xFB` MCU serial number (RO)
-- `0xFC–0xFF` Factory Testing (RW selector + RO pages)
-  - `0xFC` Selector (0=disabled)
-  - `0xFD–0xFF` Page data
+| Address range | Description | Access | Default |
+| --- | --- | --- | --- |
+| `0x01–0x02` | MCU voltage (mV) | RO | - |
+| `0x03–0x04` | Pogopin voltage (mV) | RO | - |
+| `0x05–0x06` | Battery voltage (mV) | RO | - |
+| `0x07–0x08` | USB-C voltage (mV) | RO | - |
+| `0x09–0x0A` | Micro-USB voltage (mV) | RO | - |
+| `0x0B–0x0C` | Temperature (°C, integer) | RO | - |
+| `0x0D–0x0E` | Full voltage (mV) | RW | 4200 |
+| `0x0F–0x10` | Empty voltage (mV) | RW | 3000 |
+| `0x11–0x12` | Protection voltage (mV) | RW | 2800 |
+| `0x13–0x14` | Battery percent (LSB=percent, MSB=0x00) | RO | - |
+| `0x15–0x16` | Sample period minutes | RW | 2 |
+| `0x17` | Power status (bit0=power, bit1=calibration window active) | RO | - |
+| `0x18` | Shutdown countdown seconds | RW | 0 |
+| `0x19` | Auto power on (0/1) | RW | 0 |
+| `0x1A` | Restart countdown seconds | RW | 0 |
+| `0x1B` | Factory reset (write 1 to reset) | RW | N/A |
+| `0x1C–0x1F` | Cumulative runtime (s) | RO | - |
+| `0x20–0x23` | Charging time (s) | RO | - |
+| `0x24–0x27` | Current runtime (s) | RO | - |
+| `0x28–0x29` | Firmware version | RO | - |
+| `0x2A` | Battery parameters self-programmed (0=self-program, 1=manual) | RW | 0 |
+| `0x2B` | Low battery percent threshold | RW | 10 |
+| `0x2C–0x2D` | Load on delay (seconds) | RW | 60 |
+| `0x2E–0x2F` | Output current (int16, 1 mA/LSB) | RO | - |
+| `0x30–0x31` | Battery current (int16, 1 mA/LSB) | RO | - |
+| `0x32` | Current valid flags (bit0=output, bit1=battery) | RO | - |
+| `0x33–0xEF` | Reserved (reads 0x00, writes ignored) | RO | 0 |
+| `0xF0–0xFB` | MCU serial number | RO | - |
+| `0xFC–0xFF` | Factory Testing (RW selector + RO pages) | RW | selector=0 |
 
-Factory Testing selectors:
-- `0x01` State page: power_state, charger_state, learning_mode (legacy name; indicates calibration window active)
-- `0x02` Button page: button_state, click, hold_ticks (LSB)
-- `0x03` Charger/window page: charger_present, window_active, window_due
-- `0x04` Protection page: protection_active, below_count, pending_power_cut
-- `0x05` Flash/persistence page: flash_status, auto_power_on_info, flash_sequence_lsb
-- `0x06` INA boot presence page: bit0=output(0x40), bit1=battery(0x45)
-- `0x07` INA current age page: output_age_10ms, battery_age_10ms (each saturated to 255)
 
 ## Documentation
 
 - Development setup and build steps: `documents/Development_Guide.md`
 - Behavior specification (contract for features): `documents/UPSPlus_Behavior_Spec.md`
-- Refactoring plan and rationale: `documents/UPSPlus_Refactoring_Plan.md`
+- Debugging guide and test script usage: `documents/UPSPlus_Debugging_Guide.md`
+- Feature development plans are archived in `documents/archive/`.
 
 ## NUT Driver
 
