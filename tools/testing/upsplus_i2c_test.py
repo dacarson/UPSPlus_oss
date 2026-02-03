@@ -226,6 +226,27 @@ def test_factory_test_pages(t: TestRunner, dev: I2CDevice) -> None:
                 button_state_ok and click_ok,
                 f"read {data}",
             )
+    output_present = False
+    battery_present = False
+    for selector in (6, 7):
+        dev.write_u8(REG["FACTORY_TEST_START"], selector)
+        if not wait_for_reg_value(dev, REG["FACTORY_TEST_START"], selector):
+            t.record(
+                f"Factory test selector {selector} timeout",
+                False,
+                f"waited for 0xFC={selector}",
+            )
+            return
+        data = dev.read_block(REG["FACTORY_TEST_START"], 4)
+        t.record(
+            f"Factory test selector {selector} echoed",
+            data[0] == selector,
+            f"read {data}",
+        )
+        if selector == 6:
+            reserved_ok = (data[1] & 0xFC) == 0 and data[2] == 0 and data[3] == 0
+            output_present = (data[1] & 0x01) != 0
+            battery_present = (data[1] & 0x02) != 0
             detail = (
                 f"read {data} "
                 f"(output={'yes' if output_present else 'no'} "
