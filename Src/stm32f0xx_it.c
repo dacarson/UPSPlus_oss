@@ -22,6 +22,7 @@
 #include "stm32f0xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "stm32f0xx.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -78,17 +79,32 @@ void NMI_Handler(void)
 
 /**
   * @brief This function handles Hard fault interrupt.
+  * Fail-safe: drive MT_EN/IP_EN low (RPi off, charger off), PWR_EN high,
+  * then request system reset. Direct register writes only; no HAL/LL calls.
   */
 void HardFault_Handler(void)
 {
-  /* USER CODE BEGIN HardFault_IRQn 0 */
+  static volatile uint8_t in_handler;
+  if (in_handler) { for (;;) { __NOP(); } }
+  in_handler = 1;
 
-  /* USER CODE END HardFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
+  /* Enable GPIOA clock (direct RCC; pins may be uninitialized). */
+  RCC->AHBENR |= RCC_AHBENR_GPIOAEN;
+  __DSB();
+  __ISB();
+
+  /* PA5/PA6/PA7: output, push-pull, low speed, no pull. */
+  GPIOA->MODER   = (GPIOA->MODER   & ~(0x3FU << 10)) | (0x15U << 10);
+  GPIOA->OTYPER  = GPIOA->OTYPER  & ~0xE0U;
+  GPIOA->OSPEEDR = GPIOA->OSPEEDR & ~(0x3FU << 10);
+  GPIOA->PUPDR   = GPIOA->PUPDR   & ~(0x3FU << 10);
+
+  /* Safe outputs: MT_EN LOW, IP_EN LOW, PWR_EN HIGH. BSRR: bits 0–15 set (high), 16–31 reset (low). */
+  GPIOA->BSRR = (1u << 21) | (1u << 22) | (1u << 7);
+
+  /* Request system reset; then NOP forever if reset is delayed. */
+  SCB->AIRCR = (0x5FAu << SCB_AIRCR_VECTKEY_Pos) | SCB_AIRCR_SYSRESETREQ_Msk;
+  for (;;) { __NOP(); }
 }
 
 /**

@@ -9,7 +9,7 @@ This document outlines the implementation plan for STM32F030F4 hardware features
 | Item | Status |
 |------|--------|
 | **IWDG** | Implemented: ~8 s at 56 kHz LSI, pet at end of main loop; no LSI block; option bytes verified in doc only |
-| **HardFault handler** | Default infinite loop; no safe outputs, no reset |
+| **HardFault handler** | Implemented: safe outputs (MT_EN/IP_EN low, PWR_EN high) + SYSRESETREQ |
 | **Reset cause** | Not captured or exported via I2C |
 | **CRC** | Software CRC32 in `Flash_ComputeCrc32()` (~25 lines) |
 | **I2C** | LL driver; no explicit analog/digital filter or timeout configuration |
@@ -82,7 +82,7 @@ Define safe outputs in terms of actual GPIO levels and board-side effects. The h
 
 1. **Verify parity is enabled**:
    - Cortex-M0 has no parity; STM32F0 SRAM parity is hardware (check if any config disables it)
-   - Typically enabled by default
+   - STM32F030F4: 4KB SRAM with hardware parity; typically enabled by default. Confirm option bytes (RAM_PARITY_CHECK) are not set to disable. No firmware change needed if enabled.
 
 2. **Implement deterministic HardFault handler**:
    - Enable GPIOA clock (direct `RCC->AHBENR` write) if not guaranteed already
@@ -99,6 +99,11 @@ Define safe outputs in terms of actual GPIO levels and board-side effects. The h
    - Keep handler minimal (no function calls that could fault)
    - Consider simple flag: if already in HardFault, just loop (avoid double-fault)
    - **Verification:** Confirm handler does not depend on healthy stack; consider `__attribute__((naked))` or minimal stack use if needed
+
+**Files:** `Src/stm32f0xx_it.c`  
+**Flash impact:** ~60–80 bytes (direct register writes only; no HAL/LL calls; single `stm32f0xx.h` include)  
+**Status:** Complete.  
+**Image size (after Phase 2):** 16212 bytes (0x3f54), `UPSPlus_oss.elf` (text 12684 + data 96 + bss 3432).
 
 ---
 
@@ -236,7 +241,7 @@ Configure analog and digital filter settings **before** `LL_I2C_Enable(I2C1)`. S
 | Order | Phase | Est. Effort | Risk | Status |
 |-------|-------|-------------|------|--------|
 | 1 | IWDG | 1–2 hrs | Low | **Done** |
-| 2 | HardFault | 1–2 hrs | Low | |
+| 2 | HardFault | 1–2 hrs | Low | **Done** |
 | 3 | Reset cause | 1–2 hrs | Low | |
 | 4 | CRC | 2–3 hrs | Medium (format compatibility) | |
 | 5 | I2C filters | ~1 hr | Low | |
