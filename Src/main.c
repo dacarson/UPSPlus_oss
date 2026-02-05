@@ -45,6 +45,10 @@ __IO uint8_t MustRefreshVDD = 1;
 
 #define BL_START_ADDRESS 0x8000000
 
+/* IWDG: PR=6 (÷256), RLR chosen for ~8 s minimum at 56 kHz LSI (~17 s at 26 kHz). Main loop must complete within timeout. */
+#define IWDG_PR_256   6u
+#define IWDG_RLR_VAL  1748u
+
 typedef void (*pFunction)(void);
 __IO pFunction JumpToAplication;
 
@@ -780,6 +784,22 @@ int main(void)
 
     SystemClock_Config();
 
+    /* IWDG: LSI 26–56 kHz; PR=256, RLR=1748 → ~8 s at 56 kHz, ~17 s at 26 kHz. Main loop must finish within timeout.
+     * We do not block on LSI ready: if LSI never starts, the watchdog simply won’t tick, but firmware still runs.
+     * Option bytes: verify SW-start mode and IWDG not frozen in documentation/manufacturing; do not program to disable.
+     * Starting here puts init under the watchdog; if init grows, consider moving start to just before while(1). */
+    LL_RCC_LSI_Enable();
+    IWDG->KR = 0x5555u;   /* Key: unlock PR and RLR for write */
+    IWDG->PR = IWDG_PR_256;
+    IWDG->RLR = IWDG_RLR_VAL;
+    {
+        uint32_t sr_wait = 0xFFFFu;
+        while ((IWDG->SR & (IWDG_SR_PVU | IWDG_SR_RVU)) != 0u && sr_wait != 0u)   /* Wait for PR/RLR latch */
+            sr_wait--;
+        /* If SR doesn't clear, start anyway; timeout may be shorter than expected. */
+    }
+    IWDG->KR = 0xCCCCu;   /* Key: start watchdog */
+
     MX_TIM3_Init();
     MX_GPIO_Init();
     MX_DMA_Init();
@@ -973,6 +993,9 @@ int main(void)
 
         /* Button actions (short/long press) */
         Button_DispatchActions();
+
+        /* IWDG: single refresh per loop, after all critical work (scheduler, I2C, INA, flash, protection, GPIO). */
+        IWDG->KR = 0xAAAAu;   /* Key: reload watchdog counter */
     }
 }
 
