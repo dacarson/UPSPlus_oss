@@ -77,6 +77,9 @@ volatile uint32_t adc_sample_seq = 0;
 static scheduler_flags_t sched_flags;
 /* Main loop derives tick_1s from tick_100ms (10 pulses = 1s) */
 static uint8_t tick_100ms_count = 0;
+/* Downcounters for 100ms/500ms flags (avoid modulo in ISR) */
+static uint8_t ticks_until_100ms = TICKS_PER_100MS;
+static uint8_t ticks_until_500ms = TICKS_PER_500MS;
 
 /* Flash save requested; main loop snapshots then commits (rate-limited unless bypassed). */
 static volatile uint8_t flash_save_requested = 0;
@@ -1716,7 +1719,7 @@ static void BatteryPlateau_Tick1s(void)
         uint32_t num = (uint32_t)learned_full * (uint32_t)(PLATEAU_ALPHA_DEN - PLATEAU_ALPHA_NUM) +
                        (uint32_t)plateau_mean * (uint32_t)PLATEAU_ALPHA_NUM +
                        (uint32_t)(PLATEAU_ALPHA_DEN / 2u);
-        uint16_t new_full = (uint16_t)(num / (uint32_t)PLATEAU_ALPHA_DEN);
+        uint16_t new_full = (uint16_t)(num >> 2u);  /* PLATEAU_ALPHA_DEN == 4 */
         uint16_t min_allowed = (uint16_t)(state.empty_voltage_mv + MIN_VOLTAGE_DELTA_MV);
         if (new_full < min_allowed)
             new_full = min_allowed;
@@ -1763,12 +1766,16 @@ void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
         LL_TIM_ClearFlag_UPDATE(TIM1);
         sched_flags.tick_counter++;
         sched_flags.tick_10ms = 1;
-        /* Modulo is acceptable at 100Hz; for higher tick rate or more periodicities consider
-         * downcounters or accumulated tick counters to avoid % in ISR. */
-        if ((sched_flags.tick_counter % TICKS_PER_100MS) == 0u)
+        if (--ticks_until_100ms == 0u)
+        {
+            ticks_until_100ms = TICKS_PER_100MS;
             sched_flags.tick_100ms = 1;
-        if ((sched_flags.tick_counter % TICKS_PER_500MS) == 0u)
+        }
+        if (--ticks_until_500ms == 0u)
+        {
+            ticks_until_500ms = TICKS_PER_500MS;
             sched_flags.tick_500ms = 1;
+        }
     }
 }
 

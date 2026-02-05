@@ -122,8 +122,8 @@ extern "C" {
 #define I_TAPER_MA                    150     /* Charge current <= this for taper gate (C/20 ~3000mAh) */
 #define TAPER_HOLD_SEC                300u    /* Taper must hold this long (concurrent with plateau) */
 #define PLATEAU_MIN_CHANGE_MV         10u
-#define PLATEAU_ALPHA_NUM             1u      /* EMA alpha = 1/5 = 0.2 */
-#define PLATEAU_ALPHA_DEN             5u
+#define PLATEAU_ALPHA_NUM             1u      /* EMA alpha = 1/4 = 0.25 (use 4 for shift, no division) */
+#define PLATEAU_ALPHA_DEN             4u
 #define PLATEAU_POWER_STABLE_SEC      60u   /* RPI_ON must be stable this long before plateau evaluation */
 #define PLATEAU_PERSIST_MIN_CHANGE_MV 20u
 #define LEARNED_FULL_MIN_MV           3900u
