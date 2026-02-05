@@ -1,9 +1,5 @@
 #include "pindef.h"
 
-/* Compatibility fallback: device header (via LL/CMSIS) normally defines RCC_CSR_RMVF. */
-#ifndef RCC_CSR_RMVF
-#define RCC_CSR_RMVF  (1u << 24)  /* Clear reset flags (STM32F0). */
-#endif
 /* RCC_CSR reset-flag byte: bits 31:25 (LPWRRSTF down to BORRSTF); client interprets raw. */
 #define RCC_CSR_RESET_FLAGS_SHIFT  25
 #define RCC_CSR_RESET_FLAGS_MASK   0x7Fu
@@ -101,7 +97,7 @@ static uint8_t flash_dirty = 0;
 static uint16_t flash_sequence = 0;
 static uint32_t flash_last_write_sec = 0;
 static uint32_t flash_next_retry_sec = 0;
-/* Reset cause: captured at boot (Phase 3), exported via factory test 0x08/0x09. */
+/* Reset cause: captured at boot, exported via factory test 0x08/0x09. */
 static uint32_t boot_reset_csr = 0u;
 static uint8_t last_persisted_reset_cause = 0u;
 static uint8_t last_persisted_reset_seq = 0u;
@@ -740,7 +736,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.version = 22;
+    state.version = 23;
     state.snapshot_tick = 0;
     state.last_true_vbat_sample_tick = 0;
     state.last_true_vbat_mv = 0;
@@ -812,7 +808,7 @@ int main(void)
 
     SystemClock_Config();
 
-    /* Phase 3: Capture reset cause before clearing (order matters). Export via factory test 0x08/0x09. */
+    /* Capture reset cause before clearing (order matters). Export via factory test 0x08/0x09. */
     {
         uint32_t csr = RCC->CSR;
         boot_reset_csr = csr;

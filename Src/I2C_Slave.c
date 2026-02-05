@@ -20,7 +20,7 @@ static uint8_t write_byte_index = 0;         /* 0 = expect reg ptr, 1+ = data by
 static uint8_t ignore_write = 0;             /* 1 = pending already set, drop this write until STOP */
 static volatile uint8_t latched_reg_image = 0;  /* Latched at ADDR+READ; TX uses reg_image[latched_reg_image] for whole transaction */
 
-/* INA219 probe/master setup (Phase 2 + minimal Phase 3) */
+/* INA219 probe/master setup */
 #define I2C1_SLAVE_ADDR_7BIT    0x17u
 #define INA219_ADDR_OUTPUT      0x40u
 #define INA219_ADDR_BATTERY     0x45u
@@ -701,7 +701,7 @@ void MX_I2C1_Slave_Init(void)
     uint32_t timing_100k = I2C1_TIMING_100KHZ_HSI8MHZ;
     LL_I2C_SetTiming(I2C1, timing_100k);
 
-    /* Phase 5: analog + digital filters before PE=1 (noise robustness). HW timeout not enabled; stuck-bus uses I2C1_BusRecovery(). */
+    /* Analog and digital filters before PE=1 (noise robustness). HW timeout not enabled; stuck-bus uses I2C1_BusRecovery(). */
     LL_I2C_ConfigFilters(I2C1, LL_I2C_ANALOGFILTER_ENABLE, 1u);
 
     /*

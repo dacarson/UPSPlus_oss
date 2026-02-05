@@ -151,8 +151,19 @@ It is intended as the source of truth for feature development and future changes
   - 0xFD: output_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFE: battery_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFF: 0  
+- Selector 0x08: Reset cause (this boot)  
+  - 0xFD: raw reset-flag byte (RCC CSR bits 31:25): bit6=LPWRRSTF, bit5=WWDGRSTF, bit4=IWDGRSTF, bit3=SFTRSTF, bit2=PORRSTF, bit1=PINRSTF, bit0=BORRSTF  
+  - 0xFE–0xFF: CSR bits 23:16 and 31:24 (high 16 bits of RCC_CSR). Client interprets; no firmware normalization.  
+- Selector 0x09: Last persisted reset cause (from flash)  
+  - 0xFD: last_reset_cause (raw reset-flag byte as stored at last flash save)  
+  - 0xFE: last_reset_seq (sequence byte from flash)  
+  - 0xFF: reserved (0)  
 
-### 4.5 Current Measurement Behavior
+### 4.5 I2C Bus Robustness
+- I2C input filters (analog and digital, 1 I2C clock digital filter) are enabled at init to improve robustness in noisy environments.
+- Stuck-bus recovery is performed in software (e.g. SCL toggling); no hardware I2C timeout is used. Recovery behavior is internal and does not change the external I2C register contract.
+
+### 4.6 Current Measurement Behavior
 - Output and battery current values come from the INA219 **shunt voltage** register (0x01).
 - The raw signed 16-bit shunt value is used directly as milliamps (1 LSB = 1 mA).
 - Cached values update **only** on a successful INA read; failed/skip attempts do not overwrite.
@@ -317,7 +328,8 @@ Key behaviors:
 - Single-slot persistence (1KB page).
 - Dirty state is periodically flushed (60s) and on critical events.
 - Flash write attempts are rate limited unless bypassed.
-- CRC and sequence validation performed on load; invalid → defaults + dirty.
+- Integrity: record structure version **2**; validation uses **hardware CRC**. Records with older structure version or invalid CRC are rejected at load → defaults applied and state marked dirty.
+- CRC and sequence validation performed on load; invalid or wrong-version → defaults + dirty.
 
 ---
 
@@ -330,7 +342,15 @@ Key behaviors:
 
 ---
 
-## 10. Testing and Validation
+## 10. Reliability and Fail-Safe Behavior
+
+- **Independent Watchdog (IWDG):** Timeout ~8 s (LSI-based). Refreshed **once per main-loop iteration**, after critical work (scheduler, I2C processing, INA probe, flash save, protection/GPIO). **Never** refreshed in ISRs (e.g. I2C ISR); a main-loop hang or I2C deadlock cannot keep the watchdog alive. If the main loop does not complete within the timeout, the device resets.
+- **HardFault safe state:** On HardFault the handler drives **MT_EN LOW** (RPi power off), **IP_EN LOW** (charger path off), **PWR_EN HIGH** (MCU hold-up), then triggers a system reset. This ensures safe outputs before reset regardless of fault cause.
+- **Reset cause:** Captured from RCC at boot (before clear). Persisted in flash and exported via I2C: **factory test selector 0x08** = this boot’s raw reset flags and CSR high bits; **selector 0x09** = last persisted reset cause and sequence from flash. Encoding is raw RCC_CSR bits; client interprets (e.g. IWDGRSTF, PINRSTF, PORRSTF).
+
+---
+
+## 11. Testing and Validation
 
 - Automated I2C test script: `tools/testing/upsplus_i2c_test.py`.
 - Manual hardware tests still required for charger transitions, measurement windows, and protection latching.
@@ -341,7 +361,7 @@ Key behaviors:
 
 ---
 
-## 11. Enumerations (ABI-Stable Values)
+## 12. Enumerations (ABI-Stable Values)
 
 - `power_state_t`:  
   - `RPI_OFF=0`, `RPI_ON=1`, `PROTECTION_LATCHED=2`, `LOAD_ON_DELAY=3`
@@ -358,7 +378,7 @@ These numeric values are part of the Factory Testing ABI and must remain stable.
 
 ---
 
-## 12. Non-Goals
+## 13. Non-Goals
 
 - No SOC estimation beyond voltage-based heuristic.
 - No fast charger negotiation.
@@ -367,7 +387,7 @@ These numeric values are part of the Factory Testing ABI and must remain stable.
 
 ---
 
-## 13. Glossary
+## 14. Glossary
 
 - **true VBAT**: Battery voltage sampled while charger path is disabled (IP_EN LOW).
 - **charger present**: Physical charger voltage above presence threshold with stability.
@@ -377,16 +397,17 @@ These numeric values are part of the Factory Testing ABI and must remain stable.
 
 ---
 
-## 14. Change Impact Map
+## 15. Change Impact Map
 
 - If ADC cadence changes, revisit: charger stability counters, protection sample count, window duration.
 - If register map changes, revisit: Factory Testing ABI, test scripts, and external tools.
 - If snapshot frequency changes, revisit: I2C coherence assumptions and staleness guarantees.
 - If protection logic changes, revisit: power-cut ordering and flash save semantics.
+- If reliability features change (IWDG timeout, HardFault safe outputs, reset-cause encoding), revisit: Section 10, factory test selectors 0x08/0x09, and any tools that interpret reset cause.
 
 ---
 
-## 15. Spec Authority
+## 16. Spec Authority
 
 In the event of conflict, this Behavior Specification is authoritative over code comments,
 test scripts, and historical behavior.

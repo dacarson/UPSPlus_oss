@@ -548,7 +548,7 @@ typedef struct {
     /* Note: power_status (register 0x17) is NOT persisted; it is derived from state machine on boot */
     /* Runtime counters persistence: Always persisted when flash is enabled (on every flash write).
      * These are "optional for recovery" per plan - they aid recovery but are not critical. */
-    uint8_t last_reset_cause;            /* Phase 3: raw RCC_CSR reset-flag byte (bits 31:25) for run that last did a save. */
+    uint8_t last_reset_cause;            /* Raw RCC_CSR reset-flag byte (bits 31:25) for run that last did a save. */
     uint8_t last_reset_seq;             /* Diagnostic context only: flash sequence number at save time (not the cause). */
     uint8_t reserved_padding2[2];       /* Alignment + deterministic CRC - MUST be zeroed */
     uint32_t cumulative_runtime_sec;
@@ -719,7 +719,7 @@ extern volatile uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]; /* 
 /* Load On Delay (0x2C-0x2D): Read has no side effects; decrement occurs only on tick_1s in main loop */
 #define REG_LOAD_ON_DELAY_L     0x2C  /* Current countdown value (read from snapshot, no side effects) */
 #define REG_LOAD_ON_DELAY_H     0x2D  /* Current countdown value (read from snapshot, no side effects) */
-/* Current measurement registers (INA219 plan, phase 1 allocation) */
+/* Current measurement registers (INA219 allocation) */
 #define REG_OUTPUT_CURRENT_L    0x2E
 #define REG_OUTPUT_CURRENT_H    0x2F
 #define REG_BATTERY_CURRENT_L   0x30
