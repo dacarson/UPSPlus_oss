@@ -50,7 +50,9 @@ When battery parameters are self-programmed (register `0x2A` = 0, the default), 
 - **Learn full:** Plug in the HAT and let the batteries **fully charge** with the load on (about 30 minutes or more at a stable high voltage). Full is detected when battery voltage plateaus (stays within a narrow band) for 30 minutes at a near-top level (~4.18 V). If current telemetry is available, the firmware also confirms charge current has tapered to a low level before declaring full. Full clears when you unplug the charger or when voltage stays below the reset level for ~45 seconds.
 - **Learn empty:** Run the unit on battery until the RPi turns off. The firmware records the **lowest voltage under load** right before shutdown as the learned empty value (graceful shutdown, protection cutoff, or abrupt brownout).
 
-Learned full and empty are used for battery percent and protection. For detailed behavior, see `documents/UPSPlus_Behavior_Spec.md` §7 and `documents/Battery_Empty_Full_Checklist.md`. Read or override via registers `0x0D–0x0E` (full) and `0x0F–0x10` (empty). Set `0x2A` = 1 to disable self-programming.
+**Note** The 18650 batteries can run down to as low as 2.75V safely, however, they are unable to provide the power needed to supply the 5V of the RPi at that level. The Empty battery level is typically around 3V, after which they can no longer provide enough power for the RPi.
+
+Learned full and empty are used for battery percent and protection. For detailed behavior, see `documents/UPSPlus_Behavior_Spec.md` §7. Read or override via registers `0x0D–0x0E` (full) and `0x0F–0x10` (empty). Set `0x2A` = 1 to disable self-programming.
 
 ## Firmware Update (OTA - Legacy Bootloader)
 
