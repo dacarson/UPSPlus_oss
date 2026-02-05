@@ -547,7 +547,9 @@ typedef struct {
     /* Note: power_status (register 0x17) is NOT persisted; it is derived from state machine on boot */
     /* Runtime counters persistence: Always persisted when flash is enabled (on every flash write).
      * These are "optional for recovery" per plan - they aid recovery but are not critical. */
-    uint8_t reserved_padding2[4];       /* Alignment + deterministic CRC - MUST be zeroed */
+    uint8_t last_reset_cause;            /* Phase 3: raw RCC_CSR reset-flag byte (bits 31:25) for run that last did a save. */
+    uint8_t last_reset_seq;             /* Diagnostic context only: flash sequence number at save time (not the cause). */
+    uint8_t reserved_padding2[2];       /* Alignment + deterministic CRC - MUST be zeroed */
     uint32_t cumulative_runtime_sec;
     uint32_t charging_time_sec;
 } flash_persistent_data_t;

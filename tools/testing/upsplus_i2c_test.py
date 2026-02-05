@@ -75,6 +75,17 @@ REG = {
 RESERVED_SAMPLES = [0x33, 0x50, 0xEF]
 FACTORY_PAGE_CURRENT_AGE = 0x07
 
+# RCC_CSR reset-flag byte (bits 31:25): bit index -> name (STM32F0)
+RESET_FLAG_NAMES = (
+    (0, "BOR"),   # bit 25
+    (1, "PIN"),   # bit 26 (NRST)
+    (2, "POR"),   # bit 27
+    (3, "SFT"),   # bit 28 (software)
+    (4, "IWDG"),  # bit 29
+    (5, "WWDG"),  # bit 30
+    (6, "LPWR"),  # bit 31
+)
+
 VBAT_FULL_MAX_MV = 4500
 VBAT_EMPTY_MAX_MV = 4500
 VBAT_PROTECT_MIN_MV = 2800
@@ -84,6 +95,15 @@ VBAT_MIN_DELTA_MV = 50
 
 def u16_from_le(lsb: int, msb: int) -> int:
     return (msb << 8) | lsb
+
+
+def decode_reset_flags(flags_byte: int) -> list[str]:
+    """Decode RCC_CSR reset-flag byte (bits 31:25) into list of set flag names."""
+    names = []
+    for bit_index, name in RESET_FLAG_NAMES:
+        if (flags_byte >> bit_index) & 1:
+            names.append(name)
+    return names if names else ["(none)"]
 
 
 def s16_from_le(lsb: int, msb: int) -> int:
@@ -455,6 +475,32 @@ def test_factory_test_pages(t: TestRunner, dev: I2CDevice) -> None:
         f"auto_loaded={auto_info & 0x01} auto_effective={(auto_info >> 1) & 0x01})"
     )
     t.record("Factory test page 0x05 bitfields", reserved_ok, detail)
+
+    # Reset cause: selector 0x08 (this boot), 0x09 (last persisted from flash)
+    for selector, label in ((0x08, "this boot"), (0x09, "last persisted")):
+        dev.write_u8(REG["FACTORY_TEST_START"], selector)
+        if not wait_for_reg_value(dev, REG["FACTORY_TEST_START"], selector):
+            t.record(f"Factory test selector 0x{selector:02X} timeout", False, f"waited for 0xFC=0x{selector:02X}")
+            break
+        data = dev.read_block(REG["FACTORY_TEST_START"], 4)
+        ok = data[0] == selector
+        flags_byte = data[1]
+        decoded = decode_reset_flags(flags_byte)
+        if selector == 0x08:
+            csr_23_16 = data[2]
+            csr_31_24 = data[3]
+            detail = (
+                f"0xFD=0x{flags_byte:02X} ({', '.join(decoded)}) "
+                f"0xFE=0x{csr_23_16:02X} 0xFF=0x{csr_31_24:02X}"
+            )
+        else:
+            seq_byte = data[2]
+            detail = (
+                f"0xFD=0x{flags_byte:02X} ({', '.join(decoded)}) "
+                f"0xFE=seq={seq_byte} (0=unknown)"
+            )
+        t.record(f"Factory test page 0x{selector:02X} ({label})", ok, detail)
+
     dev.write_u8(REG["FACTORY_TEST_START"], 0)
 
 

@@ -1,5 +1,13 @@
 #include "pindef.h"
 
+/* Compatibility fallback: device header (via LL/CMSIS) normally defines RCC_CSR_RMVF. */
+#ifndef RCC_CSR_RMVF
+#define RCC_CSR_RMVF  (1u << 24)  /* Clear reset flags (STM32F0). */
+#endif
+/* RCC_CSR reset-flag byte: bits 31:25 (LPWRRSTF down to BORRSTF); client interprets raw. */
+#define RCC_CSR_RESET_FLAGS_SHIFT  25
+#define RCC_CSR_RESET_FLAGS_MASK   0x7Fu
+
 #include "stm32f0xx_ll_adc.h"
 #include "stm32f0xx_ll_bus.h"
 #include "stm32f0xx_ll_cortex.h"
@@ -92,6 +100,11 @@ static uint8_t flash_dirty = 0;
 static uint16_t flash_sequence = 0;
 static uint32_t flash_last_write_sec = 0;
 static uint32_t flash_next_retry_sec = 0;
+/* Reset cause: captured at boot (Phase 3), exported via factory test 0x08/0x09. */
+static uint32_t boot_reset_csr = 0u;
+static uint8_t last_persisted_reset_cause = 0u;
+static uint8_t last_persisted_reset_seq = 0u;
+
 /* Flash/persistence debug (factory test page 0x05) */
 static uint8_t flash_record_valid_boot = 0;
 static uint8_t flash_save_attempted = 0;
@@ -401,6 +414,20 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
                                                         auth->output_current_age_10ms : 255u);
             buf[REG_FACTORY_TEST_START + 2] = (uint8_t)((auth->battery_current_age_10ms <= 255u) ?
                                                         auth->battery_current_age_10ms : 255u);
+            buf[REG_FACTORY_TEST_START + 3] = 0x00u;
+            break;
+        case 0x08u: {
+            /* CSR byte packing: buf[+1] = RCC_CSR bits 31:25 (reset flags). buf[+2]/buf[+3] = CSR high 16 bits as [23:16], [31:24] (not LE order). */
+            uint32_t csr = boot_reset_csr;
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)((csr >> RCC_CSR_RESET_FLAGS_SHIFT) & RCC_CSR_RESET_FLAGS_MASK);
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)(csr >> 16);
+            buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(csr >> 24);
+            break;
+        }
+        case 0x09u:
+            /* Last reset cause persisted in flash (previous run). */
+            buf[REG_FACTORY_TEST_START + 1] = last_persisted_reset_cause;
+            buf[REG_FACTORY_TEST_START + 2] = last_persisted_reset_seq;
             buf[REG_FACTORY_TEST_START + 3] = 0x00u;
             break;
         default:
@@ -783,6 +810,13 @@ int main(void)
     NVIC_SetVectorTable();
 
     SystemClock_Config();
+
+    /* Phase 3: Capture reset cause before clearing (order matters). Export via factory test 0x08/0x09. */
+    {
+        uint32_t csr = RCC->CSR;
+        boot_reset_csr = csr;
+        RCC->CSR |= RCC_CSR_RMVF;
+    }
 
     /* IWDG: LSI 26–56 kHz; PR=256, RLR=1748 → ~8 s at 56 kHz, ~17 s at 26 kHz. Main loop must finish within timeout.
      * We do not block on LSI ready: if LSI never starts, the watchdog simply won’t tick, but firmware still runs.
@@ -1211,6 +1245,8 @@ static void Flash_FillRecordFromState(flash_persistent_data_t *rec, uint16_t seq
     rec->battery_params_self_programmed = (state.battery_params_self_programmed != 0u) ? 1u : 0u;
     rec->low_battery_percent = state.low_battery_percent;
     rec->load_on_delay_config_sec = state.load_on_delay_config_sec;
+    rec->last_reset_cause = (uint8_t)((boot_reset_csr >> RCC_CSR_RESET_FLAGS_SHIFT) & RCC_CSR_RESET_FLAGS_MASK);
+    rec->last_reset_seq = (uint8_t)(flash_sequence & 0xFFu);  /* Save-time sequence context (diagnostic only). */
     rec->cumulative_runtime_sec = state.cumulative_runtime_sec;
     rec->charging_time_sec = state.charging_time_sec;
 
@@ -1327,6 +1363,8 @@ void Flash_Load(void)
     if (flash_record_valid_boot)
     {
         Flash_ApplyRecordToState(&rec);
+        last_persisted_reset_cause = rec.last_reset_cause;
+        last_persisted_reset_seq = rec.last_reset_seq;
         flash_auto_power_on_loaded = (rec.auto_power_on != 0u) ? 1u : 0u;
         UpdateDerivedState();
         flash_sequence = rec.sequence_number;
@@ -1335,6 +1373,9 @@ void Flash_Load(void)
     }
     else
     {
+        /* 0 = unknown / no prior boot record (invalid or missing flash). */
+        last_persisted_reset_cause = 0u;
+        last_persisted_reset_seq = 0u;
         FactoryReset();
         RequestFlashSave(0, 1);
         flash_sequence = 0;

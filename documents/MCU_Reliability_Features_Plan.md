@@ -130,24 +130,25 @@ Define safe outputs in terms of actual GPIO levels and board-side effects. The h
 2. **Clear reset flags**:
    - Set `RCC->CSR |= RCC_CSR_RMVF` *after* you snapshot them, so next reset reflects fresh cause
 
-3. **Export via I2C** — chosen encoding (5 bytes):
-   - Add factory test page (e.g., 0x08). **Layout:**
-     - **Byte0:** Normalized primary cause (one-hot: 0x01=LPWR, 0x02=WWDG, 0x04=IWDG, 0x08=SFT, 0x10=POR, 0x20=PIN, 0x40=BOR). When multiple flags are set, prefer watchdog (IWDG/WWDG) > software > POR/PIN > BOR > LPWR.
-     - **Bytes 1–4:** Full 32-bit `RCC->CSR` snapshot (LSB first), most debuggable
-   - Update `Snapshot_UpdateDerived()` / `StateToRegisterBuffer()` and register map
-   - If boot-only: populate during early init and never overwrite; validate availability after I2C up
+3. **Export via I2C** — chosen encoding:
+   - Factory test selector **0x08** (this boot): **0xFD** = raw reset-flag byte (RCC_CSR bits 31:25), **0xFE–0xFF** = CSR bits 23:16 and 31:24 (high 16 bits of CSR). Raw flag byte: bit6=LPWRRSTF, bit5=WWDGRSTF, bit4=IWDGRSTF, bit3=SFTRSTF, bit2=PORRSTF, bit1=PINRSTF, bit0=BORRSTF. Client interprets; no firmware normalization.
+   - Factory test selector **0x09**: last persisted reset-flag byte and seq from flash.
+   - Update `StateToRegisterBuffer()` and register map
 
 4. **NRST hardware** (documentation only):
    - Add note in hardware docs or README:
-     - Datasheet-recommended RC on NRST
-     - Optional filtering cap for noise immunity
-   - No firmware change; schematic/PCB review
+     - Datasheet-recommended RC on NRST (e.g. 100 nF–1 µF from NRST to GND for debounce; series resistor per datasheet if needed)
+     - Optional filtering cap for noise immunity on long traces
+   - No firmware change; schematic/PCB review. Reset cause (PINRSTF) is now exported via factory test 0x08 so NRST events are visible.
 
 **Optional: Fault reason byte (recommended):** Alongside reset cause, consider 1 byte `last_fault_code` (e.g., 0=none, 1=assert, 2=hardfault, 3=stack overflow, 4=protection-triggered reset). Optionally 1 byte `last_fault_detail` (subcode). Export via factory test page. Even if not persisted, having it in RAM on boot helps diagnostics.
 
 **Files:** `Src/main.c`, `Inc/ups_state.h` (register map), behavior spec docs  
 **Flash impact:** ~40–60 bytes  
-**Dependencies:** Phase 1 complete if you want IWDG resets visible in logs
+**Dependencies:** Phase 1 complete if you want IWDG resets visible in logs  
+
+**Status:** Complete. Reset cause captured at boot (RCC->CSR snapshot then RMVF clear); raw reset-flag byte (CSR bits 31:25) stored; persisted in flash as `last_reset_cause`/`last_reset_seq` (saved on each flash save); exported via factory test 0x08 (this boot: raw flags + CSR high 16 bits) and 0x09 (last persisted from flash). Struct size unchanged (reused 2 bytes of padding).  
+**Image size (after Phase 3):** 16336 bytes (0x3fd0), `UPSPlus_oss.elf` (text 12808 + data 96 + bss 3432).
 
 ---
 
@@ -242,7 +243,7 @@ Configure analog and digital filter settings **before** `LL_I2C_Enable(I2C1)`. S
 |-------|-------|-------------|------|--------|
 | 1 | IWDG | 1–2 hrs | Low | **Done** |
 | 2 | HardFault | 1–2 hrs | Low | **Done** |
-| 3 | Reset cause | 1–2 hrs | Low | |
+| 3 | Reset cause | 1–2 hrs | Low | **Done** |
 | 4 | CRC | 2–3 hrs | Medium (format compatibility) | |
 | 5 | I2C filters | ~1 hr | Low | |
 
