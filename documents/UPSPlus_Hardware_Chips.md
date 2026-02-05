@@ -6,7 +6,7 @@ confirmed.
 
 ## I2C Bus Devices
 
-- **STM32F030F4P6** (MCU, I2C slave: 0x17 runtime; 0x18 OTA)
+- **STM32F030F4P6** (MCU, SW I2C slave: 0x17 runtime; 0x18 OTA)
   - Main microcontroller running the UPSPlus firmware.
   - Shares the I2C bus with the current monitors and RTC.
 - **INA219** x2 (current monitors, I2C slave: 0x40 & 0x45)
@@ -20,6 +20,9 @@ confirmed.
 - **IP5328** (battery charger / power management)
   - Handles battery charging and power path control.
   - Has i2c interface but not connected to i2c bus
+  - Charging can be enabled and disabled via MCU
+  - Low Battery Cutoff is roughly 2.4–2.6 V
+  - Recovery around 3.0 V
 
 ## Notes
 
