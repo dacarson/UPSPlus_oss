@@ -108,9 +108,14 @@ static uint16_t plateau_sample_index = 0;
 static uint8_t plateau_suppressed = 0;
 static uint8_t plateau_persisted_this_session = 0;
 static charger_state_t plateau_last_charger_state = CHARGER_STATE_ABSENT;
+static power_state_t plateau_last_power_state = POWER_STATE_RPI_OFF;
 static uint8_t plateau_eval_counter = 0;
+/* Empty learning: minimum battery voltage seen while load was on during this discharge (0xFFFF = none yet) */
+static uint16_t min_vbat_while_load_on_mv = 0xFFFF;
+static uint8_t empty_persisted_this_session = 0;
 static uint8_t battery_full = 0;
 static uint32_t battery_full_clear_start_ticks = 0;
+static uint32_t taper_hold_ticks = 0;   /* Seconds (in ticks) battery current <= I_TAPER_MA with valid; for taper gate */
 
 /* Restart power-cycle state machine: MT_EN low for 5s then RPI_ON (non-blocking) */
 #define RESTART_POWER_OFF_TICKS  (5u * TICKS_PER_1S)  /* 5 seconds in 10ms ticks */
@@ -209,6 +214,7 @@ static void BatteryPlateau_ResetSession(void)
 {
     plateau_persisted_this_session = 0;
     plateau_suppressed = 0;
+    taper_hold_ticks = 0;
     BatteryPlateau_ResetWindow();
 }
 
@@ -946,8 +952,7 @@ int main(void)
             BatteryPlateau_OnAdcSample(state.battery_voltage_mv);
             UpdateBatteryMinMax();
             UpdateBatteryPercentage();
-            /* True-VBAT sample tick when charger not influencing (for staleness gating).
-             * Intentional mismatch: freshness uses Charger_IsInfluencingVBAT; percent uses VBUS heuristic per B8. */
+            /* True-VBAT sample tick when charger not influencing (for percent and staleness gating). */
             if (!Charger_IsInfluencingVBAT(&sys_state))
             {
                 state.last_true_vbat_sample_tick = sched_flags.tick_counter;
@@ -1092,6 +1097,8 @@ void FactoryReset(void)
     restart_phase = 0;
     restart_remaining_ticks = 0;
     BatteryPlateau_Init();
+    min_vbat_while_load_on_mv = 0xFFFFu;
+    empty_persisted_this_session = 0;
 }
 
 extern const uint8_t __flash_storage_start__[];
@@ -1415,6 +1422,41 @@ void SystemClock_Config(void)
     LL_RCC_SetI2CClockSource(LL_RCC_I2C1_CLKSOURCE_HSI);
 }
 
+/** Upper bound for empty_voltage_mv (full - MIN_VOLTAGE_DELTA_MV, clamped to VBAT_EMPTY_MAX_MV). */
+__attribute__((noinline)) static uint16_t EmptyVoltageMaxMv(void)
+{
+    uint16_t em = VBAT_EMPTY_MAX_MV;
+    if (state.full_voltage_mv >= (uint16_t)MIN_VOLTAGE_DELTA_MV)
+    {
+        uint16_t u = state.full_voltage_mv - MIN_VOLTAGE_DELTA_MV;
+        if (u < em) em = u;
+    }
+    return em;
+}
+
+/**
+ * Commit tracked discharge-session minimum to state.empty_voltage_mv (spec: commit at
+ * load-off, protection trigger, or output-current validity loss). Call with request_flash=0
+ * when the caller will request flash anyway (e.g. protection path).
+ */
+static void EmptyLearn_CommitTrackedMin(uint8_t request_flash)
+{
+    if (min_vbat_while_load_on_mv == 0xFFFFu)
+        return;
+    uint16_t new_empty = ClampU16(min_vbat_while_load_on_mv, state.protection_voltage_mv, EmptyVoltageMaxMv());
+    uint16_t old_empty = state.empty_voltage_mv;
+    state.empty_voltage_mv = new_empty;
+    min_vbat_while_load_on_mv = 0xFFFFu;
+
+    if (request_flash &&
+        AbsDiffU16(new_empty, old_empty) >= EMPTY_PERSIST_MIN_CHANGE_MV &&
+        !empty_persisted_this_session)
+    {
+        empty_persisted_this_session = 1;
+        RequestFlashSave(0, 1);
+    }
+}
+
 void UpdateBatteryMinMax(void)
 {
     if (state.battery_params_self_programmed == 1)
@@ -1423,14 +1465,35 @@ void UpdateBatteryMinMax(void)
     }
     else
     {
-        if (!Charger_IsInfluencingVBAT(&sys_state))
+        /* When charger influences VBAT, discard session minimum so it cannot be committed later. */
+        if (Charger_IsInfluencingVBAT(&sys_state))
         {
-            if (state.battery_voltage_mv < state.empty_voltage_mv &&
-                state.battery_voltage_mv > state.protection_voltage_mv)
-                state.empty_voltage_mv = state.battery_voltage_mv;
+            min_vbat_while_load_on_mv = 0xFFFFu;
+            empty_persisted_this_session = 0;
+        }
+        else
+        {
+            /* Track min VBAT when load is on; when INA invalid but RPi on, assume load on (brownout). */
+            int16_t out_ma = state.output_current_mA;
+            uint8_t load_off = state.output_current_valid &&
+                (out_ma >= -(int16_t)EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA &&
+                 out_ma <= (int16_t)EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA);
+            uint8_t load_on = state.output_current_valid &&
+                (out_ma < -(int16_t)EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA ||
+                 out_ma > (int16_t)EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA);
+            uint8_t assume_load_on = (sys_state.power_state == POWER_STATE_RPI_ON && !state.output_current_valid);
+
+            if ((load_on || assume_load_on) && state.battery_voltage_mv >= state.protection_voltage_mv)
+            {
+                if (min_vbat_while_load_on_mv == 0xFFFFu ||
+                    state.battery_voltage_mv < min_vbat_while_load_on_mv)
+                    min_vbat_while_load_on_mv = state.battery_voltage_mv;
+            }
+            if (load_off && min_vbat_while_load_on_mv != 0xFFFFu)
+                EmptyLearn_CommitTrackedMin(1);
         }
     }
-    state.empty_voltage_mv = ClampU16(state.empty_voltage_mv, state.protection_voltage_mv, VBAT_EMPTY_MAX_MV);
+    state.empty_voltage_mv = ClampU16(state.empty_voltage_mv, state.protection_voltage_mv, EmptyVoltageMaxMv());
 }
 
 void UpdateBatteryPercentage(void)
@@ -1457,8 +1520,7 @@ void UpdateBatteryPercentage(void)
     else if (percentage > 100)
         percentage = 100;
 
-    /* Use charger state (not VBUS heuristic) so percent can fall on battery even
-     * if 5V rails are present or backfed. */
+    /* Percent update direction uses charger state (Charger_IsInfluencingVBAT), not raw VBUS. */
     int32_t delta = percentage - (int32_t)state.battery_percent;
     if (delta >= (int32_t)BATTERY_PERCENT_HYSTERESIS || delta <= -(int32_t)BATTERY_PERCENT_HYSTERESIS)
     {
@@ -1541,16 +1603,11 @@ static void BatteryPlateau_UpdateBatteryFullClear(uint32_t now_ticks)
         battery_full_clear_start_ticks = 0;
         return;
     }
-    if (state.full_voltage_mv <= FULL_HYST_MV)
-    {
-        battery_full_clear_start_ticks = 0;
-        return;
-    }
-    if (filtered_vbat_mv < (uint16_t)(state.full_voltage_mv - FULL_HYST_MV))
+    if (filtered_vbat_mv < VBAT_FULL_RESET_MV)
     {
         if (battery_full_clear_start_ticks == 0u)
             battery_full_clear_start_ticks = now_ticks;
-        if ((now_ticks - battery_full_clear_start_ticks) >= (uint32_t)(FULL_CLEAR_SEC * TICKS_PER_1S))
+        if ((now_ticks - battery_full_clear_start_ticks) >= (uint32_t)(FULL_RESET_HOLD_SEC * TICKS_PER_1S))
             battery_full = 0;
     }
     else
@@ -1570,6 +1627,7 @@ static void BatteryPlateau_Tick1s(void)
         battery_full_clear_start_ticks = 0;
         BatteryPlateau_ResetSession();
         plateau_last_charger_state = sys_state.charger_state;
+        plateau_last_power_state = sys_state.power_state;
         return;
     }
 
@@ -1579,6 +1637,7 @@ static void BatteryPlateau_Tick1s(void)
         battery_full_clear_start_ticks = 0;
         BatteryPlateau_ResetSession();
         plateau_last_charger_state = sys_state.charger_state;
+        plateau_last_power_state = sys_state.power_state;
         return;
     }
 
@@ -1586,7 +1645,20 @@ static void BatteryPlateau_Tick1s(void)
         BatteryPlateau_ResetSession();
     plateau_last_charger_state = sys_state.charger_state;
 
+    /* Reset plateau window on power-state transition so the 30-min window is continuous under RPI_ON. */
+    if (plateau_last_power_state != POWER_STATE_RPI_ON && sys_state.power_state == POWER_STATE_RPI_ON)
+        BatteryPlateau_ResetWindow();
+    plateau_last_power_state = sys_state.power_state;
+
     BatteryPlateau_UpdateBatteryFullClear(now_ticks);
+
+    /* Taper gate: hold time that battery (charging) current <= I_TAPER_MA with valid; else reset */
+    if (state.battery_current_valid &&
+        state.battery_current_mA >= 0 &&
+        state.battery_current_mA <= (int16_t)I_TAPER_MA)
+        taper_hold_ticks += (uint32_t)TICKS_PER_1S;
+    else
+        taper_hold_ticks = 0;
 
     plateau_eval_counter++;
     if (plateau_eval_counter < PLATEAU_EVAL_PERIOD_SEC)
@@ -1604,14 +1676,11 @@ static void BatteryPlateau_Tick1s(void)
         return;
     if (plateau_suppressed)
         return;
-    if (filtered_vbat_mv < PLATEAU_MIN_VBAT_MV)
+    if (filtered_vbat_mv < VBAT_FULL_MIN_MV)
         return;
-    if (sys_state.power_state != POWER_STATE_RPI_ON)
+    if (sys_state.power_state != POWER_STATE_RPI_ON || sys_state.power_state_entry_ticks == 0u)
         return;
-
-    uint32_t window_ticks = (uint32_t)(PLATEAU_WINDOW_SEC * TICKS_PER_1S);
-    uint32_t stable_ticks = now_ticks - sys_state.power_state_entry_ticks;
-    if (stable_ticks < window_ticks || stable_ticks < (uint32_t)(PLATEAU_POWER_STABLE_SEC * TICKS_PER_1S))
+    if ((now_ticks - sys_state.power_state_entry_ticks) < (uint32_t)(PLATEAU_POWER_STABLE_SEC * TICKS_PER_1S))
         return;
 
     uint16_t min_v = 0xFFFFu;
@@ -1627,19 +1696,16 @@ static void BatteryPlateau_Tick1s(void)
         sum += v;
     }
 
-    uint16_t start_idx = plateau_sample_index;
-    uint16_t end_idx = (plateau_sample_index == 0u) ? (uint16_t)(PLATEAU_WINDOW_SAMPLES - 1u)
-                                                    : (uint16_t)(plateau_sample_index - 1u);
-    uint16_t v_start = plateau_samples[start_idx];
-    uint16_t v_end = plateau_samples[end_idx];
-
-    if (v_end + DISCHARGE_DETECT_MV < v_start)
-        return;
     if ((uint16_t)(max_v - min_v) > PLATEAU_DELTA_MV)
         return;
 
+    /* Optional taper gate: if current is valid, require taper hold; else plateau-only (no stale current) */
+    if (state.battery_current_valid &&
+        taper_hold_ticks < (uint32_t)(TAPER_HOLD_SEC * TICKS_PER_1S))
+        return;
+
     if (state.full_voltage_mv < LEARNED_FULL_MIN_MV || state.full_voltage_mv > LEARNED_FULL_MAX_MV)
-        state.full_voltage_mv = PLATEAU_MIN_VBAT_MV;
+        state.full_voltage_mv = VBAT_FULL_MIN_MV;
 
     uint16_t plateau_mean = (uint16_t)(sum / plateau_sample_count);
     uint16_t learned_full = state.full_voltage_mv;
@@ -1757,6 +1823,9 @@ static void Protection_Step(void)
     {
         BootBackoff_OnProtectionTrigger();
         sys_state.pending_power_cut_start_ticks = sched_flags.tick_counter;
+        /* Empty learning: commit tracked min before power cut (spec commit condition (2)). */
+        if (state.battery_params_self_programmed == 0)
+            EmptyLearn_CommitTrackedMin(0);
     }
     RequestFlashSave(1, 1);
     sys_state.pending_power_cut = 1;
@@ -1963,6 +2032,12 @@ static void CurrentAge_Tick10ms(void)
         (((uint32_t)state.output_current_age_10ms) <= CURRENT_VALID_AGE_TICKS) ? 1u : 0u;
     state.battery_current_valid =
         (((uint32_t)state.battery_current_age_10ms) <= CURRENT_VALID_AGE_TICKS) ? 1u : 0u;
+
+    /* Empty learning: commit on loss of output-current validity while RPi on (spec condition (3)). */
+    if (prev_output_valid && !state.output_current_valid &&
+        sys_state.power_state == POWER_STATE_RPI_ON &&
+        state.battery_params_self_programmed == 0)
+        EmptyLearn_CommitTrackedMin(1);
 
     if (state.output_current_valid != prev_output_valid ||
         state.battery_current_valid != prev_battery_valid)

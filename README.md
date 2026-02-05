@@ -3,6 +3,8 @@
 Open-source firmware for the UPSPlus uninterruptible power supply (UPS) module (EP-0136) designed for Raspberry Pi. [The device has been declared as EOL](https://github.com/geeekpi/upsplus/blob/main/firmware/README.md).
 This firmware runs on the STM32F030F4P6 microcontroller and provides battery monitoring, power management, and I2C communication capabilities.
 
+**Flash constraint:** The STM32F030F4P6 has 16 KB total flash; the linker reserves 2 KB for the bootloader and 1 KB for persistence, leaving **13 KB for the application**. Builds must stay under this limit (Release build uses `-Os` and `-ffunction-sections` / `--gc-sections`). When adding features, keep code size in mind.
+
 The code has been re-written from the ground up using a combination of ChatGPT and Cursor and the `documents/UPSPlus_Refactoring_Plan.md` document.
 
 ## Hardware Requirements
@@ -18,7 +20,7 @@ Items marked with `(*)` did not exist in the original factory firmware.
 - Protection shutdown at configured protection voltage.
 - Auto power-on with configurable low-battery threshold and load-on delay.(*)
 - Boot brownout backoff learning (see [Boot Brownout Backoff](#boot-brownout-backoff)).(*)
-- Charging plateau detection for adaptive full-battery learning.(*)
+- Improved automatic Battery Full and Empty values. (*)
 - INA219 current reporting via the 0x17 I2C registers (no separate INA bus reads required).(*)
 - Factory Testing pages (0xFC–0xFF) for diagnostics.(*)
 - OTA firmware update support (legacy bootloader mode only; not part of this runtime firmware).
@@ -40,6 +42,15 @@ Learning stops after a successful 5-minute run without a protection-triggered sh
 learned delay is clamped to 60 minutes, persists across power cycles, and is cleared only by
 factory reset. A user write to `load.on.delay` becomes the new baseline; any further learning
 adds minutes on top of that value.
+
+## Automatic Battery Calibration
+
+When battery parameters are self-programmed (register `0x2A` = 0, the default), the firmware learns **full** and **empty** voltages from actual use.
+
+- **Learn full:** Plug in the HAT and let the batteries **fully charge** with the load on (about 30 minutes or more at a stable high voltage). Full is detected when battery voltage plateaus (stays within a narrow band) for 30 minutes at a near-top level (~4.18 V). If current telemetry is available, the firmware also confirms charge current has tapered to a low level before declaring full. Full clears when you unplug the charger or when voltage stays below the reset level for ~45 seconds.
+- **Learn empty:** Run the unit on battery until the RPi turns off. The firmware records the **lowest voltage under load** right before shutdown as the learned empty value (graceful shutdown, protection cutoff, or abrupt brownout).
+
+Learned full and empty are used for battery percent and protection. For detailed behavior, see `documents/UPSPlus_Behavior_Spec.md` §7 and `documents/Battery_Empty_Full_Checklist.md`. Read or override via registers `0x0D–0x0E` (full) and `0x0F–0x10` (empty). Set `0x2A` = 1 to disable self-programming.
 
 ## Firmware Update (OTA - Legacy Bootloader)
 

@@ -233,49 +233,61 @@ Key behaviors:
 - Battery percent update direction uses charger state (charger path enabled), not VBUS voltage.
 - Protection voltage is enforced with hysteresis (50mV).
 - Protection latch requires multiple ADC samples below threshold (3 samples).
-- **Charging plateau full detection (self-programming enabled):**
-  - All VBAT values in this algorithm refer to **filtered** VBAT.
-  - **Plateau definition (two knobs):** while charger state is `PRESENT`, a battery is
-    considered **full** when filtered VBAT remains within `PLATEAU_DELTA_MV` over a continuous
-    `PLATEAU_WINDOW_SEC` (i.e., `max(VBAT) - min(VBAT) <= PLATEAU_DELTA_MV` within the window).
-    Default `PLATEAU_WINDOW_SEC` is **1800 seconds (30 minutes)** and
-    default `PLATEAU_DELTA_MV` is **40 mV**.
-  - **Window evaluation:** use a sliding window evaluated every `PLATEAU_EVAL_PERIOD_SEC`.
-    Default `PLATEAU_EVAL_PERIOD_SEC` is **5 seconds**.
-  - **Gating conditions:** plateau detection is attempted only when all are true:
-    - Charger state is `PRESENT` **and** the battery is not in a discharge event.
-      A discharge event is detected when `VBAT_end < VBAT_start - DISCHARGE_DETECT_MV`
-      over the plateau window, where `VBAT_start` and `VBAT_end` are filtered VBAT
-      sampled at the window boundaries. Default `DISCHARGE_DETECT_MV` is **15 mV**.
-    - VBAT is above `PLATEAU_MIN_VBAT_MV` (near-full floor). Default
-      `PLATEAU_MIN_VBAT_MV` is **4050 mV**.
-    - Load state is stable: no `power_state_t` transitions during the window and
-      `power_state_t == RPI_ON` has been stable for at least `PLATEAU_POWER_STABLE_SEC`.
-      Default `PLATEAU_POWER_STABLE_SEC` is **60 seconds**.
-    - Optional: if charger/charge-current telemetry exists, require taper/CV region; otherwise
-      this condition is skipped.
-  - **Learning update rule:** on a plateau event, compute the plateau level as the mean of
-    filtered VBAT samples within the window.
-    If `abs(plateau - learned_full) >= PLATEAU_MIN_CHANGE_MV`, update learned full as:
-    `learned_full = (1 - PLATEAU_ALPHA) * learned_full + PLATEAU_ALPHA * plateau`.
-    Default `PLATEAU_MIN_CHANGE_MV` is **10 mV** and default `PLATEAU_ALPHA` is **0.2**.
-  - **Initialization / invalid learned_full:** if `learned_full` is unset, initialize it to
-    `PLATEAU_MIN_VBAT_MV` (or 4200 mV if a fixed default is preferred) and allow learning normally.
-  - **Clamping:** clamp `learned_full` to `[LEARNED_FULL_MIN_MV, LEARNED_FULL_MAX_MV]`.
-    Default bounds are **3900–4500 mV**.
-  - **Full state behavior:** on plateau detection, assert `battery_full=1`.
-    Clear `battery_full` when charger is not `PRESENT` or when
-    `VBAT < learned_full - FULL_HYST_MV` for `FULL_CLEAR_SEC`.
-    Default `FULL_HYST_MV` is **50 mV** and default `FULL_CLEAR_SEC` is **300 seconds**.
-  - **Re-trigger suppression:** after a plateau event, suppress further plateau detection
-    until the charger leaves `PRESENT`.
-  - **Persistence / flash wear:** persist the learned full voltage only if the
-    accepted change is >= `PLATEAU_PERSIST_MIN_CHANGE_MV` and at most once per
-    charger-present session. A charger-present session begins when the charger
-    state transitions to `PRESENT` and ends when it leaves `PRESENT`. Default
-    `PLATEAU_PERSIST_MIN_CHANGE_MV` is **20 mV**.
-  - If the battery is replaced and a different plateau level persists for the same window,
-    the learned full voltage automatically converges to the new plateau value.
+- **Full battery detection (hybrid: plateau + optional current taper)** (self-programming enabled):
+  - **Definitions:**
+    - **Filtered VBAT:** the filtered battery voltage used everywhere in this algorithm.
+    - **Plateau window:** over `PLATEAU_WINDOW_SEC`, with tolerance `PLATEAU_DELTA_MV`:
+      within the window, `max(VBAT) - min(VBAT) <= PLATEAU_DELTA_MV`. Default
+      `PLATEAU_WINDOW_SEC` is **1800 seconds (30 minutes)** and default `PLATEAU_DELTA_MV` is **40 mV**.
+    - **Current freshness:** a current measurement is usable only when the corresponding
+      `*_current_valid` flag is set (fresh within the validity window).
+  - **Primary full criterion (plateau)** — baseline behavior, MUST be supported. While charger
+    state is `PRESENT`, the battery is considered **FULL** when:
+    1. The plateau condition holds continuously for `PLATEAU_WINDOW_SEC`, and
+    2. Filtered VBAT is at or above a near-top minimum, `VBAT_FULL_MIN_MV` (prevents plateauing
+       at mid-voltage from being misclassified as full). Recommended **4150–4180 mV**, default **4180 mV**.
+  - **Optional secondary criterion (taper gate):** If reliable charge-current telemetry exists
+    (e.g. INA219 battery-path current) and the measurement is fresh, plateau qualification MAY
+    be tightened by requiring a taper condition during the final portion of the plateau window.
+    The taper hold interval is evaluated **concurrently** with the final portion of the plateau
+    window. When enabled, the plateau is only accepted as FULL if, in addition to the primary criterion:
+    3. Battery charge current is low (taper): battery current is <= `I_TAPER_MA` for at least
+       `TAPER_HOLD_SEC` continuously, and the battery-current measurement is fresh
+       (`battery_current_valid` set) for all samples contributing to the hold time. Battery charge
+       current refers to **positive** (charging) battery current; negative current (discharge) does
+       not satisfy the taper condition.
+    If current telemetry is not fresh for a sustained period, the taper gate is skipped and the
+    decision falls back to voltage plateau only.
+  - **Defaults / recommended values:**
+    - `VBAT_FULL_MIN_MV`: 4150–4180 mV (default 4180 mV).
+    - `I_TAPER_MA`: conservative, e.g. C/20 equivalent (default **150 mA** for ~3000 mAh cells).
+    - `TAPER_HOLD_SEC`: 300–600 s (default **300 s**).
+  - **Latching and reset semantics:** When FULL is asserted, it is latched until either charger
+    state becomes not `PRESENT`, or filtered VBAT drops below `VBAT_FULL_RESET_MV` for
+    `FULL_RESET_HOLD_SEC`. Recommended: `VBAT_FULL_RESET_MV = VBAT_FULL_MIN_MV - 100 mV`,
+    `FULL_RESET_HOLD_SEC` = **30–60 s**.
+  - **Learning update rule (unchanged):** on a plateau event, compute the plateau level as the mean
+    of filtered VBAT samples within the window; if `abs(plateau - learned_full) >= PLATEAU_MIN_CHANGE_MV`,
+    update learned full (e.g. EMA). Clamp `learned_full` to `[LEARNED_FULL_MIN_MV, LEARNED_FULL_MAX_MV]`.
+    Persist only if change >= `PLATEAU_PERSIST_MIN_CHANGE_MV` and at most once per charger-present session.
+  - **Safety / robustness:** The taper gate MUST NOT use stale current readings: `*_current_valid` must
+    be set. Current taper is a secondary confirmation, not the sole definition of full. The voltage
+    plateau algorithm remains the canonical mechanism for “full” if current telemetry is unavailable
+    or unreliable.
+- **Empty voltage learning (self-programming enabled):** While the charger is not influencing VBAT,
+  the firmware tracks the **minimum** battery voltage seen while the load is on (output current above
+  `EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA`). Output/battery current values are derived directly from
+  the INA219 shunt-voltage register; on this board the shunt resistor is 10 mΩ so the register count
+  equals 1 mA per LSB. The learned empty voltage is committed when the Pi is
+  effectively off or about to turn off, detected by any of: **(1)** output current dropping to near zero
+  (graceful shutdown / load removed); **(2)** a low-VBAT protection trigger that initiates a pending
+  power cut; or **(3)** loss of output-current validity while the system is in `POWER_STATE_RPI_ON`
+  (covers abrupt brownouts where telemetry stops before current reaches ~0). The committed value is
+  that minimum—i.e. the lowest under-load voltage **before** the Pi turned off, not the rebound voltage
+  after load removal. The tracked discharge-session minimum is an internal candidate value; the
+  externally visible “empty voltage” (registers 0x0F–0x10) reflects only the last committed learned
+  value. If the charger is influencing VBAT, the discharge-session minimum is discarded
+  (no learning while charging).
 - When protection triggers: pending power cut is set, flash save is attempted, then MT_EN is cut.
 - If flash save fails, power is still cut after the attempt. On next boot, defaults may apply,
   but the protection latch behavior remains effective.

@@ -72,6 +72,10 @@ extern "C" {
 #define VBAT_PROTECT_MAX_MV           4500    /* Maximum allowed protection voltage */
 #define VBAT_FULL_MAX_MV              4500    /* Maximum allowed full voltage */
 #define VBAT_EMPTY_MAX_MV             4500    /* Maximum allowed empty voltage */
+/* Load detection threshold used by empty-learning logic (load_on vs load_off classification) */
+#define EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA  25   /* |output_current_mA| <= this => load off (mA) */
+/* Empty learning: persist only if change >= this and at most once per discharge session */
+#define EMPTY_PERSIST_MIN_CHANGE_MV              20u
 
 /* Charger Detection Thresholds */
 /* 
@@ -108,18 +112,19 @@ extern "C" {
 #define MIN_VOLTAGE_DELTA_MV          50      /* Minimum voltage range for valid % calculation */
 #define BATTERY_PERCENT_HYSTERESIS    1       /* Minimum change to update percentage */
 
-/* Charging Plateau Full Detection (self-programming enabled) */
+/* Charging Plateau Full Detection (self-programming enabled) - Section 7 */
 #define PLATEAU_WINDOW_SEC            1800u   /* 30 minutes */
 #define PLATEAU_EVAL_PERIOD_SEC       5u      /* Sliding window evaluation period */
 #define PLATEAU_DELTA_MV              40u
-#define PLATEAU_MIN_VBAT_MV           4050u
+#define VBAT_FULL_MIN_MV              4180u   /* Near-top minimum for plateau full (4150-4180 mV per spec) */
+#define VBAT_FULL_RESET_MV            (VBAT_FULL_MIN_MV - 100u)  /* Clear FULL when VBAT below this for FULL_RESET_HOLD_SEC */
+#define FULL_RESET_HOLD_SEC           45u     /* 30-60 s per spec */
+#define I_TAPER_MA                    150     /* Charge current <= this for taper gate (C/20 ~3000mAh) */
+#define TAPER_HOLD_SEC                300u    /* Taper must hold this long (concurrent with plateau) */
 #define PLATEAU_MIN_CHANGE_MV         10u
 #define PLATEAU_ALPHA_NUM             1u      /* EMA alpha = 1/5 = 0.2 */
 #define PLATEAU_ALPHA_DEN             5u
-#define DISCHARGE_DETECT_MV           15u
-#define PLATEAU_POWER_STABLE_SEC      60u
-#define FULL_HYST_MV                  50u
-#define FULL_CLEAR_SEC                300u
+#define PLATEAU_POWER_STABLE_SEC      60u   /* RPI_ON must be stable this long before plateau evaluation */
 #define PLATEAU_PERSIST_MIN_CHANGE_MV 20u
 #define LEARNED_FULL_MIN_MV           3900u
 #define LEARNED_FULL_MAX_MV           4500u
