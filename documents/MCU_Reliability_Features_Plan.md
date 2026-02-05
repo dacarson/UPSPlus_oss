@@ -194,6 +194,11 @@ Explicit decision gate — pick one to avoid mid-implementation stuck state:
 **Flash impact:** Neutral or slightly smaller (removes SW CRC loop); HAL avoided  
 **Dependencies:** None (can parallel with other phases)
 
+**Decision applied:** Option A (internal only) — switched to HW CRC; record version bumped to 2 so old SW-CRC records are discarded on load.
+
+**Status:** Complete. LL CRC used (`stm32f0xx_ll_crc.h`); CRC clock enabled in `Flash_ComputeCrc32`; 32-bit feed with trailing-byte handling; `FLASH_STRUCTURE_VERSION` set to 2.  
+**Image size (after Phase 4):** 16320 bytes (0x3fc0), `UPSPlus_oss.elf` (text 12792 + data 96 + bss 3432).
+
 ---
 
 ## Phase 5: I2C Analog/Digital Filters & Timeouts
@@ -244,7 +249,7 @@ Configure analog and digital filter settings **before** `LL_I2C_Enable(I2C1)`. S
 | 1 | IWDG | 1–2 hrs | Low | **Done** |
 | 2 | HardFault | 1–2 hrs | Low | **Done** |
 | 3 | Reset cause | 1–2 hrs | Low | **Done** |
-| 4 | CRC | 2–3 hrs | Medium (format compatibility) | |
+| 4 | CRC | 2–3 hrs | Medium (format compatibility) | **Done** |
 | 5 | I2C filters | ~1 hr | Low | |
 
 Phases 4 and 5 can be implemented in parallel.
@@ -258,7 +263,7 @@ Phases 4 and 5 can be implemented in parallel.
 - [ ] HardFault path does not depend on healthy stack (keep handler naked/minimal if needed)
 - [ ] Reset cause (especially IWDG) visible via I2C after watchdog reset
 - [ ] Reset-cause bytes correct across: POR, NRST pin reset, software reset, IWDG reset
-- [ ] Flash persistence still validates after CRC migration (if changed)
+- [x] Flash persistence still validates after CRC migration (HW CRC, version 2)
 - [ ] I2C stable with filters/timeout enabled
 - [ ] I2C still works correctly under repeated-start and short reads after filter changes
 - [ ] I2C recovery: repeated-start read, mid-transfer STOP, master abort don't wedge peripheral

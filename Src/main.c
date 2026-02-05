@@ -21,6 +21,7 @@
 #include "stm32f0xx_ll_system.h"
 #include "stm32f0xx_ll_tim.h"
 #include "stm32f0xx_ll_utils.h"
+#include "stm32f0xx_ll_crc.h"
 
 #include "I2C_Slave.h"
 #include "ups_state.h"
@@ -1172,23 +1173,25 @@ static inline const uint8_t *FlashStorageEndPtr(void)
     return __flash_storage_end__;
 }
 
+/* Hardware CRC (STM32F0): polynomial 0x04C11DB7, init 0xFFFFFFFF, no reflection.
+ * Replaces software CRC32 to reduce flash; record version bumped so old records are discarded. */
 static uint32_t Flash_ComputeCrc32(const uint8_t *data, uint32_t len)
 {
-    uint32_t crc = 0xFFFFFFFFu;
     uint32_t i;
-    uint32_t bit;
-    for (i = 0; i < len; i++)
-    {
-        crc ^= data[i];
-        for (bit = 0; bit < 8u; bit++)
-        {
-            if (crc & 1u)
-                crc = (crc >> 1) ^ 0xEDB88320u;
-            else
-                crc >>= 1;
-        }
+    uint32_t last = 0u;
+
+    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_CRC);
+    LL_CRC_ResetCRCCalculationUnit(CRC);
+
+    for (i = 0u; i < (len >> 2u); i++)
+        LL_CRC_FeedData32(CRC, *(const uint32_t *)(data + (i << 2u)));
+
+    if (len & 3u) {
+        memcpy(&last, data + (len & ~3u), len & 3u);
+        LL_CRC_FeedData32(CRC, last);
     }
-    return ~crc;
+
+    return LL_CRC_ReadData32(CRC);
 }
 
 static uint8_t Flash_RecordIsValid(const flash_persistent_data_t *rec)

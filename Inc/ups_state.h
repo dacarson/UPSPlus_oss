@@ -169,7 +169,7 @@ STATIC_ASSERT((PLATEAU_WINDOW_SEC % PLATEAU_EVAL_PERIOD_SEC) == 0,
 /* Note: Flash storage is little-endian on STM32; this constant ensures correct
  * byte order when comparing against flash-stored values. */
 #define FLASH_MAGIC_NUMBER            ((uint32_t)('U') | ((uint32_t)('P')<<8) | ((uint32_t)('S')<<16) | ((uint32_t)('P')<<24))
-#define FLASH_STRUCTURE_VERSION       1           /* Increment when structure changes */
+#define FLASH_STRUCTURE_VERSION       2           /* Increment when structure changes (2 = HW CRC) */
 #define FLASH_WRITE_RATE_LIMIT_SEC    5           /* Minimum seconds between flash writes */
 #define FLASH_DIRTY_MAX_INTERVAL_SEC  60          /* Max seconds before forcing a dirty save */
 #define FLASH_RETRY_BACKOFF_SEC       2           /* Retry backoff after failed save */
@@ -518,6 +518,7 @@ typedef struct {
  * Implementation Requirement:
  * - CRC implementation MUST compute CRC over [FLASH_CRC_START_OFFSET, FLASH_CRC_END_OFFSET)
  * - Do NOT use bespoke byte ranges; use the offset macros for safety
+ * - From version 2: HW CRC (STM32 polynomial 0x04C11DB7, init 0xFFFFFFFF, no reflection).
  */
 typedef struct {
     /* Header (excluded from CRC) */
