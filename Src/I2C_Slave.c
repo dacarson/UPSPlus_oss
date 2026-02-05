@@ -701,6 +701,9 @@ void MX_I2C1_Slave_Init(void)
     uint32_t timing_100k = I2C1_TIMING_100KHZ_HSI8MHZ;
     LL_I2C_SetTiming(I2C1, timing_100k);
 
+    /* Phase 5: analog + digital filters before PE=1 (noise robustness). HW timeout not enabled; stuck-bus uses I2C1_BusRecovery(). */
+    LL_I2C_ConfigFilters(I2C1, LL_I2C_ANALOGFILTER_ENABLE, 1u);
+
     /*
      * Program Own Address 1 
      */

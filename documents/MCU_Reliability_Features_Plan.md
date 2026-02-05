@@ -240,6 +240,9 @@ Configure analog and digital filter settings **before** `LL_I2C_Enable(I2C1)`. S
 **Flash impact:** ~10–20 bytes (register config)  
 **Dependencies:** None
 
+**Status:** Complete. Analog filter enabled and digital filter set to 1 (one I2C clock) via `LL_I2C_ConfigFilters()` before `LL_I2C_Enable()`. Hardware timeout not enabled; stuck-bus recovery remains `I2C1_BusRecovery()`.  
+**Image size (after Phase 5):** 16340 bytes (0x3fd4), `UPSPlus_oss.elf` (text 12812 + data 96 + bss 3432).
+
 ---
 
 ## Implementation Order
@@ -250,7 +253,7 @@ Configure analog and digital filter settings **before** `LL_I2C_Enable(I2C1)`. S
 | 2 | HardFault | 1–2 hrs | Low | **Done** |
 | 3 | Reset cause | 1–2 hrs | Low | **Done** |
 | 4 | CRC | 2–3 hrs | Medium (format compatibility) | **Done** |
-| 5 | I2C filters | ~1 hr | Low | |
+| 5 | I2C filters | ~1 hr | Low | **Done** |
 
 Phases 4 and 5 can be implemented in parallel.
 
