@@ -6,7 +6,7 @@ confirmed.
 
 ## I2C Bus Devices
 
-- **STM32F030F4P6** (MCU, SW I2C slave: 0x17 runtime; 0x18 OTA)
+- (**STM32F030F4P6**)[https://www.st.com/resource/en/datasheet/stm32f030f4.pdf] (MCU, SW I2C slave: 0x17 runtime; 0x18 OTA)
   - Main microcontroller running the UPSPlus firmware.
   - Shares the I2C bus with the current monitors and RTC.
 - **INA219** x2 (current monitors, I2C slave: 0x40 & 0x45)
