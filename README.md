@@ -60,7 +60,15 @@ This workflow targets the legacy bootloader. The runtime firmware can enter OTA 
 
 ### Entering OTA mode
 
-**Option A – I2C command (recommended)**  
+**Option A – Button sequence (recommended)**  
+1. Remove all power and batteries.  
+2. Hold the Func Key button and insert batteries.  
+3. The device starts in OTA mode.
+
+**Option B – I2C command**  
+**Caution** If this path is used, UPSPlus device will always reboot into OTA until an OTA Update is performed.
+
+
 With the firmware running and the UPSPlus on the I2C bus (e.g. Raspberry Pi at 0x17), write **0x7F** to register **0xFC** (factory test region). This is a one-shot command: the firmware persists the bootloader OTA flag, saves flash, and reboots immediately into the bootloader. Register 0xFC remains 0 for readback (it is not a selector value).
 
 ```bash
@@ -69,14 +77,9 @@ i2cset -y 1 0x17 0xFC 0x7F b
 
 Use the same I2C bus as your setup (e.g. `0` or `1` on Raspberry Pi). After a few seconds the device resets into bootloader OTA mode.
 
-**Option B – Button sequence**  
-1. Remove all power and batteries.  
-2. Hold the Func Key button and insert batteries.  
-3. The device starts in OTA mode.
-
 ### Flashing the new firmware
 
-1. Verify OTA mode with `i2cdetect -y 1`; the bootloader should be visible at the expected address ox 0x18.
+1. Verify OTA mode with `i2cdetect -y 1`; the bootloader should be visible at the expected address `0x18`.
 2. Copy the compiled binary to the same directory as `tools/OTA_upgrade.py` and rename it to `upsplus_oss.bin` if needed.
 3. Run:
 
