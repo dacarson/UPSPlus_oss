@@ -388,7 +388,165 @@ These numeric values are part of the Factory Testing ABI and must remain stable.
 
 ---
 
-## 14. Glossary
+## 14. Bootloader Behaviour
+
+### 14.1 Purpose
+
+The device includes a resident I²C bootloader responsible for:
+
+- Conditional entry into OTA / programming mode  
+- Erasing and programming the application flash region  
+- Booting the application image when permitted  
+
+The bootloader does **not** provide a runtime command to exit OTA mode or to jump directly to the application once OTA mode has been entered.
+
+---
+
+### 14.2 Flash Memory Layout
+
+| Region | Address Range | Notes |
+|------|---------------|------|
+| Bootloader | `0x08000000 – 0x080007FF` | Resident; never erased |
+| Application | `0x08000800 – 0x08003BFF` | Erased and reprogrammed during OTA |
+| Device Settings / Persistence | `0x08003C00 – 0x08003FFF` | Erased during OTA |
+
+- Flash page size is **1 KB (0x400 bytes)**.
+- OTA erase operations cover the entire range `0x08000800` through `0x08003FFF`.
+
+---
+
+### 14.3 Boot-Time Mode Selection
+
+On reset, the bootloader determines whether to enter OTA mode or boot the application using the following conditions.
+
+#### 14.3.1 Force-Bootloader Button
+
+- A dedicated GPIO input (GPIOB IDR bit 1) is sampled during boot.
+- If asserted, the device **enters OTA mode**.
+- If not asserted, normal application boot is allowed.
+
+#### 14.3.2 OTA Request Flag (Flash)
+
+- A predefined value stored in the device settings flash page requests OTA mode.
+- If present at boot, the bootloader **enters OTA mode**.
+- This flag is **cleared implicitly** when the settings page is erased during OTA.
+
+#### 14.3.3 Application Vector Table Validation
+
+Before booting the application, the bootloader validates the application image:
+
+- Reads initial MSP from `0x08000800`
+- MSP must be within the valid SRAM range (`0x2000xxxx`)
+- Reads reset handler from `0x08000804`
+- If validation fails, the device remains in OTA mode
+
+---
+
+### 14.4 Application Boot Sequence
+
+If no OTA condition is present and the application vector table is valid, the bootloader performs the following steps:
+
+1. Load MSP from `0x08000800`
+2. Set MSP
+3. Load reset handler from `0x08000804`
+4. Branch to application reset handler
+
+Application execution begins immediately after this branch.
+
+---
+
+### 14.5 OTA Mode Behaviour
+
+#### 14.5.1 Entry Conditions
+
+The device enters OTA mode at boot if **any** of the following are true:
+
+- Force-boot GPIO is asserted  
+- OTA request flag is present in flash  
+- Application vector table is invalid  
+
+#### 14.5.2 Flash Erase Behaviour
+
+Upon entering OTA mode, the bootloader:
+
+- Unlocks the FLASH peripheral
+- Sequentially erases all 1 KB flash pages from:
+  - `0x08000800` through `0x08003FFF`
+- This erase includes the **device settings / persistence page**
+
+Erased flash locations read back as `0xFF`.
+
+As a result, the OTA request flag is cleared automatically during the erase process.
+
+---
+
+### 14.6 I²C OTA Programming Interface
+
+- The device operates as an I²C slave at address `0x18`.
+- Programming data is delivered using a framed protocol.
+
+High-level behaviour:
+
+- Each programming block begins with a marker byte (`0xFA`)
+- Each block programs **16 bytes (8 halfwords)** of flash
+- Flash programming is performed using **16-bit halfword writes**
+- The flash write pointer auto-increments after each halfword
+- Programming continues while valid frames are received
+
+The bootloader does **not** expose:
+
+- A total image length
+- A checksum or CRC
+- An explicit “end of programming” command
+
+---
+
+### 14.7 OTA Exit and Application Boot After OTA
+
+#### 14.7.1 No In-Band Exit Command
+
+Once OTA mode has been entered:
+
+- There is **no I²C command** to:
+  - Exit OTA mode
+  - Jump directly to the application
+  - Trigger a software reset
+
+OTA mode persists until the device is reset or power-cycled.
+
+#### 14.7.2 Required Exit Mechanism
+
+To boot the application after OTA programming:
+
+1. OTA request flag must be cleared  
+   - This occurs automatically during the OTA erase sequence.
+2. The device must be **reset or power-cycled**.
+3. On reboot, if:
+   - No force-boot condition is present, and
+   - The application vector table is valid  
+   → the bootloader jumps to the application.
+
+---
+
+### 14.8 I²C Register Observations
+
+- The I²C register space is primarily read-only status.
+- Register `0x00` reflects current mode/state.
+- Internal OTA receive counters are exposed for diagnostics.
+- Registers `0xF0–0xFF` expose identity and version information.
+- No register functions as a command mailbox for reset or application boot.
+
+---
+
+### 14.9 Design Implications
+
+- OTA workflows **must include a reset or power-cycle step** after programming.
+- Application images **must be linked for base address `0x08000800`**.
+- The application vector table must remain valid post-OTA.
+- Device settings stored in the last flash page are erased during OTA and must be reinitialized by the application.
+---
+
+## 15. Glossary
 
 - **true VBAT**: Battery voltage sampled while charger path is disabled (IP_EN LOW).
 - **charger present**: Physical charger voltage above presence threshold with stability.
@@ -398,7 +556,7 @@ These numeric values are part of the Factory Testing ABI and must remain stable.
 
 ---
 
-## 15. Change Impact Map
+## 16. Change Impact Map
 
 - If ADC cadence changes, revisit: charger stability counters, protection sample count, window duration.
 - If register map changes, revisit: Factory Testing ABI, test scripts, and external tools.
@@ -408,7 +566,7 @@ These numeric values are part of the Factory Testing ABI and must remain stable.
 
 ---
 
-## 16. Spec Authority
+## 17. Spec Authority
 
 In the event of conflict, this Behavior Specification is authoritative over code comments,
 test scripts, and historical behavior.
