@@ -23,7 +23,7 @@ Items marked with `(*)` did not exist in the original factory firmware.
 - Improved automatic Battery Full and Empty values. (*)
 - INA219 current reporting via the 0x17 I2C registers (no separate INA bus reads required).(*)
 - Factory Testing pages (0xFC–0xFF) for diagnostics.(*)
-- OTA firmware update support (legacy bootloader mode only; not part of this runtime firmware).
+- OTA firmware update support: write 0x7F to register 0xFC to enter legacy bootloader OTA mode (see [Firmware Update](#firmware-update-ota---legacy-bootloader)).(*)
 
 ## Button Behavior
 
@@ -56,19 +56,35 @@ Learned full and empty are used for battery percent and protection. For detailed
 
 ## Firmware Update (OTA - Legacy Bootloader)
 
-This workflow targets the legacy bootloader mode and is not supported by the
-runtime firmware register map in this branch.
+This workflow targets the legacy bootloader. The runtime firmware can enter OTA mode either via an I2C command (recommended) or the physical button sequence.
 
-1. Ensure the UPSPlus is connected to your Raspberry Pi.
-2. Put the UPSPlus into OTA mode by removing all power supplies and batteries.
-3. Hold the Func Key button down and insert batteries.
-4. Verify OTA mode with `i2cdetect -y 1`; register 0x18 should be visible.
-5. Copy the compiled binary to the same directory as `tools/OTA_upgrade.py` and rename it to `upsplus_oss.bin` if needed.
-6. Run:
+### Entering OTA mode
 
+**Option A – I2C command (recommended)**  
+With the firmware running and the UPSPlus on the I2C bus (e.g. Raspberry Pi at 0x17), write **0x7F** to register **0xFC** (factory test region). This is a one-shot command: the firmware persists the bootloader OTA flag, saves flash, and reboots immediately into the bootloader. Register 0xFC remains 0 for readback (it is not a selector value).
+
+```bash
+i2cset -y 1 0x17 0xFC 0x7F b
 ```
+
+Use the same I2C bus as your setup (e.g. `0` or `1` on Raspberry Pi). After a few seconds the device resets into bootloader OTA mode.
+
+**Option B – Button sequence**  
+1. Remove all power and batteries.  
+2. Hold the Func Key button and insert batteries.  
+3. The device starts in OTA mode.
+
+### Flashing the new firmware
+
+1. Verify OTA mode with `i2cdetect -y 1`; the bootloader should be visible at the expected address ox 0x18.
+2. Copy the compiled binary to the same directory as `tools/OTA_upgrade.py` and rename it to `upsplus_oss.bin` if needed.
+3. Run:
+
+```bash
 python3 tools/OTA_upgrade.py
 ```
+
+After a successful update, remove power and batteries to force a reboot; the device does not reset automatically.
 
 ## I2C Register Map and Reading
 
@@ -116,7 +132,7 @@ Note: multi-byte registers are little-endian (LSB at lower address).
 | `0x32` | Current valid flags (bit0=output, bit1=battery) | RO | - |
 | `0x33–0xEF` | Reserved (reads 0x00, writes ignored) | RO | 0 |
 | `0xF0–0xFB` | MCU serial number | RO | - |
-| `0xFC–0xFF` | Factory Testing (RW selector + RO pages) | RW | selector=0 |
+| `0xFC–0xFF` | Factory Testing (selector + pages). Write **0x7F** to **0xFC** = OTA command (one-shot; see Firmware Update) | RW | selector=0 |
 
 
 ## Documentation

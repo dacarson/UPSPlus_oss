@@ -553,13 +553,29 @@ typedef struct {
     uint8_t reserved_padding2[2];       /* Alignment + deterministic CRC - MUST be zeroed */
     uint32_t cumulative_runtime_sec;
     uint32_t charging_time_sec;
+
+    /* Reserved for bootloader: byte at 0x08003C64 must be 0x7F to enter OTA. Intentionally EXCLUDED from CRC
+     * so the bootloader can read it without affecting record validity. Do not move into CRC-covered region. */
+#define FLASH_OTA_FLAG_OFFSET   0x64
+#define FLASH_PRE_OTA_TAIL_OFFSET  44  /* Must equal first byte after charging_time_sec; assert below */
+    uint8_t reserved_ota_padding[FLASH_OTA_FLAG_OFFSET - FLASH_PRE_OTA_TAIL_OFFSET];  /* pad to OTA offset */
+    uint8_t bootloader_ota_flag;  /* At 0x08003C64: 0x7F = enter OTA, 0 = normal; app writes 0 unless OTA requested */
 } flash_persistent_data_t;
 
-/* CRC calculation span - compile-time offsets for safety */
+/* CRC calculation span - compile-time offsets for safety (excludes OTA reserved area) */
 #define FLASH_CRC_START_OFFSET  offsetof(flash_persistent_data_t, full_voltage_mv)
-#define FLASH_CRC_END_OFFSET    (sizeof(flash_persistent_data_t))
+#define FLASH_CRC_END_OFFSET    offsetof(flash_persistent_data_t, reserved_ota_padding)
 #define FLASH_CRC_SIZE          (FLASH_CRC_END_OFFSET - FLASH_CRC_START_OFFSET)
 
+/* Pre-OTA tail offset must match last CRC field end (no hidden padding) */
+STATIC_ASSERT((offsetof(flash_persistent_data_t, charging_time_sec) + sizeof(((flash_persistent_data_t *)0)->charging_time_sec)) == FLASH_PRE_OTA_TAIL_OFFSET,
+               "FLASH_PRE_OTA_TAIL_OFFSET must equal first byte after charging_time_sec");
+/* Bootloader OTA flag must be at fixed address 0x08003C64 */
+STATIC_ASSERT(offsetof(flash_persistent_data_t, bootloader_ota_flag) == FLASH_OTA_FLAG_OFFSET,
+               "bootloader_ota_flag must be at offset 0x64 for bootloader OTA check");
+/* OTA byte must remain outside CRC region (invariant for future edits) */
+STATIC_ASSERT(offsetof(flash_persistent_data_t, bootloader_ota_flag) >= FLASH_CRC_END_OFFSET,
+               "bootloader_ota_flag must not be inside CRC-covered region");
 /* Compile-time assertion: flash structure must fit in slot size */
 STATIC_ASSERT(sizeof(flash_persistent_data_t) <= FLASH_PAGE_SIZE,
                "flash_persistent_data_t exceeds FLASH_PAGE_SIZE");
@@ -734,7 +750,8 @@ extern volatile uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]; /* 
  * regs—writes are ACK'd but discarded; reserved reads always return 0x00.
  *
  * Factory Test Region (0xFC-0xFF): 0xFC is the selector; 0xFD-0xFF return
- * selector-defined page data when enabled, otherwise 0x00. */
+ * selector-defined page data when enabled, otherwise 0x00. Write 0x7F to 0xFC
+ * is OTA command (consumed; selector not updated; see behavior spec). */
 #define REG_RESERVED_START      0x33  /* Start of reserved region */
 #define REG_RESERVED_END        0xEF  /* End of reserved region */
 #define REG_SERIAL_START        0xF0

@@ -104,7 +104,8 @@ It is intended as the source of truth for feature development and future changes
   - Write: sets configured delay; if countdown active, resets remaining time.
 
 ### 4.4 Factory Testing (0xFC–0xFF)
-- **Selector register:** write `0xFC` to select a page; write 0 to disable.
+- **Selector register:** write a value to `0xFC` to select a page; write 0 to disable.
+- **OTA command (write-only, consumed):** Writing **0x7F** to **0xFC** is a one-shot command. It does **not** update the factory test selector. The firmware persists the bootloader OTA flag (0x7F at 0x08003C64), saves flash, and reboots into the bootloader. After the command, readback of 0xFC returns **0** (selector remains 0). Do not treat 0x7F as a selector value; tools/scripts should use 0x7F only to trigger OTA.
 - **When disabled:** 0xFC–0xFF read as 0x00.
 - **When enabled:** 0xFC returns selector, 0xFD–0xFF return page values.
 - **Unknown selector:** accepted and read back; 0xFD–0xFF return 0x00.

@@ -20,6 +20,7 @@
 #include "stm32f0xx_ll_crc.h"
 
 #include "I2C_Slave.h"
+#include "stm32f0xx.h"
 #include "ups_state.h"
 
 #include <string.h>
@@ -107,6 +108,11 @@ static uint8_t flash_record_valid_boot = 0;
 static uint8_t flash_save_attempted = 0;
 static uint8_t flash_last_save_success = 0;
 static uint8_t flash_auto_power_on_loaded = 0;
+/* OTA request sub-state: request latched → flash save requested → on save-success (for that save) reboot.
+ * flash_ota_flag_next_save: next save writes 0x7F at bootloader_ota_flag (cleared inside FillRecord).
+ * ota_reboot_after_save: we reboot only after the save that actually wrote the OTA flag (gated in main loop). */
+static volatile uint8_t flash_ota_flag_next_save = 0;
+static volatile uint8_t ota_reboot_after_save = 0;
 static volatile uint8_t ina_probe_requested = 0;
 static uint32_t ina_probe_due_ticks = 0;
 static uint8_t ina_probe_is_output = 1u;
@@ -652,8 +658,14 @@ static void ProcessI2CPendingWrite(void)
         break;
     case REG_FACTORY_TEST_START:
         if (len >= 1) {
-            /* Selector only; ignore any extra data bytes. */
             u8 = i2c_pending_write.data[0];
+            if (u8 == 0x7Fu) {
+                /* OTA command (consumed): latch request → save → reboot. break so selector is never updated. */
+                flash_ota_flag_next_save = 0x7Fu;
+                ota_reboot_after_save = 1u;
+                RequestFlashSave(1, 1);  /* bypass=1, mark_dirty=1: next Flash_Save uses bypass and runs soon */
+                break;
+            }
             if (sys_state.factory_test_selector != u8) {
                 sys_state.factory_test_selector = u8;
                 changed = 1;
@@ -736,7 +748,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.version = 23;
+    state.version = 24;
     state.snapshot_tick = 0;
     state.last_true_vbat_sample_tick = 0;
     state.last_true_vbat_mv = 0;
@@ -940,12 +952,19 @@ int main(void)
             }
             else
             {
+                uint8_t ota_save_this_round = (ota_reboot_after_save && (flash_ota_flag_next_save == 0x7Fu));
                 Snapshot_UpdateDerived();
                 if (Flash_Save(flash_save_bypass))
                 {
                     flash_save_requested = 0;
                     flash_save_bypass = 0;
                     flash_next_retry_sec = 0;
+                    if (ota_save_this_round)
+                    {
+                        ota_reboot_after_save = 0;
+                        SCB->AIRCR = (0x5FAu << SCB_AIRCR_VECTKEY_Pos) | SCB_AIRCR_SYSRESETREQ_Msk;
+                        for (;;) { __NOP(); }
+                    }
                     if (sys_state.pending_power_cut)
                     {
                         sys_state.power_state = POWER_STATE_PROTECTION_LATCHED;
@@ -1248,6 +1267,10 @@ static void Flash_FillRecordFromState(flash_persistent_data_t *rec, uint16_t seq
     rec->last_reset_seq = (uint8_t)(flash_sequence & 0xFFu);  /* Save-time sequence context (diagnostic only). */
     rec->cumulative_runtime_sec = state.cumulative_runtime_sec;
     rec->charging_time_sec = state.charging_time_sec;
+    /* Bootloader OTA byte at 0x08003C64: 0 = run app, 0x7F = enter OTA (set when factory test 0xFC = 0x7F) */
+    rec->bootloader_ota_flag = (flash_ota_flag_next_save == 0x7Fu) ? 0x7Fu : 0u;
+    if (flash_ota_flag_next_save == 0x7Fu)
+        flash_ota_flag_next_save = 0;
 
     rec->crc32 = Flash_ComputeCrc32(((const uint8_t *)rec) + FLASH_CRC_START_OFFSET, FLASH_CRC_SIZE);
 }
