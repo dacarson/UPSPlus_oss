@@ -42,7 +42,7 @@ void CheckPowerOnConditions(void);
 /* Raw ADC buffer; DMA fills, main loop processes into state */
 __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
 
-/* Timing/button helpers (TIM1/EXTI). Authoritative state is state/sys_state only;
+/* Timing/button helpers (canonical 10 ms tick/EXTI). Authoritative state is state/sys_state only;
  * no shadow globals (uXXXVolt, counters, mode flags) remain as authoritative. */
 __IO uint8_t sKeyFlag = 0;         /* Button activity (EXTI edge) */
 __IO uint16_t sIPIdleTicks = 0;
@@ -80,14 +80,14 @@ volatile uint8_t active_reg_image = 0;
 volatile uint8_t adc_ready = 0;
 volatile uint32_t adc_sample_seq = 0;
 
-/* Canonical scheduler - TIM1 sets flags only; main loop runs all tasks.
+/* Canonical scheduler - canonical 10 ms tick (generated from SysTick) sets flags only; main loop runs all tasks.
  * Flag race: small chance of losing an event if ISR sets a flag between main's check and clear.
  * For coarse 100ms/500ms tasks usually acceptable; for never-miss semantics consider
  * counters (increment in ISR) or copy+clear in one short critical section in main. */
 static scheduler_flags_t sched_flags;
 /* Main loop derives tick_1s from tick_100ms (10 pulses = 1s) */
 static uint8_t tick_100ms_count = 0;
-/* Downcounters for 100ms/500ms flags (avoid modulo in ISR) */
+/* Downcounters for 100ms/500ms flags (avoid modulo in ISR). ISR-only: do not modify from main. */
 static uint8_t ticks_until_100ms = TICKS_PER_100MS;
 static uint8_t ticks_until_500ms = TICKS_PER_500MS;
 
@@ -465,7 +465,7 @@ static void UpdateDerivedState(void)
 
 void Snapshot_Update(void)
 {
-    state.snapshot_tick = sched_flags.tick_counter;  /* canonical TIM1 tick */
+    state.snapshot_tick = sched_flags.tick_counter;  /* canonical 10 ms tick */
     uint8_t inactive = (uint8_t)(1u - active_reg_image);
     StateToRegisterBuffer(&state, &sys_state, reg_image[inactive]);
     active_reg_image = inactive;
@@ -862,7 +862,7 @@ int main(void)
 
     while (1)
     {
-        /* Canonical scheduler - run tasks from TIM1 flags, then clear flags */
+        /* Canonical scheduler - run tasks from scheduler flags, then clear flags */
         if (sched_flags.tick_10ms)
         {
             Scheduler_Tick10ms();
@@ -1844,24 +1844,21 @@ void DMA1_CH1_IRQHandler(void)
     }
 }
 
-/* TIM1 ISR is flag-only. All timing logic runs in main loop. */
-void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
+/* Scheduler 10 ms tick: flag-only work, called from SysTick every 10th tick.
+ * On Cortex-M0, aligned 32-bit write to tick_counter is atomic; main reads it for deltas. */
+void Scheduler_ISR_Tick10ms(void)
 {
-    if (LL_TIM_IsActiveFlag_UPDATE(TIM1) == 1)
+    sched_flags.tick_counter++;
+    sched_flags.tick_10ms = 1;
+    if (--ticks_until_100ms == 0u)
     {
-        LL_TIM_ClearFlag_UPDATE(TIM1);
-        sched_flags.tick_counter++;
-        sched_flags.tick_10ms = 1;
-        if (--ticks_until_100ms == 0u)
-        {
-            ticks_until_100ms = TICKS_PER_100MS;
-            sched_flags.tick_100ms = 1;
-        }
-        if (--ticks_until_500ms == 0u)
-        {
-            ticks_until_500ms = TICKS_PER_500MS;
-            sched_flags.tick_500ms = 1;
-        }
+        ticks_until_100ms = TICKS_PER_100MS;
+        sched_flags.tick_100ms = 1;
+    }
+    if (--ticks_until_500ms == 0u)
+    {
+        ticks_until_500ms = TICKS_PER_500MS;
+        sched_flags.tick_500ms = 1;
     }
 }
 
@@ -2376,21 +2373,6 @@ static void MX_ADC_Init(void)
     };
     LL_ADC_Enable(ADC1);
     LL_ADC_REG_StartConversion(ADC1);
-
-    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_TIM1);
-
-    LL_TIM_SetPrescaler(TIM1, __LL_TIM_CALC_PSC(SystemCoreClock, 10000));
-    /* Set the frequency to 100 Hz. */
-    LL_TIM_SetAutoReload(
-        TIM1, __LL_TIM_CALC_ARR(SystemCoreClock, LL_TIM_GetPrescaler(TIM1), 100));
-    LL_TIM_EnableIT_UPDATE(TIM1);
-
-    NVIC_SetPriority(TIM1_BRK_UP_TRG_COM_IRQn, 0);
-    NVIC_EnableIRQ(TIM1_BRK_UP_TRG_COM_IRQn);
-
-    LL_TIM_EnableCounter(TIM1);
-
-    LL_TIM_GenerateEvent_UPDATE(TIM1);
 }
 
 /**
