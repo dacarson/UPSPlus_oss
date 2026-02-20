@@ -599,6 +599,9 @@ typedef struct {
     volatile uint32_t tick_counter; /* Free-running 10ms counter (monotonic, never cleared) */
 } scheduler_flags_t;
 
+/** Called from SysTick every 10 ms (flag-only; do not add heavy logic). Declared here for stm32f0xx_it.c. */
+void Scheduler_ISR_Tick10ms(void);
+
 /*===========================================================================*/
 /*                         I2C PENDING WRITE STRUCTURE                        */
 /*===========================================================================*/

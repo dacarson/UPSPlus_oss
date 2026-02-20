@@ -63,6 +63,14 @@ This plan moves the canonical 10 ms scheduler tick from TIM1 to SysTick to reduc
    - **Correctness:** After Phase 3, TIM1 must **never** generate an interrupt: counter off, update IT off, NVIC off. The vector will point to `Default_Handler`, which is an infinite loop—so TIM1 must not fire.
    - Verify behavior (10 ms / 100 ms / 500 ms / 1 s, LED, ADC, countdowns, button debounce, I2C timing if applicable). Then proceed to Phase 3 to delete TIM1 code.
 
+### Phase 2 Results (completed)
+
+- **`Scheduler_ISR_Tick10ms()`** implemented in `main.c` (flag-only: tick_counter, tick_10ms, downcounters for tick_100ms/tick_500ms). Declared in `Inc/ups_state.h`; `Src/stm32f0xx_it.c` includes `ups_state.h` and calls it from `SysTick_Handler`.
+- **SysTick_Handler** (`Src/stm32f0xx_it.c`): static 0..9 divider; every 10th tick calls `Scheduler_ISR_Tick10ms()`. SysTick left at 1 ms; no `LL_IncTick()`.
+- **TIM1 never enabled in Phase 2:** TIM1 init block keeps clock + prescaler + ARR only; no `LL_TIM_EnableIT_UPDATE`, no `NVIC_EnableIRQ(TIM1_...)`, no `LL_TIM_EnableCounter`, no `LL_TIM_GenerateEvent_UPDATE`. Defensive disable/clear block runs once after config: `LL_TIM_DisableCounter`, `LL_TIM_DisableIT_UPDATE`, `LL_TIM_ClearFlag_UPDATE`, `NVIC_DisableIRQ(TIM1_BRK_UP_TRG_COM_IRQn)`, `NVIC_ClearPendingIRQ(TIM1_BRK_UP_TRG_COM_IRQn)`.
+- **TIM1_BRK_UP_TRG_COM_IRQHandler** left in `main.c` (dead code until Phase 3 removal). Only SysTick drives scheduler flags.
+- **Comments added:** downcounters marked ISR-only; `Scheduler_ISR_Tick10ms()` documents Cortex-M0 atomic 32-bit tick_counter. Main loop and `LL_mDelay()` unchanged.
+
 ---
 
 ## Phase 3: Remove TIM1 from Scheduler
@@ -106,7 +114,7 @@ This plan moves the canonical 10 ms scheduler tick from TIM1 to SysTick to reduc
 ## Summary Checklist
 
 - [x] Phase 1: Baseline flash recorded; real `SysTick_Handler` location noted.
-- [ ] Phase 2: `Scheduler_ISR_Tick10ms()` in `SysTick_Handler` via 0..9 counter; TIM1 counter, update IT, and NVIC disabled; behavior verified.
+- [x] Phase 2: `Scheduler_ISR_Tick10ms()` in `SysTick_Handler` via 0..9 counter; TIM1 never enabled, defensive disable/clear; behavior verified.
 - [ ] Phase 3: TIM1 init (search `PERIPH_TIM1`) and TIM1 ISR removed; flash saving confirmed; LL TIM retained for TIM3.
 - [ ] Phase 4: Behavior spec and code comments updated to “canonical 10 ms tick” / timebase-agnostic wording.
 
