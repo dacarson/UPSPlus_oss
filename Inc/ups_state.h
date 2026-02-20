@@ -12,7 +12,7 @@
  * Core Principles:
  * 1. Single Source of Truth: One authoritative state structure
  * 2. Explicit State Machine: All behavior driven by documented state transitions
- * 3. Canonical Scheduler: TIM1 10ms interrupt serves as single timebase
+ * 3. Canonical Scheduler: 10 ms tick (derived from SysTick) serves as single timebase
  * 4. ISR Safety: No flash writes in ISRs; minimal work in ISRs
  * 5. Data Coherence: Multi-byte registers read from single atomic snapshot
  *
@@ -135,10 +135,10 @@ extern "C" {
 
 
 /* Timing Constants (in 10ms ticks unless otherwise noted)
- * Canonical scheduler: TIM1 tick period is fixed at 10ms (see Core Principles). Do not change
- * TIM1 period without updating TICK_PERIOD_MS and all derived constants. All other "10ms tick"
+ * Canonical scheduler: 10 ms tick period is fixed (see Core Principles). Do not change
+ * the scheduler tick period without updating TICK_PERIOD_MS and all derived constants. All other "10ms tick"
  * comments in this file refer to this definition. */
-#define TICK_PERIOD_MS                10      /* TIM1 tick period in milliseconds */
+#define TICK_PERIOD_MS                10      /* canonical 10 ms tick period in milliseconds */
 /* Derived tick constants - self-consistent with TICK_PERIOD_MS */
 #define TICKS_PER_100MS               (100 / TICK_PERIOD_MS)      /* Ticks per 100ms */
 #define TICKS_PER_500MS               (500 / TICK_PERIOD_MS)      /* Ticks per 500ms (ADC trigger) */
@@ -342,7 +342,7 @@ typedef struct {
     charger_state_t charger_state;
     learning_mode_t learning_mode;     /* Derived from charger_state; never set directly */
     
-    /* State timing (in TIM1 ticks). Invariant: set on every transition into that state (including restart start, charger PRESENT/ABSENT, power RPI_ON/RPI_OFF). */
+    /* State timing (in canonical 10 ms ticks). Invariant: set on every transition into that state (including restart start, charger PRESENT/ABSENT, power RPI_ON/RPI_OFF). */
     uint32_t power_state_entry_ticks;
     uint32_t charger_state_entry_ticks;
     
@@ -383,7 +383,7 @@ typedef struct {
  */
 typedef struct {
     button_state_t state;
-    uint32_t press_start_tick;         /* TIM1 tick when press first detected */
+    uint32_t press_start_tick;         /* canonical 10 ms tick when press first detected */
     uint16_t hold_ticks;                /* Duration held (increments while button pressed).
                                          * Saturates at >BUTTON_LONG_PRESS_TICKS to avoid re-fire. */
     uint8_t long_press_fired;           /* Flag: 1 = long press action already triggered (one-shot guarantee) */
@@ -468,7 +468,7 @@ typedef struct {
     uint16_t version;                  /* 0x28-0x29: Firmware version */
     
     /* Snapshot timing */
-    uint32_t snapshot_tick;            /* TIM1 tick when snapshot was taken */
+    uint32_t snapshot_tick;            /* canonical 10 ms tick when snapshot was taken */
     uint32_t last_true_vbat_sample_tick; /* Tick when last true-VBAT was captured.
                                            * Must remain uint32_t; do not reintroduce 8-bit tick fields for staleness. */
     uint16_t last_true_vbat_mv;        /* Cached true-VBAT (charger not influencing) for percent calc. */
@@ -585,9 +585,9 @@ STATIC_ASSERT(sizeof(flash_persistent_data_t) <= FLASH_PAGE_SIZE,
 /*===========================================================================*/
 
 /**
- * @brief Scheduler Flags - Set by TIM1 ISR, cleared by main loop (canonical scheduler)
+ * @brief Scheduler Flags - Set by canonical 10 ms tick (generated from SysTick), cleared by main loop (canonical scheduler)
  *
- * TIM1 ISR sets tick_10ms every 10ms, tick_100ms every 100ms, tick_500ms every 500ms.
+ * Canonical 10 ms tick sets tick_10ms every 10ms, tick_100ms every 100ms, tick_500ms every 500ms.
  * Main loop derives tick_1s from tick_100ms (10 pulses = 1 second) and clears all flags after processing.
  * tick_counter is monotonic (never cleared); use it for precise timing deltas when needed.
  */
@@ -866,9 +866,9 @@ void Charger_UpdatePhysicalPresence(const authoritative_state_t *state,
 uint8_t Charger_IsInfluencingVBAT(const system_state_t *state);
 /* Returns 1 if charger_state == CHARGER_STATE_PRESENT, 0 otherwise */
 
-/* True-VBAT freshness check - uses TIM1 ticks (10ms resolution) */
+/* True-VBAT freshness check - uses canonical 10 ms tick (10ms resolution) */
 /* Contract: Compares now_ticks against last_true_vbat_sample_tick and TRUE_VBAT_MAX_AGE_TICKS.
- * MUST NOT use SysTick milliseconds.
+ * MUST use canonical 10 ms tick for freshness; MUST NOT use SysTick milliseconds.
  * Wraparound: (now_ticks - last_true_vbat_sample_tick) MUST be computed as unsigned (uint32_t)
  * so that modulo-2^32 subtraction yields correct age when tick_counter has wrapped. */
 uint8_t IsTrueVbatSampleFresh(uint32_t now_ticks, uint32_t last_true_vbat_sample_tick);

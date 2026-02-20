@@ -35,7 +35,7 @@ It is intended as the source of truth for feature development and future changes
 
 ## 3. Timing Model
 
-- Canonical scheduler tick: **10ms** (TIM1 ISR sets flags only).
+- Canonical scheduler tick: **10ms** (derived from SysTick; ISR sets flags only).
 - Derived tick rates:  
   - 100ms heartbeat  
   - 500ms ADC trigger  
@@ -558,6 +558,7 @@ To boot the application after OTA programming:
 
 ## 16. Change Impact Map
 
+- If the scheduler timebase (10 ms) source changes (e.g. SysTick vs TIM), update Section 3 and all comments referring to the interrupt source.
 - If ADC cadence changes, revisit: charger stability counters, protection sample count, window duration.
 - If register map changes, revisit: Factory Testing ABI, test scripts, and external tools.
 - If snapshot frequency changes, revisit: I2C coherence assumptions and staleness guarantees.

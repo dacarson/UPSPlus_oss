@@ -104,7 +104,7 @@ This plan moves the canonical 10 ms scheduler tick from TIM1 to SysTick to reduc
 
 ---
 
-## Phase 4: Update Documentation and Spec
+## Phase 4: Update Documentation and Spec (completed)
 
 **Goal:** Keep the behavior spec and code comments accurate and timebase-agnostic.
 
@@ -120,6 +120,12 @@ This plan moves the canonical 10 ms scheduler tick from TIM1 to SysTick to reduc
 3. **Change impact**
    - In the spec’s Change Impact Map (Section 16), add: “If the scheduler timebase (10 ms) source changes (e.g. SysTick vs TIM), update Section 3 and all comments referring to the interrupt source.”
 
+### Phase 4 Results (completed)
+
+- **Behavior spec** (`documents/UPSPlus_Behavior_Spec.md`): Section 3 (Timing Model) updated to "canonical 10 ms tick generated from SysTick sets flags only"; Section 16 (Change Impact Map) updated with scheduler timebase change-impact bullet.
+- **main.c**: Comments updated—timing/button helpers, canonical scheduler (two places), snapshot_tick, and "run tasks from scheduler flags."
+- **Inc/ups_state.h**: Core Principles (canonical 10 ms tick from SysTick); TICK_PERIOD_MS block and define comment; state timing, press_start_tick, snapshot_tick (canonical 10 ms tick); scheduler_flags_t doc (canonical 10 ms tick); IsTrueVbatSampleFresh doc (canonical 10 ms tick, MUST use for freshness).
+
 ---
 
 ## Summary Checklist
@@ -127,7 +133,7 @@ This plan moves the canonical 10 ms scheduler tick from TIM1 to SysTick to reduc
 - [x] Phase 1: Baseline flash recorded; real `SysTick_Handler` location noted.
 - [x] Phase 2: `Scheduler_ISR_Tick10ms()` in `SysTick_Handler` via 0..9 counter; TIM1 never enabled, defensive disable/clear; behavior verified.
 - [x] Phase 3: TIM1 init (search `PERIPH_TIM1`) and TIM1 ISR removed; flash saving confirmed; LL TIM retained for TIM3.
-- [ ] Phase 4: Behavior spec and code comments updated to “canonical 10 ms tick” / timebase-agnostic wording.
+- [x] Phase 4: Behavior spec and code comments updated to “canonical 10 ms tick” / timebase-agnostic wording.
 
 ---
 

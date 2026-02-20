@@ -42,7 +42,7 @@ void CheckPowerOnConditions(void);
 /* Raw ADC buffer; DMA fills, main loop processes into state */
 __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
 
-/* Timing/button helpers (TIM1/EXTI). Authoritative state is state/sys_state only;
+/* Timing/button helpers (canonical 10 ms tick/EXTI). Authoritative state is state/sys_state only;
  * no shadow globals (uXXXVolt, counters, mode flags) remain as authoritative. */
 __IO uint8_t sKeyFlag = 0;         /* Button activity (EXTI edge) */
 __IO uint16_t sIPIdleTicks = 0;
@@ -80,7 +80,7 @@ volatile uint8_t active_reg_image = 0;
 volatile uint8_t adc_ready = 0;
 volatile uint32_t adc_sample_seq = 0;
 
-/* Canonical scheduler - TIM1 sets flags only; main loop runs all tasks.
+/* Canonical scheduler - canonical 10 ms tick (generated from SysTick) sets flags only; main loop runs all tasks.
  * Flag race: small chance of losing an event if ISR sets a flag between main's check and clear.
  * For coarse 100ms/500ms tasks usually acceptable; for never-miss semantics consider
  * counters (increment in ISR) or copy+clear in one short critical section in main. */
@@ -465,7 +465,7 @@ static void UpdateDerivedState(void)
 
 void Snapshot_Update(void)
 {
-    state.snapshot_tick = sched_flags.tick_counter;  /* canonical TIM1 tick */
+    state.snapshot_tick = sched_flags.tick_counter;  /* canonical 10 ms tick */
     uint8_t inactive = (uint8_t)(1u - active_reg_image);
     StateToRegisterBuffer(&state, &sys_state, reg_image[inactive]);
     active_reg_image = inactive;
@@ -862,7 +862,7 @@ int main(void)
 
     while (1)
     {
-        /* Canonical scheduler - run tasks from TIM1 flags, then clear flags */
+        /* Canonical scheduler - run tasks from scheduler flags, then clear flags */
         if (sched_flags.tick_10ms)
         {
             Scheduler_Tick10ms();
