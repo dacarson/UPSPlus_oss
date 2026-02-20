@@ -722,7 +722,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.version = 24;
+    state.version = 25;
     state.snapshot_tick = 0;
     state.last_true_vbat_sample_tick = 0;
     state.last_true_vbat_mv = 0;
