@@ -21,6 +21,17 @@ This plan moves the canonical 10 ms scheduler tick from TIM1 to SysTick to reduc
    - `LL_Init1msTick(48000000)` and `LL_SYSTICK_EnableIT()` are already called in `SystemClock_Config()` in `main.c`. SysTick stays at 1 ms; the 10 ms scheduler will run every 10th tick. No code changes in this phase.
    - **Note:** In this project's STM32F0 LL driver, `LL_mDelay()` uses the **hardware** SysTick COUNTFLAG (`SysTick->CTRL`), not a software tick. It does not require `LL_IncTick()` or any code in `SysTick_Handler` to run. The current empty `SysTick_Handler` is therefore correct for `LL_mDelay()`.
 
+### Phase 1 Results (completed)
+
+- **Baseline flash (Release, from `Release/UPSPlus_oss.map`):**
+  - `.text`: 0x31a0 (12,640 bytes)
+  - Total program flash (load end): ~0x32c8 (12,968 bytes) from FLASH origin 0x08000800
+  - **TIM1 (for later comparison):** `TIM1_BRK_UP_TRG_COM_IRQHandler` at 0x0800199c; `SysTick_Handler` at 0x08001a8c
+- **Real `SysTick_Handler`:**
+  - **Definition:** `Src/stm32f0xx_it.c` at **line 139** (the body is empty; USER CODE blocks only). This is the file to modify in Phase 2.
+  - Declaration: `Inc/stm32f0xx_it.h` line 54. Startup `Startup/startup_stm32f030f4px.s` has weak `SysTick_Handler` → `Default_Handler`; the strong symbol in `stm32f0xx_it.c` overrides it.
+- **SysTick enabled:** Confirmed in `main.c`: `LL_Init1msTick(48000000)` and `LL_SYSTICK_EnableIT()` are called in `SystemClock_Config()` at lines 1506–1507. No code changes in Phase 1.
+
 ---
 
 ## Phase 2: Move Scheduler Logic to SysTick and Disable TIM1
@@ -94,7 +105,7 @@ This plan moves the canonical 10 ms scheduler tick from TIM1 to SysTick to reduc
 
 ## Summary Checklist
 
-- [ ] Phase 1: Baseline flash recorded; real `SysTick_Handler` location noted.
+- [x] Phase 1: Baseline flash recorded; real `SysTick_Handler` location noted.
 - [ ] Phase 2: `Scheduler_ISR_Tick10ms()` in `SysTick_Handler` via 0..9 counter; TIM1 counter, update IT, and NVIC disabled; behavior verified.
 - [ ] Phase 3: TIM1 init (search `PERIPH_TIM1`) and TIM1 ISR removed; flash saving confirmed; LL TIM retained for TIM3.
 - [ ] Phase 4: Behavior spec and code comments updated to “canonical 10 ms tick” / timebase-agnostic wording.
