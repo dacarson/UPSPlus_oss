@@ -80,8 +80,9 @@ void NMI_Handler(void)
 
 /**
   * @brief This function handles Hard fault interrupt.
-  * Fail-safe: drive MT_EN/IP_EN low (RPi off, charger off), PWR_EN high,
-  * then request system reset. Direct register writes only; no HAL/LL calls.
+  * Fail-safe: drive IP_EN LOW (charger path off), keep PWR_EN HIGH (MCU hold-up).
+  * MT_EN is left unchanged to avoid unnecessarily power-cycling the Pi.
+  * Then request system reset. Direct register writes only; no HAL/LL calls.
   */
 void HardFault_Handler(void)
 {
@@ -94,14 +95,14 @@ void HardFault_Handler(void)
   __DSB();
   __ISB();
 
-  /* PA5/PA6/PA7: output, push-pull, low speed, no pull. */
-  GPIOA->MODER   = (GPIOA->MODER   & ~(0x3FU << 10)) | (0x15U << 10);
-  GPIOA->OTYPER  = GPIOA->OTYPER  & ~0xE0U;
-  GPIOA->OSPEEDR = GPIOA->OSPEEDR & ~(0x3FU << 10);
-  GPIOA->PUPDR   = GPIOA->PUPDR   & ~(0x3FU << 10);
+  /* PA5 (IP_EN) and PA7 (PWR_EN): output, push-pull, low speed, no pull. Leave PA6 (MT_EN) unchanged. */
+  GPIOA->MODER   = (GPIOA->MODER   & ~((0x3U << 10) | (0x3U << 14))) | (0x1U << 10) | (0x1U << 14);
+  GPIOA->OTYPER  = GPIOA->OTYPER  & ~((1U << 5) | (1U << 7));
+  GPIOA->OSPEEDR = (GPIOA->OSPEEDR & ~((0x3U << 10) | (0x3U << 14)));
+  GPIOA->PUPDR   = (GPIOA->PUPDR   & ~((0x3U << 10) | (0x3U << 14)));
 
-  /* Safe outputs: MT_EN LOW, IP_EN LOW, PWR_EN HIGH. BSRR: bits 0–15 set (high), 16–31 reset (low). */
-  GPIOA->BSRR = (1u << 21) | (1u << 22) | (1u << 7);
+  /* IP_EN LOW, PWR_EN HIGH. Do not drive MT_EN (leave unchanged). BSRR: 0–15 set, 16–31 reset. */
+  GPIOA->BSRR = (1u << 21) | (1u << 7);
 
   /* Request system reset; then NOP forever if reset is delayed. */
   SCB->AIRCR = (0x5FAu << SCB_AIRCR_VECTKEY_Pos) | SCB_AIRCR_SYSRESETREQ_Msk;

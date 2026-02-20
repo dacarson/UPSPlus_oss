@@ -346,7 +346,7 @@ Key behaviors:
 ## 10. Reliability and Fail-Safe Behavior
 
 - **Independent Watchdog (IWDG):** Timeout ~8 s (LSI-based). Refreshed **once per main-loop iteration**, after critical work (scheduler, I2C processing, INA probe, flash save, protection/GPIO). **Never** refreshed in ISRs (e.g. I2C ISR); a main-loop hang or I2C deadlock cannot keep the watchdog alive. If the main loop does not complete within the timeout, the device resets.
-- **HardFault safe state:** On HardFault the handler drives **MT_EN LOW** (RPi power off), **IP_EN LOW** (charger path off), **PWR_EN HIGH** (MCU hold-up), then triggers a system reset. This ensures safe outputs before reset regardless of fault cause.
+- **HardFault safe state (prioritize Pi uptime):** On HardFault the handler drives **IP_EN LOW** (charger path off) and keeps **PWR_EN HIGH** (MCU hold-up), but it **does not force MT_EN LOW**. MT_EN is left unchanged to avoid unnecessarily power-cycling the Raspberry Pi if it is otherwise running normally. The handler then triggers an immediate system reset. Note: if the application’s protection logic later determines the battery is below the protection threshold, it will still perform the normal shutdown sequence (attempt flash save, then cut MT_EN).
 - **Reset cause:** Captured from RCC at boot (before clear). Persisted in flash and exported via I2C: **factory test selector 0x08** = this boot’s raw reset flags and CSR high bits; **selector 0x09** = last persisted reset cause and sequence from flash. Encoding is raw RCC_CSR bits; client interprets (e.g. IWDGRSTF, PINRSTF, PORRSTF).
 
 ---
