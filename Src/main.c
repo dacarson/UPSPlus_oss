@@ -278,6 +278,18 @@ uint8_t GetPowerStatusRegisterValue(const authoritative_state_t *auth_state, con
     return value;
 }
 
+/* Little-endian store helpers to shrink StateToRegisterBuffer code. */
+static inline void StoreU16LE(uint8_t *buf, uint8_t off, uint16_t v) {
+    buf[off]     = (uint8_t)(v & 0xFFu);
+    buf[off + 1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+static inline void StoreU32LE(uint8_t *buf, uint8_t off, uint32_t v) {
+    buf[off]     = (uint8_t)(v & 0xFFu);
+    buf[off + 1] = (uint8_t)((v >> 8) & 0xFFu);
+    buf[off + 2] = (uint8_t)((v >> 16) & 0xFFu);
+    buf[off + 3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
 /**
  * Fill 256-byte register image from authoritative state + system state (for 0x17).
  * Little-endian multi-byte registers; reserved/factory regions filled with 0x00.
@@ -285,8 +297,6 @@ uint8_t GetPowerStatusRegisterValue(const authoritative_state_t *auth_state, con
 static void StateToRegisterBuffer(const authoritative_state_t *auth, const system_state_t *sys,
                                   uint8_t *buf)
 {
-    uint16_t u16;
-    uint32_t u32;
     uint16_t i;
     /* Snapshot local copies for debug/diagnostic pages (main-loop owned state). */
     const button_handler_t button_snapshot = button_handler;
@@ -294,76 +304,40 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
     const window_manager_state_t window_snapshot = window_mgr;
     const protection_state_t protection_snapshot = prot_state;
 
-    buf[REG_MCU_VOLTAGE_L]       = (uint8_t)(auth->mcu_voltage_mv & 0xFFu);
-    buf[REG_MCU_VOLTAGE_H]       = (uint8_t)((auth->mcu_voltage_mv >> 8) & 0xFFu);
-    buf[REG_POGOPIN_VOLTAGE_L]   = (uint8_t)(auth->pogopin_voltage_mv & 0xFFu);
-    buf[REG_POGOPIN_VOLTAGE_H]   = (uint8_t)((auth->pogopin_voltage_mv >> 8) & 0xFFu);
-    buf[REG_BATTERY_VOLTAGE_L]   = (uint8_t)(auth->battery_voltage_mv & 0xFFu);
-    buf[REG_BATTERY_VOLTAGE_H]   = (uint8_t)((auth->battery_voltage_mv >> 8) & 0xFFu);
-    buf[REG_USBC_VOLTAGE_L]      = (uint8_t)(auth->usbc_voltage_mv & 0xFFu);
-    buf[REG_USBC_VOLTAGE_H]      = (uint8_t)((auth->usbc_voltage_mv >> 8) & 0xFFu);
-    buf[REG_MICROUSB_VOLTAGE_L]  = (uint8_t)(auth->microusb_voltage_mv & 0xFFu);
-    buf[REG_MICROUSB_VOLTAGE_H]  = (uint8_t)((auth->microusb_voltage_mv >> 8) & 0xFFu);
-    buf[REG_TEMPERATURE_L]       = (uint8_t)(auth->temperature_raw & 0xFFu);
-    buf[REG_TEMPERATURE_H]       = (uint8_t)((auth->temperature_raw >> 8) & 0xFFu);
-    buf[REG_FULL_VOLTAGE_L]      = (uint8_t)(auth->full_voltage_mv & 0xFFu);
-    buf[REG_FULL_VOLTAGE_H]      = (uint8_t)((auth->full_voltage_mv >> 8) & 0xFFu);
-    buf[REG_EMPTY_VOLTAGE_L]     = (uint8_t)(auth->empty_voltage_mv & 0xFFu);
-    buf[REG_EMPTY_VOLTAGE_H]     = (uint8_t)((auth->empty_voltage_mv >> 8) & 0xFFu);
-    buf[REG_PROTECT_VOLTAGE_L]   = (uint8_t)(auth->protection_voltage_mv & 0xFFu);
-    buf[REG_PROTECT_VOLTAGE_H]   = (uint8_t)((auth->protection_voltage_mv >> 8) & 0xFFu);
+    StoreU16LE(buf, REG_MCU_VOLTAGE_L, auth->mcu_voltage_mv);
+    StoreU16LE(buf, REG_POGOPIN_VOLTAGE_L, auth->pogopin_voltage_mv);
+    StoreU16LE(buf, REG_BATTERY_VOLTAGE_L, auth->battery_voltage_mv);
+    StoreU16LE(buf, REG_USBC_VOLTAGE_L, auth->usbc_voltage_mv);
+    StoreU16LE(buf, REG_MICROUSB_VOLTAGE_L, auth->microusb_voltage_mv);
+    StoreU16LE(buf, REG_TEMPERATURE_L, auth->temperature_raw);
+    StoreU16LE(buf, REG_FULL_VOLTAGE_L, auth->full_voltage_mv);
+    StoreU16LE(buf, REG_EMPTY_VOLTAGE_L, auth->empty_voltage_mv);
+    StoreU16LE(buf, REG_PROTECT_VOLTAGE_L, auth->protection_voltage_mv);
     buf[REG_BATTERY_PERCENT_L]   = auth->battery_percent;
     buf[REG_BATTERY_PERCENT_H]   = 0x00u;
-    buf[REG_SAMPLE_PERIOD_L]     = (uint8_t)(auth->sample_period_minutes & 0xFFu);
-    buf[REG_SAMPLE_PERIOD_H]     = (uint8_t)((auth->sample_period_minutes >> 8) & 0xFFu);
+    StoreU16LE(buf, REG_SAMPLE_PERIOD_L, auth->sample_period_minutes);
     buf[REG_POWER_STATUS]       = GetPowerStatusRegisterValue(auth, sys);
     buf[REG_SHUTDOWN_COUNTDOWN]  = auth->shutdown_countdown_sec;
     buf[REG_AUTO_POWER_ON]       = auth->auto_power_on;
     buf[REG_RESTART_COUNTDOWN]   = auth->restart_countdown_sec;
     buf[REG_FACTORY_RESET]       = 0x00u; /* RO read; write path handled separately */
-    u32 = auth->cumulative_runtime_sec;
-    buf[REG_RUNTIME_ALL_0]       = (uint8_t)(u32 & 0xFFu);
-    buf[REG_RUNTIME_ALL_1]       = (uint8_t)((u32 >> 8) & 0xFFu);
-    buf[REG_RUNTIME_ALL_2]       = (uint8_t)((u32 >> 16) & 0xFFu);
-    buf[REG_RUNTIME_ALL_3]       = (uint8_t)((u32 >> 24) & 0xFFu);
-    u32 = auth->charging_time_sec;
-    buf[REG_RUNTIME_CHARGING_0]  = (uint8_t)(u32 & 0xFFu);
-    buf[REG_RUNTIME_CHARGING_1]  = (uint8_t)((u32 >> 8) & 0xFFu);
-    buf[REG_RUNTIME_CHARGING_2]  = (uint8_t)((u32 >> 16) & 0xFFu);
-    buf[REG_RUNTIME_CHARGING_3]  = (uint8_t)((u32 >> 24) & 0xFFu);
-    u32 = auth->current_runtime_sec;
-    buf[REG_RUNTIME_CURRENT_0]   = (uint8_t)(u32 & 0xFFu);
-    buf[REG_RUNTIME_CURRENT_1]   = (uint8_t)((u32 >> 8) & 0xFFu);
-    buf[REG_RUNTIME_CURRENT_2]   = (uint8_t)((u32 >> 16) & 0xFFu);
-    buf[REG_RUNTIME_CURRENT_3]   = (uint8_t)((u32 >> 24) & 0xFFu);
-    buf[REG_VERSION_L]           = (uint8_t)(auth->version & 0xFFu);
-    buf[REG_VERSION_H]           = (uint8_t)((auth->version >> 8) & 0xFFu);
+    StoreU32LE(buf, REG_RUNTIME_ALL_0, auth->cumulative_runtime_sec);
+    StoreU32LE(buf, REG_RUNTIME_CHARGING_0, auth->charging_time_sec);
+    StoreU32LE(buf, REG_RUNTIME_CURRENT_0, auth->current_runtime_sec);
+    StoreU16LE(buf, REG_VERSION_L, auth->version);
     buf[REG_BATTERY_SELF_PROG]   = auth->battery_params_self_programmed;
     buf[REG_LOW_BATTERY_PERCENT] = auth->low_battery_percent;
-    u16 = (auth->load_on_delay_remaining_sec != 0u) ? auth->load_on_delay_remaining_sec : auth->load_on_delay_config_sec;
-    buf[REG_LOAD_ON_DELAY_L]     = (uint8_t)(u16 & 0xFFu);
-    buf[REG_LOAD_ON_DELAY_H]     = (uint8_t)((u16 >> 8) & 0xFFu);
-    /* INA219 current registers (cached values + validity). */
-    buf[REG_OUTPUT_CURRENT_L]    = (uint8_t)(auth->output_current_mA & 0xFFu);
-    buf[REG_OUTPUT_CURRENT_H]    = (uint8_t)(((uint16_t)auth->output_current_mA >> 8) & 0xFFu);
-    buf[REG_BATTERY_CURRENT_L]   = (uint8_t)(auth->battery_current_mA & 0xFFu);
-    buf[REG_BATTERY_CURRENT_H]   = (uint8_t)(((uint16_t)auth->battery_current_mA >> 8) & 0xFFu);
+    StoreU16LE(buf, REG_LOAD_ON_DELAY_L,
+               (auth->load_on_delay_remaining_sec != 0u) ? auth->load_on_delay_remaining_sec : auth->load_on_delay_config_sec);
+    StoreU16LE(buf, REG_OUTPUT_CURRENT_L, (uint16_t)auth->output_current_mA);
+    StoreU16LE(buf, REG_BATTERY_CURRENT_L, (uint16_t)auth->battery_current_mA);
     buf[REG_CURRENT_VALID_FLAGS] = (uint8_t)((auth->output_current_valid ? 0x01u : 0x00u) |
                                              (auth->battery_current_valid ? 0x02u : 0x00u));
     for (i = REG_RESERVED_START; i <= REG_RESERVED_END; i++)
         buf[i] = 0x00u;
-    buf[REG_SERIAL_START + 0]  = (uint8_t)(LL_GetUID_Word0() & 0xFFu);
-    buf[REG_SERIAL_START + 1]  = (uint8_t)((LL_GetUID_Word0() >> 8) & 0xFFu);
-    buf[REG_SERIAL_START + 2]  = (uint8_t)((LL_GetUID_Word0() >> 16) & 0xFFu);
-    buf[REG_SERIAL_START + 3]  = (uint8_t)((LL_GetUID_Word0() >> 24) & 0xFFu);
-    buf[REG_SERIAL_START + 4]  = (uint8_t)(LL_GetUID_Word1() & 0xFFu);
-    buf[REG_SERIAL_START + 5]  = (uint8_t)((LL_GetUID_Word1() >> 8) & 0xFFu);
-    buf[REG_SERIAL_START + 6]  = (uint8_t)((LL_GetUID_Word1() >> 16) & 0xFFu);
-    buf[REG_SERIAL_START + 7]  = (uint8_t)((LL_GetUID_Word1() >> 24) & 0xFFu);
-    buf[REG_SERIAL_START + 8]  = (uint8_t)(LL_GetUID_Word2() & 0xFFu);
-    buf[REG_SERIAL_START + 9]  = (uint8_t)((LL_GetUID_Word2() >> 8) & 0xFFu);
-    buf[REG_SERIAL_START + 10] = (uint8_t)((LL_GetUID_Word2() >> 16) & 0xFFu);
-    buf[REG_SERIAL_START + 11] = (uint8_t)((LL_GetUID_Word2() >> 24) & 0xFFu);
+    StoreU32LE(buf, REG_SERIAL_START + 0,  LL_GetUID_Word0());
+    StoreU32LE(buf, REG_SERIAL_START + 4,  LL_GetUID_Word1());
+    StoreU32LE(buf, REG_SERIAL_START + 8, LL_GetUID_Word2());
     for (i = REG_FACTORY_TEST_START; i <= REG_FACTORY_TEST_END; i++)
         buf[i] = 0x00u;
     if (sys->factory_test_selector != 0u) {
