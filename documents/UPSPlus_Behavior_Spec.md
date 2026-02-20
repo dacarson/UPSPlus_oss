@@ -41,6 +41,10 @@ It is intended as the source of truth for feature development and future changes
   - 500ms ADC trigger  
   - 1s counters
 - **Measurement window:** 1.5 seconds (charger-off) for true VBAT sampling.
+  - A measurement window is scheduled **only when the charger is physically present** (charger state `PRESENT`).
+  - Every `sample_period_minutes` (registers `0x15–0x16`), the firmware enters a window where **IP_EN is forced LOW** for **1.5 seconds** (`charger_state = FORCED_OFF_WINDOW`).
+  - The purpose is to sample **true VBAT** without charger influence and refresh `last_true_vbat_*` for percent and power-gating decisions.
+  - Windows are **not** scheduled when the charger is absent.
 - Countdowns and debounce are driven by 10ms ticks, but only advanced in main loop.
 - Snapshot updates are guaranteed at least once every 100ms while the main loop is running.
 
@@ -209,8 +213,9 @@ States:
 Key behaviors:
 - `ABSENT → PRESENT`: post-scaled connector-referenced charger voltage stable above threshold.
 - `PRESENT → ABSENT`: post-scaled connector-referenced charger voltage stable below threshold.
-- `PRESENT → FORCED_OFF_WINDOW`: sample period elapsed (window due).
-- `FORCED_OFF_WINDOW → PRESENT`: window elapsed (1.5s).
+- `PRESENT → FORCED_OFF_WINDOW`: `sample_period_minutes` elapsed **while charger is present** (window due).
+- `FORCED_OFF_WINDOW → PRESENT`: window elapsed (1.5s) and charger still present.
+- `FORCED_OFF_WINDOW → ABSENT`: window elapsed (1.5s) and charger no longer present.
 
 ### 5.3 Calibration Window Flag (`learning_mode_t`)
 - **Legacy name:** `learning_mode_t` is retained for ABI compatibility.
@@ -230,12 +235,17 @@ Key behaviors:
 ## 6. Measurement Window
 
 - Window duration is **1.5 seconds** and is atomic.
+- Window is entered **only when the charger is present** (`charger_state = PRESENT`) and the sample period has elapsed.
+- During the window:
+  - **IP_EN is forced LOW** (charger path disabled).
+  - “Charger influencing VBAT” is treated as **false** for measurement purposes.
 - Window is never interrupted or restarted early.
-- If charger unplugged mid-window, window completes and samples are true VBAT.
+- If the charger is unplugged mid-window:
+  - The window still completes, and VBAT samples taken during the window are considered **true VBAT**.
+  - At window end, the charger state resolves to `ABSENT` if the charger is no longer detected.
 - Window states are represented in Factory Testing selector 0x03.
 - `learning_mode_t` reports **ACTIVE** during the window.
-- Purpose: eliminate charger influence on VBAT measurement and provide a stable
-  condition for ADC calibration.
+- Purpose: eliminate charger influence on VBAT measurement and provide a stable condition for ADC-based calibration and decision-making.
 
 ---
 
@@ -550,7 +560,7 @@ To boot the application after OTA programming:
 
 - **true VBAT**: Battery voltage sampled while charger path is disabled (IP_EN LOW).
 - **charger present**: Physical charger voltage above presence threshold with stability.
-- **charger influencing VBAT**: Charger state is PRESENT at ADC sample time.
+- **charger influencing VBAT**: Charger path enabled (IP_EN HIGH / `charger_state = PRESENT`) at ADC sample time.
 - **calibration window active (legacy field `learning_mode_t`)**: Charger forced off for true VBAT sampling and ADC calibration.
 - **snapshot**: Coherent, double-buffered register image used for I2C reads.
 
