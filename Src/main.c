@@ -1862,27 +1862,6 @@ void Scheduler_ISR_Tick10ms(void)
     }
 }
 
-/* TIM1 ISR is flag-only. All timing logic runs in main loop. (Phase 2: TIM1 disabled; SysTick drives 10 ms.) */
-void TIM1_BRK_UP_TRG_COM_IRQHandler(void)
-{
-    if (LL_TIM_IsActiveFlag_UPDATE(TIM1) == 1)
-    {
-        LL_TIM_ClearFlag_UPDATE(TIM1);
-        sched_flags.tick_counter++;
-        sched_flags.tick_10ms = 1;
-        if (--ticks_until_100ms == 0u)
-        {
-            ticks_until_100ms = TICKS_PER_100MS;
-            sched_flags.tick_100ms = 1;
-        }
-        if (--ticks_until_500ms == 0u)
-        {
-            ticks_until_500ms = TICKS_PER_500MS;
-            sched_flags.tick_500ms = 1;
-        }
-    }
-}
-
 /* Scheduler uses explicit state machine (power, charger, protection). */
 #define SAMPLE_PERIOD_TICKS_PER_MIN  ((uint32_t)(60u * TICKS_PER_1S))
 
@@ -2394,20 +2373,6 @@ static void MX_ADC_Init(void)
     };
     LL_ADC_Enable(ADC1);
     LL_ADC_REG_StartConversion(ADC1);
-
-    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_TIM1);
-
-    LL_TIM_SetPrescaler(TIM1, __LL_TIM_CALC_PSC(SystemCoreClock, 10000));
-    /* Set the frequency to 100 Hz. Phase 2: do not enable counter or update IT/NVIC; SysTick drives 10 ms. Phase 3 removes this block. */
-    LL_TIM_SetAutoReload(
-        TIM1, __LL_TIM_CALC_ARR(SystemCoreClock, LL_TIM_GetPrescaler(TIM1), 100));
-    /* TIM1 counter and interrupt left off; only SysTick runs the scheduler. */
-    /* Belt-and-suspenders: ensure TIM1 never fires (e.g. if init order changes later). */
-    LL_TIM_DisableCounter(TIM1);
-    LL_TIM_DisableIT_UPDATE(TIM1);
-    LL_TIM_ClearFlag_UPDATE(TIM1);
-    NVIC_DisableIRQ(TIM1_BRK_UP_TRG_COM_IRQn);
-    NVIC_ClearPendingIRQ(TIM1_BRK_UP_TRG_COM_IRQn);
 }
 
 /**

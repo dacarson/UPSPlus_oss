@@ -91,6 +91,17 @@ This plan moves the canonical 10 ms scheduler tick from TIM1 to SysTick to reduc
    - Build Release again; confirm no link errors and that TIM1 is no longer referenced for the scheduler.
    - Record new flash usage; compare to Phase 1 baseline. Savings = TIM1 init/config, NVIC for TIM1, TIM1 ISR, and TIM1-specific LL calls only (~80–150 bytes typical).
 
+### Phase 3 Results (completed)
+
+- **TIM1 initialization removed** from `main.c`: PERIPH_TIM1 clock enable, prescaler, auto-reload, and defensive disable/clear block deleted from the ADC/TIM init function.
+- **TIM1 ISR removed:** `TIM1_BRK_UP_TRG_COM_IRQHandler` deleted from `main.c`.
+- **TIM1 handler declaration removed** from `Inc/stm32f0xx_it.h`; vector in startup still points to weak `Default_Handler`.
+- **Scheduler_ISR_Tick10ms()** is only called from `SysTick_Handler` in `stm32f0xx_it.c` (confirmed). LL TIM retained for TIM3 (I2C_Slave, main.c microsecond timing).
+- **Flash (from `Release/UPSPlus_oss.map` after user build):**
+  - `.text`: 0x3114 (12,564 bytes). Phase 1 baseline was 0x31a0 (12,640 bytes) → **saving 76 bytes** in code.
+  - Program load end: _sidata + .data = 0x080039dc + 0x58 → 0x08003a34; size from FLASH origin 0x08000800 = 0x3234 (12,852 bytes). Phase 1 baseline ~0x32c8 (12,968 bytes) → **saving ~116 bytes** total program flash.
+- **Symbols:** `TIM1_BRK_UP_TRG_COM_IRQHandler` at 0x08003940 = `Default_Handler` (weak, from startup); no custom TIM1 handler. `SysTick_Handler` at 0x08001a30; `Scheduler_ISR_Tick10ms` from main.o (called only from SysTick).
+
 ---
 
 ## Phase 4: Update Documentation and Spec
@@ -115,7 +126,7 @@ This plan moves the canonical 10 ms scheduler tick from TIM1 to SysTick to reduc
 
 - [x] Phase 1: Baseline flash recorded; real `SysTick_Handler` location noted.
 - [x] Phase 2: `Scheduler_ISR_Tick10ms()` in `SysTick_Handler` via 0..9 counter; TIM1 never enabled, defensive disable/clear; behavior verified.
-- [ ] Phase 3: TIM1 init (search `PERIPH_TIM1`) and TIM1 ISR removed; flash saving confirmed; LL TIM retained for TIM3.
+- [x] Phase 3: TIM1 init (search `PERIPH_TIM1`) and TIM1 ISR removed; flash saving confirmed; LL TIM retained for TIM3.
 - [ ] Phase 4: Behavior spec and code comments updated to “canonical 10 ms tick” / timebase-agnostic wording.
 
 ---
