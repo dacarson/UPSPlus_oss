@@ -17,12 +17,13 @@ confirmed.
 
 ## Power / Charging
 
-- **IP5328** (battery charger / power management)
+- **IP5328** (Injoinic; battery charger / power management)
+  - Fully-integrated power bank SoC with **USB-C PD 3.0** (Power Delivery) support.
   - Handles battery charging and power path control.
-  - Has i2c interface but not connected to i2c bus
-  - Charging can be enabled and disabled via MCU
-  - Low Battery Cutoff is roughly 2.4–2.6 V
-  - Recovery around 3.0 V
+  - Accepts 5 V and higher PD input voltages (e.g. 9 V when the charger negotiates PD); USB-C register readings around 8–9 V are normal with a PD charger.
+  - I2C interface present on the IC but not connected to the HAT I2C bus.
+  - Charging can be enabled and disabled via MCU (IP_EN pin).
+  - Low Battery Cutoff is roughly 2.4–2.6 V; recovery around 3.0 V.
 
 ## Notes
 
