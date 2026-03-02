@@ -110,7 +110,7 @@ Note: multi-byte registers are little-endian (LSB at lower address).
 | `0x01–0x02` | MCU voltage (mV) | RO | - |
 | `0x03–0x04` | Pogopin voltage (mV) | RO | - |
 | `0x05–0x06` | Battery voltage (mV) | RO | - |
-| `0x07–0x08` | USB-C voltage (mV) | RO | - |
+| `0x07–0x08` | USB-C voltage (mV). 5 V or higher with PD chargers (e.g. ~9 V is normal). | RO | - |
 | `0x09–0x0A` | Micro-USB voltage (mV) | RO | - |
 | `0x0B–0x0C` | Temperature (°C, integer) | RO | - |
 | `0x0D–0x0E` | Full voltage (mV) | RW | 4200 |
