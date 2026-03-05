@@ -176,7 +176,7 @@ STATIC_ASSERT((PLATEAU_WINDOW_SEC % PLATEAU_EVAL_PERIOD_SEC) == 0,
 /* Note: Flash storage is little-endian on STM32; this constant ensures correct
  * byte order when comparing against flash-stored values. */
 #define FLASH_MAGIC_NUMBER            ((uint32_t)('U') | ((uint32_t)('P')<<8) | ((uint32_t)('S')<<16) | ((uint32_t)('P')<<24))
-#define FLASH_STRUCTURE_VERSION       2           /* Increment when structure changes (2 = HW CRC) */
+#define FLASH_STRUCTURE_VERSION       3           /* Increment when structure changes (2 = HW CRC, 3 = last_true_vbat persisted) */
 #define FLASH_WRITE_RATE_LIMIT_SEC    5           /* Minimum seconds between flash writes */
 #define FLASH_DIRTY_MAX_INTERVAL_SEC  60          /* Max seconds before forcing a dirty save */
 #define FLASH_RETRY_BACKOFF_SEC       2           /* Retry backoff after failed save */
@@ -479,6 +479,7 @@ typedef struct {
     uint32_t last_true_vbat_sample_tick; /* Tick when last true-VBAT was captured.
                                            * Must remain uint32_t; do not reintroduce 8-bit tick fields for staleness. */
     uint16_t last_true_vbat_mv;        /* Cached true-VBAT (charger not influencing) for percent calc. */
+    uint16_t persisted_true_vbat_age_sec; /* Age at save time when loaded from flash; 0 = none. Used for freshness after reset. */
 } authoritative_state_t;
 
 /* Charger Voltage Helper - Locks MAX(VBUS, USBIN) rule in code.
@@ -547,7 +548,9 @@ typedef struct {
     uint8_t low_battery_percent;
     uint8_t reserved_padding0;         /* Alignment + deterministic CRC - MUST be zeroed */
     uint16_t load_on_delay_config_sec;
-    uint16_t reserved_padding1;        /* Alignment + deterministic CRC - MUST be zeroed */
+    uint16_t last_true_vbat_mv;         /* True-VBAT at last sample (for crash recovery / auto power-on) */
+    uint16_t last_true_vbat_age_sec;    /* Age in seconds of sample at save time; 0 = no valid sample */
+    uint8_t reserved_padding2[2];      /* Alignment + deterministic CRC - MUST be zeroed */
     /* Note: Provide FlashPersistentData_InitZero(&rec) helper to ensure
      * all reserved/padding fields are zeroed before CRC calculation. */
     
@@ -555,7 +558,6 @@ typedef struct {
     /* Note: power_status (register 0x17) is NOT persisted; it is derived from state machine on boot */
     /* Runtime counters persistence: Always persisted when flash is enabled (on every flash write).
      * These are "optional for recovery" per plan - they aid recovery but are not critical. */
-    uint8_t reserved_padding2[4];       /* Alignment + deterministic CRC - MUST be zeroed (replaces former last_reset_cause/last_reset_seq) */
     uint32_t cumulative_runtime_sec;
     uint32_t charging_time_sec;
 

@@ -71,6 +71,7 @@ static protection_state_t prot_state;
 static button_handler_t button_handler;
 static uint8_t button_last_level = 0; /* 1=pressed, 0=released */
 static uint8_t i2c_stuck_addr_sec = 0; /* Seconds ADDR flag has been set; used for stuck-bus recovery */
+static uint32_t cumulative_runtime_sec_at_flash_load = 0u; /* Set when applying flash record; used for persisted true-VBAT age */
 
 /* Double-buffered register image. Snapshot_Update fills reg_image for I2C TX. */
 uint8_t reg_image[2][256];
@@ -210,6 +211,18 @@ uint8_t IsTrueVbatSampleFresh(uint32_t now_ticks, uint32_t last_true_vbat_sample
     /* Unsigned wrap gives correct age when tick_counter has wrapped */
     uint32_t age_ticks = now_ticks - last_true_vbat_sample_tick;
     return (age_ticks <= TRUE_VBAT_MAX_AGE_TICKS) ? 1u : 0u;
+}
+
+/** True if we have a usable true-VBAT value for power/percent: either a fresh tick-based sample or a persisted sample still within age. */
+static uint8_t IsTrueVbatUsableForDecision(void)
+{
+    if (state.last_true_vbat_sample_tick != 0u)
+        return IsTrueVbatSampleFresh(sched_flags.tick_counter, state.last_true_vbat_sample_tick);
+    if (state.persisted_true_vbat_age_sec == 0u)
+        return 0u;
+    uint32_t elapsed = state.cumulative_runtime_sec - cumulative_runtime_sec_at_flash_load;
+    uint32_t effective_age_sec = state.persisted_true_vbat_age_sec + elapsed;
+    return (effective_age_sec <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC) ? 1u : 0u;
 }
 
 static uint16_t ClampU16(uint16_t value, uint16_t min_value, uint16_t max_value)
@@ -715,6 +728,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.snapshot_tick = 0;
     state.last_true_vbat_sample_tick = 0;
     state.last_true_vbat_mv = 0;
+    state.persisted_true_vbat_age_sec = 0;
 
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.charger_state = CHARGER_STATE_ABSENT;
@@ -999,6 +1013,7 @@ int main(void)
             {
                 state.last_true_vbat_sample_tick = sched_flags.tick_counter;
                 state.last_true_vbat_mv = state.battery_voltage_mv;
+                state.persisted_true_vbat_age_sec = 0u; /* New sample; no longer using persisted age */
             }
             /* Protection: store last ADC reading; counting is done in Protection_Step with adc_sample_seq gating. */
             prot_state.last_adc_battery_mv = state.battery_voltage_mv;
@@ -1034,7 +1049,7 @@ void CheckPowerOnConditions(void)
     /* Charger physically connected (PRESENT or FORCED_OFF_WINDOW); distinct from Charger_IsInfluencingVBAT */
     uint8_t charger_present = (sys_state.charger_state == CHARGER_STATE_PRESENT ||
                               sys_state.charger_state == CHARGER_STATE_FORCED_OFF_WINDOW);
-    uint8_t true_vbat_fresh = IsTrueVbatSampleFresh(now_ticks, state.last_true_vbat_sample_tick);
+    uint8_t true_vbat_fresh = IsTrueVbatUsableForDecision();
 
     if (sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
     {
@@ -1116,6 +1131,7 @@ void FactoryReset(void)
     state.current_runtime_sec = 0;
     state.last_true_vbat_sample_tick = 0;
     state.last_true_vbat_mv = 0;
+    state.persisted_true_vbat_age_sec = 0;
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.factory_test_selector = 0;
 
@@ -1200,8 +1216,11 @@ static void Flash_ApplyRecordToState(const flash_persistent_data_t *rec)
     state.battery_params_self_programmed = (rec->battery_params_self_programmed != 0u) ? 1u : 0u;
     state.low_battery_percent = rec->low_battery_percent;
     state.load_on_delay_config_sec = rec->load_on_delay_config_sec;
+    state.last_true_vbat_mv = rec->last_true_vbat_mv;
+    state.persisted_true_vbat_age_sec = rec->last_true_vbat_age_sec;
     state.cumulative_runtime_sec = rec->cumulative_runtime_sec;
     state.charging_time_sec = rec->charging_time_sec;
+    cumulative_runtime_sec_at_flash_load = rec->cumulative_runtime_sec;
 
     /* Clamp to valid ranges (same policy as InitAuthoritativeStateFromBuffer) */
     if (!Validate_FullVoltage(state.full_voltage_mv)) state.full_voltage_mv = DEFAULT_VBAT_FULL_MV;
@@ -1233,6 +1252,25 @@ static void Flash_FillRecordFromState(flash_persistent_data_t *rec, uint16_t seq
     rec->battery_params_self_programmed = (state.battery_params_self_programmed != 0u) ? 1u : 0u;
     rec->low_battery_percent = state.low_battery_percent;
     rec->load_on_delay_config_sec = state.load_on_delay_config_sec;
+    /* Store age_sec; use 1 as minimum when valid to avoid collision with sentinel 0 = "no sample". */
+    if (state.last_true_vbat_sample_tick != 0u) {
+        uint32_t age_ticks = sched_flags.tick_counter - state.last_true_vbat_sample_tick;
+        uint32_t age_sec = age_ticks / (uint32_t)TICKS_PER_1S;
+        if (age_sec <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC)
+            rec->last_true_vbat_age_sec = (age_sec == 0u) ? 1u : (uint16_t)age_sec;
+        else
+            rec->last_true_vbat_age_sec = 0u;
+    } else if (state.persisted_true_vbat_age_sec != 0u) {
+        uint32_t elapsed = state.cumulative_runtime_sec - cumulative_runtime_sec_at_flash_load;
+        uint32_t effective_age = state.persisted_true_vbat_age_sec + elapsed;
+        if (effective_age <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC)
+            rec->last_true_vbat_age_sec = (effective_age == 0u) ? 1u : (uint16_t)effective_age;
+        else
+            rec->last_true_vbat_age_sec = 0u;
+    } else {
+        rec->last_true_vbat_age_sec = 0u;
+    }
+    rec->last_true_vbat_mv = state.last_true_vbat_mv;
     rec->cumulative_runtime_sec = state.cumulative_runtime_sec;
     rec->charging_time_sec = state.charging_time_sec;
     /* Bootloader OTA byte at 0x08003C64: 0 = run app, 0x7F = enter OTA (set when factory test 0xFC = 0x7F) */
@@ -1355,6 +1393,8 @@ void Flash_Load(void)
         Flash_ApplyRecordToState(&rec);
         flash_auto_power_on_loaded = (rec.auto_power_on != 0u) ? 1u : 0u;
         UpdateDerivedState();
+        /* Recompute battery_percent from persisted true-VBAT so auto power-on can proceed after reset (issue 4). */
+        UpdateBatteryPercentage();
         flash_sequence = rec.sequence_number;
         flash_dirty = 0;
         flash_last_write_sec = state.cumulative_runtime_sec;
@@ -1575,10 +1615,9 @@ void UpdateBatteryPercentage(void)
     int32_t range = (int32_t)state.full_voltage_mv - (int32_t)state.empty_voltage_mv;
     if (range < MIN_VOLTAGE_DELTA_MV)
         return;
-    uint32_t now_ticks = sched_flags.tick_counter;
-    uint8_t true_vbat_fresh = IsTrueVbatSampleFresh(now_ticks, state.last_true_vbat_sample_tick);
+    uint8_t true_vbat_usable = IsTrueVbatUsableForDecision();
     uint8_t charging = Charger_IsInfluencingVBAT(&sys_state);
-    if (charging && !true_vbat_fresh)
+    if (charging && !true_vbat_usable)
         return;
     int32_t voltage = charging ? (int32_t)state.last_true_vbat_mv
                                : (int32_t)state.battery_voltage_mv;
@@ -2292,8 +2331,7 @@ static void Button_DispatchActions(void)
             uint8_t allow_power_on = 1;
             if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
                 allow_power_on = 0;
-            if (Charger_IsInfluencingVBAT(&sys_state) &&
-                !IsTrueVbatSampleFresh(sched_flags.tick_counter, state.last_true_vbat_sample_tick))
+            if (Charger_IsInfluencingVBAT(&sys_state) && !IsTrueVbatUsableForDecision())
             {
                 allow_power_on = 0;
             }
