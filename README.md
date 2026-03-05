@@ -66,7 +66,7 @@ This workflow targets the legacy bootloader. The runtime firmware can enter OTA 
 3. The device starts in OTA mode.
 
 **Option B – I2C command**  
-**Caution** If this path is used, UPSPlus device will always reboot into OTA until an OTA Update is performed.
+**Caution** If this path is used, UPSPlus device will always reboot into OTA until an OTA Update is performed, and RPi will be restarted as power is interrupted.
 
 
 With the firmware running and the UPSPlus on the I2C bus (e.g. Raspberry Pi at 0x17), write **0x7F** to register **0xFC** (factory test region). This is a one-shot command: the firmware persists the bootloader OTA flag, saves flash, and reboots immediately into the bootloader. Register 0xFC remains 0 for readback (it is not a selector value).

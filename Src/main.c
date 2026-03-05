@@ -131,11 +131,16 @@ static uint16_t plateau_sample_index = 0;
 static uint8_t plateau_suppressed = 0;
 static uint8_t plateau_persisted_this_session = 0;
 static charger_state_t plateau_last_charger_state = CHARGER_STATE_ABSENT;
-static power_state_t plateau_last_power_state = POWER_STATE_RPI_OFF;
 static uint8_t plateau_eval_counter = 0;
 /* Empty learning: minimum battery voltage seen while load was on during this discharge (0xFFFF = none yet) */
 static uint16_t min_vbat_while_load_on_mv = 0xFFFF;
 static uint8_t empty_persisted_this_session = 0;
+/* Debounce: only commit empty on load_off after sustained load_off (0 = not in load_off, else tick when load_off started) */
+static uint32_t empty_learn_load_off_start_tick = 0u;
+/* Condition (3) debounce: 0 = not pending; else tick when output validity loss was first detected.
+ * Commit fires after EMPTY_LEARN_BROWNOUT_HOLD_TICKS of sustained validity loss (genuine brownout).
+ * Cancelled if validity is restored before the hold expires (polling gap, not a real brownout). */
+static uint32_t empty_learn_brownout_tick = 0u;
 static uint8_t battery_full = 0;
 static uint32_t battery_full_clear_start_ticks = 0;
 static uint32_t taper_hold_ticks = 0;   /* Seconds (in ticks) battery current <= I_TAPER_MA with valid; for taper gate */
@@ -527,6 +532,7 @@ static void ProcessI2CPendingWrite(void)
     uint8_t u8;
     uint8_t changed = 0;
     uint8_t persist_changed = 0;
+    uint8_t persist_bypass = 0;  /* set for auto_power_on so save is not rate-limited (issue 3) */
 
     if (!i2c_pending_write.pending) return;
 
@@ -615,6 +621,7 @@ static void ProcessI2CPendingWrite(void)
                 state.auto_power_on = u8;
                 changed = 1;
                 persist_changed = 1;
+                persist_bypass = 1;  /* commit to flash on next loop, not rate-limited */
             }
         }
         break;
@@ -689,7 +696,7 @@ static void ProcessI2CPendingWrite(void)
     if (changed)
         Snapshot_UpdateDerived();
     if (persist_changed)
-        RequestFlashSave(0, 1);
+        RequestFlashSave(persist_bypass, 1);
     i2c_pending_write.pending = 0;
 }
 
@@ -1149,6 +1156,7 @@ void FactoryReset(void)
     BatteryPlateau_Init();
     min_vbat_while_load_on_mv = 0xFFFFu;
     empty_persisted_this_session = 0;
+    empty_learn_brownout_tick = 0u;
 }
 
 extern const uint8_t __flash_storage_start__[];
@@ -1501,15 +1509,21 @@ __attribute__((noinline)) static uint16_t EmptyVoltageMaxMv(void)
  * Commit tracked discharge-session minimum to state.empty_voltage_mv (spec: commit at
  * load-off, protection trigger, or output-current validity loss). Call with request_flash=0
  * when the caller will request flash anyway (e.g. protection path).
+ * reset_min=1: reset min_vbat_while_load_on_mv (real shutdown: load-off or protection trigger).
+ * reset_min=0: keep tracking (validity-loss commit — may be a polling gap, not a true shutdown).
  */
-static void EmptyLearn_CommitTrackedMin(uint8_t request_flash)
+static void EmptyLearn_CommitTrackedMin(uint8_t request_flash, uint8_t reset_min)
 {
     if (min_vbat_while_load_on_mv == 0xFFFFu)
+        return;
+    /* Do not commit if min is too close to full — no meaningful discharge (e.g. I2C stuck near full). */
+    if ((uint32_t)min_vbat_while_load_on_mv + (uint32_t)EMPTY_LEARN_MIN_MEANINGFUL_DISCHARGE_MV >= (uint32_t)state.full_voltage_mv)
         return;
     uint16_t new_empty = ClampU16(min_vbat_while_load_on_mv, state.protection_voltage_mv, EmptyVoltageMaxMv());
     uint16_t old_empty = state.empty_voltage_mv;
     state.empty_voltage_mv = new_empty;
-    min_vbat_while_load_on_mv = 0xFFFFu;
+    if (reset_min)
+        min_vbat_while_load_on_mv = 0xFFFFu;
 
     if (request_flash &&
         AbsDiffU16(new_empty, old_empty) >= EMPTY_PERSIST_MIN_CHANGE_MV &&
@@ -1533,8 +1547,12 @@ void UpdateBatteryMinMax(void)
         {
             min_vbat_while_load_on_mv = 0xFFFFu;
             empty_persisted_this_session = 0;
+            empty_learn_load_off_start_tick = 0u;
+            empty_learn_brownout_tick = 0u;
         }
-        else
+        /* Only track/commit empty when charger is ABSENT (actual discharge). Exclude FORCED_OFF_WINDOW
+         * because the 1.5s calibration window causes an artificial VBAT dip—that min is not true empty. */
+        else if (sys_state.charger_state == CHARGER_STATE_ABSENT)
         {
             /* Track min VBAT when load is on; when INA invalid but RPi on, assume load on (brownout). */
             int16_t out_ma = state.output_current_mA;
@@ -1548,12 +1566,24 @@ void UpdateBatteryMinMax(void)
 
             if ((load_on || assume_load_on) && state.battery_voltage_mv >= state.protection_voltage_mv)
             {
+                empty_learn_load_off_start_tick = 0u;  /* Load is on; clear load_off debounce */
                 if (min_vbat_while_load_on_mv == 0xFFFFu ||
                     state.battery_voltage_mv < min_vbat_while_load_on_mv)
                     min_vbat_while_load_on_mv = state.battery_voltage_mv;
             }
             if (load_off && min_vbat_while_load_on_mv != 0xFFFFu)
-                EmptyLearn_CommitTrackedMin(1);
+            {
+                uint32_t now = sched_flags.tick_counter;
+                if (empty_learn_load_off_start_tick == 0u)
+                    empty_learn_load_off_start_tick = now;
+                else if ((now - empty_learn_load_off_start_tick) >= EMPTY_LEARN_LOAD_OFF_HOLD_TICKS)
+                {
+                    EmptyLearn_CommitTrackedMin(1, 1);
+                    empty_learn_load_off_start_tick = 0u;
+                }
+            }
+            else if (!load_off)
+                empty_learn_load_off_start_tick = 0u;
         }
     }
     state.empty_voltage_mv = ClampU16(state.empty_voltage_mv, state.protection_voltage_mv, EmptyVoltageMaxMv());
@@ -1660,7 +1690,9 @@ static uint8_t I2C1_GuardWindowReady(void)
 
 static void BatteryPlateau_UpdateBatteryFullClear(uint32_t now_ticks)
 {
-    if (sys_state.charger_state != CHARGER_STATE_PRESENT)
+    /* Clear FULL only on physical charger removal (ABSENT). FORCED_OFF_WINDOW is a calibration
+     * window -- the charger remains physically connected, so the FULL latch is preserved. */
+    if (sys_state.charger_state == CHARGER_STATE_ABSENT)
     {
         battery_full = 0;
         battery_full_clear_start_ticks = 0;
@@ -1682,7 +1714,8 @@ static void BatteryPlateau_UpdateBatteryFullClear(uint32_t now_ticks)
 static void BatteryPlateau_Tick1s(void)
 {
     uint32_t now_ticks = sched_flags.tick_counter;
-    uint8_t charger_present = (sys_state.charger_state == CHARGER_STATE_PRESENT) ? 1u : 0u;
+    /* Only reset when charger physically absent; FORCED_OFF_WINDOW is still "connected" (calibration window). */
+    uint8_t charger_connected = (sys_state.charger_state != CHARGER_STATE_ABSENT) ? 1u : 0u;
 
     if (state.battery_params_self_programmed != 0u)
     {
@@ -1690,39 +1723,49 @@ static void BatteryPlateau_Tick1s(void)
         battery_full_clear_start_ticks = 0;
         BatteryPlateau_ResetSession();
         plateau_last_charger_state = sys_state.charger_state;
-        plateau_last_power_state = sys_state.power_state;
         return;
     }
 
-    if (!charger_present)
+    if (!charger_connected)
     {
         battery_full = 0;
         battery_full_clear_start_ticks = 0;
         BatteryPlateau_ResetSession();
         plateau_last_charger_state = sys_state.charger_state;
-        plateau_last_power_state = sys_state.power_state;
         return;
     }
 
-    if (plateau_last_charger_state != CHARGER_STATE_PRESENT && charger_present)
+    /* Reset window only when transitioning from unplugged to connected, not on PRESENT <-> FORCED_OFF_WINDOW. */
+    if (plateau_last_charger_state == CHARGER_STATE_ABSENT && sys_state.charger_state != CHARGER_STATE_ABSENT)
         BatteryPlateau_ResetSession();
     plateau_last_charger_state = sys_state.charger_state;
 
-    /* Reset plateau window on power-state transition so the 30-min window is continuous under RPI_ON. */
-    if (plateau_last_power_state != POWER_STATE_RPI_ON && sys_state.power_state == POWER_STATE_RPI_ON)
-        BatteryPlateau_ResetWindow();
-    plateau_last_power_state = sys_state.power_state;
-
     BatteryPlateau_UpdateBatteryFullClear(now_ticks);
 
-    /* Taper gate: hold time that battery (charging) current <= I_TAPER_MA with valid; else reset */
+    /* Taper accumulation: |battery_current_mA| <= I_TAPER_MA with fresh reading; else reset.
+     * Bidirectional: slight discharge draws (negative current) count -- normal operation draws
+     * small loads from the battery even while charging. Stale/invalid readings reset the timer. */
     if (state.battery_current_valid &&
-        state.battery_current_mA >= 0 &&
+        state.battery_current_mA >= -(int16_t)I_TAPER_MA &&
         state.battery_current_mA <= (int16_t)I_TAPER_MA)
         taper_hold_ticks += (uint32_t)TICKS_PER_1S;
     else
         taper_hold_ticks = 0;
 
+    /* Taper path: independent of plateau window stability.
+     * Declares FULL if current has been within +/-I_TAPER_MA for TAPER_HOLD_SEC and VBAT is at
+     * near-top voltage. No learned-full update from this path (no plateau mean available). */
+    if (taper_hold_ticks >= (uint32_t)(TAPER_HOLD_SEC * TICKS_PER_1S) &&
+        filtered_vbat_mv >= VBAT_FULL_MIN_MV)
+    {
+        battery_full = 1;
+        battery_full_clear_start_ticks = 0;
+        if (!plateau_suppressed)
+            plateau_suppressed = 1;
+    }
+
+    /* Plateau path: stable 30-min voltage window at near-top voltage.
+     * Also updates the learned full-voltage calibration value. */
     plateau_eval_counter++;
     if (plateau_eval_counter < PLATEAU_EVAL_PERIOD_SEC)
         return;
@@ -1736,14 +1779,6 @@ static void BatteryPlateau_Tick1s(void)
         plateau_sample_index = 0;
 
     if (plateau_sample_count < PLATEAU_WINDOW_SAMPLES)
-        return;
-    if (plateau_suppressed)
-        return;
-    if (filtered_vbat_mv < VBAT_FULL_MIN_MV)
-        return;
-    if (sys_state.power_state != POWER_STATE_RPI_ON || sys_state.power_state_entry_ticks == 0u)
-        return;
-    if ((now_ticks - sys_state.power_state_entry_ticks) < (uint32_t)(PLATEAU_POWER_STABLE_SEC * TICKS_PER_1S))
         return;
 
     uint16_t min_v = 0xFFFFu;
@@ -1762,19 +1797,20 @@ static void BatteryPlateau_Tick1s(void)
     if ((uint16_t)(max_v - min_v) > PLATEAU_DELTA_MV)
         return;
 
-    /* Optional taper gate: if current is valid, require taper hold; else plateau-only (no stale current) */
-    if (state.battery_current_valid &&
-        taper_hold_ticks < (uint32_t)(TAPER_HOLD_SEC * TICKS_PER_1S))
+    uint16_t plateau_mean = (uint16_t)(sum / plateau_sample_count);
+    if (plateau_mean < PLATEAU_MEAN_MIN_MV)
+        return;
+
+    /* Plateau path requires VBAT at near-top voltage; taper is handled independently above. */
+    if (filtered_vbat_mv < VBAT_FULL_MIN_MV)
         return;
 
     if (state.full_voltage_mv < LEARNED_FULL_MIN_MV || state.full_voltage_mv > LEARNED_FULL_MAX_MV)
         state.full_voltage_mv = VBAT_FULL_MIN_MV;
 
-    uint16_t plateau_mean = (uint16_t)(sum / plateau_sample_count);
     uint16_t learned_full = state.full_voltage_mv;
     uint16_t old_full = state.full_voltage_mv;
 
-    if (AbsDiffU16(plateau_mean, learned_full) >= PLATEAU_MIN_CHANGE_MV)
     {
         uint32_t num = (uint32_t)learned_full * (uint32_t)(PLATEAU_ALPHA_DEN - PLATEAU_ALPHA_NUM) +
                        (uint32_t)plateau_mean * (uint32_t)PLATEAU_ALPHA_NUM +
@@ -1801,7 +1837,8 @@ static void BatteryPlateau_Tick1s(void)
 
     battery_full = 1;
     battery_full_clear_start_ticks = 0;
-    plateau_suppressed = 1;
+    if (!plateau_suppressed)
+        plateau_suppressed = 1;
 }
 
 /* DMA only sets adc_ready; main loop processes ADC and updates state */
@@ -1889,7 +1926,7 @@ static void Protection_Step(void)
         sys_state.pending_power_cut_start_ticks = sched_flags.tick_counter;
         /* Empty learning: commit tracked min before power cut (spec commit condition (2)). */
         if (state.battery_params_self_programmed == 0)
-            EmptyLearn_CommitTrackedMin(0);
+            EmptyLearn_CommitTrackedMin(0, 1);
     }
     RequestFlashSave(1, 1);
     sys_state.pending_power_cut = 1;
@@ -2097,11 +2134,44 @@ static void CurrentAge_Tick10ms(void)
     state.battery_current_valid =
         (((uint32_t)state.battery_current_age_10ms) <= CURRENT_VALID_AGE_TICKS) ? 1u : 0u;
 
-    /* Empty learning: commit on loss of output-current validity while RPi on (spec condition (3)). */
-    if (prev_output_valid && !state.output_current_valid &&
-        sys_state.power_state == POWER_STATE_RPI_ON &&
-        state.battery_params_self_programmed == 0)
-        EmptyLearn_CommitTrackedMin(1);
+    /* Empty learning condition (3): output-current validity loss while RPi is on.
+     * Intended to catch abrupt brownouts where the Pi dies before current drops to ~0.
+     * Problem: validity also expires ~2s after any I2C polling gap (no master activity
+     * → INA guard blocks reads → age exceeds CURRENT_VALID_AGE_SEC). An immediate commit
+     * on each validity-loss transition would fire on every script run, committing a
+     * non-minimum value from a short fresh-session window.
+     * Fix: debounce — start a timer on validity loss; commit only after
+     * EMPTY_LEARN_BROWNOUT_HOLD_TICKS of sustained validity loss. Cancel if validity
+     * is restored before the hold expires (polling gap case). A genuine brownout results
+     * in no further I2C activity, so the hold fires and commits correctly.
+     * reset_min=0: preserve tracking across validity gaps so the accumulated minimum
+     * is not discarded on transient gaps. Conditions (1)/(2) use reset_min=1. */
+    if (state.battery_params_self_programmed == 0 &&
+        sys_state.power_state == POWER_STATE_RPI_ON)
+    {
+        if (prev_output_valid && !state.output_current_valid &&
+            min_vbat_while_load_on_mv != 0xFFFFu)
+        {
+            /* Validity just dropped — start brownout debounce */
+            empty_learn_brownout_tick = sched_flags.tick_counter;
+        }
+        else if (state.output_current_valid)
+        {
+            /* Validity restored — cancel debounce (was a polling gap, not a brownout) */
+            empty_learn_brownout_tick = 0u;
+        }
+        else if (empty_learn_brownout_tick != 0u &&
+                 (sched_flags.tick_counter - empty_learn_brownout_tick) >= EMPTY_LEARN_BROWNOUT_HOLD_TICKS)
+        {
+            /* Sustained validity loss — likely a real brownout; commit and clear */
+            EmptyLearn_CommitTrackedMin(1, 0);
+            empty_learn_brownout_tick = 0u;
+        }
+    }
+    else
+    {
+        empty_learn_brownout_tick = 0u;
+    }
 
     if (state.output_current_valid != prev_output_valid ||
         state.battery_current_valid != prev_battery_valid)
