@@ -156,14 +156,8 @@ It is intended as the source of truth for feature development and future changes
   - 0xFD: output_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFE: battery_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFF: 0  
-- Selector 0x08: Reset cause (this boot)  
-  - 0xFD: raw reset-flag byte (RCC CSR bits 31:25): bit6=LPWRRSTF, bit5=WWDGRSTF, bit4=IWDGRSTF, bit3=SFTRSTF, bit2=PORRSTF, bit1=PINRSTF, bit0=BORRSTF  
-  - 0xFE–0xFF: CSR bits 23:16 and 31:24 (high 16 bits of RCC_CSR). Client interprets; no firmware normalization.  
-- Selector 0x09: Last persisted reset cause (from flash)  
-  - 0xFD: last_reset_cause (raw reset-flag byte as stored at last flash save)  
-  - 0xFE: last_reset_seq (sequence byte from flash)  
-  - 0xFF: reserved (0)  
 
+**Reset cause not reported:** The application does not have access to the bootloader source. The bootloader clears the RCC reset flags (e.g. writes `RMVF=1` to `RCC_CSR`) before jumping to the application, so by the time the app runs the reset cause is already lost. Reset cause is not recorded or reported via I2C or factory test.
 ### 4.5 I2C Bus Robustness
 - I2C input filters (analog and digital, 1 I2C clock digital filter) are enabled at init to improve robustness in noisy environments.
 - Stuck-bus recovery is performed in software (e.g. SCL toggling); no hardware I2C timeout is used. Recovery behavior is internal and does not change the external I2C register contract.
@@ -367,7 +361,7 @@ Key behaviors:
 
 - **Independent Watchdog (IWDG):** Timeout ~8 s (LSI-based). Refreshed **once per main-loop iteration**, after critical work (scheduler, I2C processing, INA probe, flash save, protection/GPIO). **Never** refreshed in ISRs (e.g. I2C ISR); a main-loop hang or I2C deadlock cannot keep the watchdog alive. If the main loop does not complete within the timeout, the device resets.
 - **HardFault safe state (prioritize Pi uptime):** On HardFault the handler drives **IP_EN LOW** (charger path off) and keeps **PWR_EN HIGH** (MCU hold-up), but it **does not force MT_EN LOW**. MT_EN is left unchanged to avoid unnecessarily power-cycling the Raspberry Pi if it is otherwise running normally. The handler then triggers an immediate system reset. Note: if the application’s protection logic later determines the battery is below the protection threshold, it will still perform the normal shutdown sequence (attempt flash save, then cut MT_EN).
-- **Reset cause:** Captured from RCC at boot (before clear). Persisted in flash and exported via I2C: **factory test selector 0x08** = this boot’s raw reset flags and CSR high bits; **selector 0x09** = last persisted reset cause and sequence from flash. Encoding is raw RCC_CSR bits; client interprets (e.g. IWDGRSTF, PINRSTF, PORRSTF).
+- **Reset cause:** The bootloader (which we do not have access to) clears the RCC reset flags before starting the application, so the actual reset cause cannot be read by the app. The firmware does not record or expose reset cause via I2C; the corresponding flash fields are reserved (written as 0) for layout compatibility.
 
 ---
 
@@ -583,7 +577,7 @@ To boot the application after OTA programming:
 - If register map changes, revisit: Factory Testing ABI, test scripts, and external tools.
 - If snapshot frequency changes, revisit: I2C coherence assumptions and staleness guarantees.
 - If protection logic changes, revisit: power-cut ordering and flash save semantics.
-- If reliability features change (IWDG timeout, HardFault safe outputs, reset-cause encoding), revisit: Section 10, factory test selectors 0x08/0x09, and any tools that interpret reset cause.
+- If reliability features change (IWDG timeout, HardFault safe outputs), revisit Section 10 and any tools that depend on factory test selectors.
 
 ---
 
