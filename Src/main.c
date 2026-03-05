@@ -51,6 +51,9 @@ __IO uint8_t MustRefreshVDD = 1;
 #define IWDG_PR_256   6u
 #define IWDG_RLR_VAL  1748u
 
+/* I2C stuck-bus recovery: if ADDR flag set for this many seconds, re-init slave (clock-stretch watchdog). */
+#define I2C_STUCK_ADDR_RECOVERY_SEC  5u
+
 typedef void (*pFunction)(void);
 __IO pFunction JumpToAplication;
 
@@ -67,6 +70,7 @@ static charger_physical_state_t charger_physical;
 static protection_state_t prot_state;
 static button_handler_t button_handler;
 static uint8_t button_last_level = 0; /* 1=pressed, 0=released */
+static uint8_t i2c_stuck_addr_sec = 0; /* Seconds ADDR flag has been set; used for stuck-bus recovery */
 
 /* Double-buffered register image. Snapshot_Update fills reg_image for I2C TX. */
 uint8_t reg_image[2][256];
@@ -862,6 +866,16 @@ int main(void)
                 (state.cumulative_runtime_sec - flash_last_write_sec) >= FLASH_DIRTY_MAX_INTERVAL_SEC)
             {
                 RequestFlashSave(0, 0);
+            }
+            /* I2C stuck-bus recovery: if ADDR flag set for >= 5 s (clock stretch), re-init slave. */
+            if (I2C1_IsAddrFlagSet())
+                i2c_stuck_addr_sec++;
+            else
+                i2c_stuck_addr_sec = 0;
+            if (i2c_stuck_addr_sec >= I2C_STUCK_ADDR_RECOVERY_SEC)
+            {
+                MX_I2C1_Slave_Init();
+                i2c_stuck_addr_sec = 0;
             }
             Snapshot_UpdateDerived();
             sched_flags.tick_1s = 0;

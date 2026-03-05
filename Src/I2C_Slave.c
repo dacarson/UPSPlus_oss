@@ -647,6 +647,11 @@ uint8_t I2C1_GetSlaveTxnActive(void)
     return i2c_slave_txn_active;
 }
 
+uint8_t I2C1_IsAddrFlagSet(void)
+{
+    return LL_I2C_IsActiveFlag_ADDR(I2C1) ? 1u : 0u;
+}
+
 uint16_t I2C1_GetLastAddrUs(void)
 {
     return i2c_last_addr_us;

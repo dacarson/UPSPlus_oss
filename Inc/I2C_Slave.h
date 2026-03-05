@@ -21,6 +21,7 @@ void I2C1_RunIna219Probe(void);
 uint8_t I2C1_GetInaProbeOutputPresent(void);
 uint8_t I2C1_GetInaProbeBatteryPresent(void);
 uint8_t I2C1_GetSlaveTxnActive(void);
+uint8_t I2C1_IsAddrFlagSet(void);
 uint16_t I2C1_GetLastAddrUs(void);
 uint16_t I2C1_GetLastStopUs(void);
 uint8_t I2C1_ReadIna219Shunt(uint8_t is_output, int16_t *shunt_raw);
