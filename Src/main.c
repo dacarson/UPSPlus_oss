@@ -1674,6 +1674,9 @@ static uint8_t I2C1_BusIdleStable500us(void)
     return 1u;
 }
 
+/* If no I2C master activity for this long (ticks), allow INA219 reads unconditionally. */
+#define I2C_MASTER_IDLE_ALLOW_READ_TICKS  (5u * TICKS_PER_1S)
+
 static uint8_t I2C1_GuardWindowReady(void)
 {
     uint16_t now_us = (uint16_t)LL_TIM_GetCounter(TIM3);
@@ -1684,6 +1687,34 @@ static uint8_t I2C1_GuardWindowReady(void)
     if (txn_active)
         return 0u;
 
+    /* Track last I2C master activity in tick resolution so we can allow reads when master has been idle > 5 s. */
+    {
+        static uint16_t last_seen_stop_us = 0u;
+        static uint16_t last_seen_addr_us = 0u;
+        static uint32_t last_i2c_activity_tick = 0u;
+        uint32_t now_ticks = sched_flags.tick_counter;
+
+        if (last_stop_us != last_seen_stop_us || last_addr_us != last_seen_addr_us)
+        {
+            last_i2c_activity_tick = now_ticks;
+            last_seen_stop_us = last_stop_us;
+            last_seen_addr_us = last_addr_us;
+        }
+
+        /* No master activity observed yet, or master idle long enough: no collision risk, allow after bus checks. */
+        if (last_i2c_activity_tick == 0u ||
+            (now_ticks - last_i2c_activity_tick) > I2C_MASTER_IDLE_ALLOW_READ_TICKS)
+        {
+            if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
+                !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
+                return 0u;
+            if (!I2C1_BusIdleStable500us())
+                return 0u;
+            return 1u;
+        }
+    }
+
+    /* Master recently active: apply 50 ms guard window to avoid collision. */
     if ((uint16_t)(now_us - last_stop_us) > 50000u)
         return 0u;
 
