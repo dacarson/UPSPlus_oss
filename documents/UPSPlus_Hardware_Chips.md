@@ -29,3 +29,8 @@ confirmed.
 
 - If additional regulators, protection ICs, or board revisions are identified,
   add them here with part numbers and roles.
+- DEBUG UPSPlus HAT pins, Pin 1 on the LHS
+  Pin 1 - VDD MCU Pin 16
+  Pin 2 - SWCLK MCU Pin 20
+  Pin 3 - SWDIO MCU Pin 19
+  Pin 4 - GND MCU Pin 15

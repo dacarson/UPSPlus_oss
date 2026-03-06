@@ -1,9 +1,5 @@
 #include "pindef.h"
 
-/* RCC_CSR reset-flag byte: bits 31:25 (LPWRRSTF down to BORRSTF); client interprets raw. */
-#define RCC_CSR_RESET_FLAGS_SHIFT  25
-#define RCC_CSR_RESET_FLAGS_MASK   0x7Fu
-
 #include "stm32f0xx_ll_adc.h"
 #include "stm32f0xx_ll_bus.h"
 #include "stm32f0xx_ll_cortex.h"
@@ -55,6 +51,9 @@ __IO uint8_t MustRefreshVDD = 1;
 #define IWDG_PR_256   6u
 #define IWDG_RLR_VAL  1748u
 
+/* I2C stuck-bus recovery: if ADDR flag set for this many seconds, re-init slave (clock-stretch watchdog). */
+#define I2C_STUCK_ADDR_RECOVERY_SEC  5u
+
 typedef void (*pFunction)(void);
 __IO pFunction JumpToAplication;
 
@@ -71,6 +70,8 @@ static charger_physical_state_t charger_physical;
 static protection_state_t prot_state;
 static button_handler_t button_handler;
 static uint8_t button_last_level = 0; /* 1=pressed, 0=released */
+static uint8_t i2c_stuck_addr_sec = 0; /* Seconds ADDR flag has been set; used for stuck-bus recovery */
+static uint32_t cumulative_runtime_sec_at_flash_load = 0u; /* Set when applying flash record; used for persisted true-VBAT age */
 
 /* Double-buffered register image. Snapshot_Update fills reg_image for I2C TX. */
 uint8_t reg_image[2][256];
@@ -98,11 +99,6 @@ static uint8_t flash_dirty = 0;
 static uint16_t flash_sequence = 0;
 static uint32_t flash_last_write_sec = 0;
 static uint32_t flash_next_retry_sec = 0;
-/* Reset cause: captured at boot, exported via factory test 0x08/0x09. */
-static uint32_t boot_reset_csr = 0u;
-static uint8_t last_persisted_reset_cause = 0u;
-static uint8_t last_persisted_reset_seq = 0u;
-
 /* Flash/persistence debug (factory test page 0x05) */
 static uint8_t flash_record_valid_boot = 0;
 static uint8_t flash_save_attempted = 0;
@@ -131,11 +127,16 @@ static uint16_t plateau_sample_index = 0;
 static uint8_t plateau_suppressed = 0;
 static uint8_t plateau_persisted_this_session = 0;
 static charger_state_t plateau_last_charger_state = CHARGER_STATE_ABSENT;
-static power_state_t plateau_last_power_state = POWER_STATE_RPI_OFF;
 static uint8_t plateau_eval_counter = 0;
 /* Empty learning: minimum battery voltage seen while load was on during this discharge (0xFFFF = none yet) */
 static uint16_t min_vbat_while_load_on_mv = 0xFFFF;
 static uint8_t empty_persisted_this_session = 0;
+/* Debounce: only commit empty on load_off after sustained load_off (0 = not in load_off, else tick when load_off started) */
+static uint32_t empty_learn_load_off_start_tick = 0u;
+/* Condition (3) debounce: 0 = not pending; else tick when output validity loss was first detected.
+ * Commit fires after EMPTY_LEARN_BROWNOUT_HOLD_TICKS of sustained validity loss (genuine brownout).
+ * Cancelled if validity is restored before the hold expires (polling gap, not a real brownout). */
+static uint32_t empty_learn_brownout_tick = 0u;
 static uint8_t battery_full = 0;
 static uint32_t battery_full_clear_start_ticks = 0;
 static uint32_t taper_hold_ticks = 0;   /* Seconds (in ticks) battery current <= I_TAPER_MA with valid; for taper gate */
@@ -210,6 +211,18 @@ uint8_t IsTrueVbatSampleFresh(uint32_t now_ticks, uint32_t last_true_vbat_sample
     /* Unsigned wrap gives correct age when tick_counter has wrapped */
     uint32_t age_ticks = now_ticks - last_true_vbat_sample_tick;
     return (age_ticks <= TRUE_VBAT_MAX_AGE_TICKS) ? 1u : 0u;
+}
+
+/** True if we have a usable true-VBAT value for power/percent: either a fresh tick-based sample or a persisted sample still within age. */
+static uint8_t IsTrueVbatUsableForDecision(void)
+{
+    if (state.last_true_vbat_sample_tick != 0u)
+        return IsTrueVbatSampleFresh(sched_flags.tick_counter, state.last_true_vbat_sample_tick);
+    if (state.persisted_true_vbat_age_sec == 0u)
+        return 0u;
+    uint32_t elapsed = state.cumulative_runtime_sec - cumulative_runtime_sec_at_flash_load;
+    uint32_t effective_age_sec = state.persisted_true_vbat_age_sec + elapsed;
+    return (effective_age_sec <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC) ? 1u : 0u;
 }
 
 static uint16_t ClampU16(uint16_t value, uint16_t min_value, uint16_t max_value)
@@ -393,20 +406,7 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
                                                         auth->battery_current_age_10ms : 255u);
             buf[REG_FACTORY_TEST_START + 3] = 0x00u;
             break;
-        case 0x08u: {
-            /* CSR byte packing: buf[+1] = RCC_CSR bits 31:25 (reset flags). buf[+2]/buf[+3] = CSR high 16 bits as [23:16], [31:24] (not LE order). */
-            uint32_t csr = boot_reset_csr;
-            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)((csr >> RCC_CSR_RESET_FLAGS_SHIFT) & RCC_CSR_RESET_FLAGS_MASK);
-            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)(csr >> 16);
-            buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(csr >> 24);
-            break;
-        }
-        case 0x09u:
-            /* Last reset cause persisted in flash (previous run). */
-            buf[REG_FACTORY_TEST_START + 1] = last_persisted_reset_cause;
-            buf[REG_FACTORY_TEST_START + 2] = last_persisted_reset_seq;
-            buf[REG_FACTORY_TEST_START + 3] = 0x00u;
-            break;
+        /* 0x08/0x09 (reset cause) removed: bootloader clears RCC_CSR before app runs, so values were always 0. */
         default:
             break;
         }
@@ -527,6 +527,7 @@ static void ProcessI2CPendingWrite(void)
     uint8_t u8;
     uint8_t changed = 0;
     uint8_t persist_changed = 0;
+    uint8_t persist_bypass = 0;  /* set for auto_power_on so save is not rate-limited (issue 3) */
 
     if (!i2c_pending_write.pending) return;
 
@@ -615,6 +616,7 @@ static void ProcessI2CPendingWrite(void)
                 state.auto_power_on = u8;
                 changed = 1;
                 persist_changed = 1;
+                persist_bypass = 1;  /* commit to flash on next loop, not rate-limited */
             }
         }
         break;
@@ -675,10 +677,14 @@ static void ProcessI2CPendingWrite(void)
     case REG_LOAD_ON_DELAY_L:
         if (len >= 2) {
             u16 = (uint16_t)i2c_pending_write.data[0] | ((uint16_t)i2c_pending_write.data[1] << 8);
-            if (Validate_LoadOnDelay(u16) && state.load_on_delay_config_sec != u16) {
-                state.load_on_delay_config_sec = u16;
-                changed = 1;
-                persist_changed = 1;
+            if (Validate_LoadOnDelay(u16)) {
+                if (state.load_on_delay_config_sec != u16) {
+                    state.load_on_delay_config_sec = u16;
+                    changed = 1;
+                    persist_changed = 1;
+                }
+                if (sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
+                    state.load_on_delay_remaining_sec = u16;
             }
         }
         break;
@@ -689,7 +695,7 @@ static void ProcessI2CPendingWrite(void)
     if (changed)
         Snapshot_UpdateDerived();
     if (persist_changed)
-        RequestFlashSave(0, 1);
+        RequestFlashSave(persist_bypass, 1);
     i2c_pending_write.pending = 0;
 }
 
@@ -726,6 +732,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.snapshot_tick = 0;
     state.last_true_vbat_sample_tick = 0;
     state.last_true_vbat_mv = 0;
+    state.persisted_true_vbat_age_sec = 0;
 
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.charger_state = CHARGER_STATE_ABSENT;
@@ -794,12 +801,8 @@ int main(void)
 
     SystemClock_Config();
 
-    /* Capture reset cause before clearing (order matters). Export via factory test 0x08/0x09. */
-    {
-        uint32_t csr = RCC->CSR;
-        boot_reset_csr = csr;
-        RCC->CSR |= RCC_CSR_RMVF;
-    }
+    /* Clear RCC reset flags so they do not accumulate (bootloader already cleared them before app run). */
+    RCC->CSR |= RCC_CSR_RMVF;
 
     /* IWDG: LSI 26–56 kHz; PR=256, RLR=1748 → ~8 s at 56 kHz, ~17 s at 26 kHz. Main loop must finish within timeout.
      * We do not block on LSI ready: if LSI never starts, the watchdog simply won’t tick, but firmware still runs.
@@ -881,6 +884,16 @@ int main(void)
                 (state.cumulative_runtime_sec - flash_last_write_sec) >= FLASH_DIRTY_MAX_INTERVAL_SEC)
             {
                 RequestFlashSave(0, 0);
+            }
+            /* I2C stuck-bus recovery: if ADDR flag set for >= 5 s (clock stretch), re-init slave. */
+            if (I2C1_IsAddrFlagSet())
+                i2c_stuck_addr_sec++;
+            else
+                i2c_stuck_addr_sec = 0;
+            if (i2c_stuck_addr_sec >= I2C_STUCK_ADDR_RECOVERY_SEC)
+            {
+                MX_I2C1_Slave_Init();
+                i2c_stuck_addr_sec = 0;
             }
             Snapshot_UpdateDerived();
             sched_flags.tick_1s = 0;
@@ -1004,6 +1017,7 @@ int main(void)
             {
                 state.last_true_vbat_sample_tick = sched_flags.tick_counter;
                 state.last_true_vbat_mv = state.battery_voltage_mv;
+                state.persisted_true_vbat_age_sec = 0u; /* New sample; no longer using persisted age */
             }
             /* Protection: store last ADC reading; counting is done in Protection_Step with adc_sample_seq gating. */
             prot_state.last_adc_battery_mv = state.battery_voltage_mv;
@@ -1012,8 +1026,7 @@ int main(void)
             adc_ready = 0;
         }
 
-        if (state.auto_power_on)
-            CheckPowerOnConditions();
+        CheckPowerOnConditions();
 
         /* Button actions (short/long press) */
         Button_DispatchActions();
@@ -1030,48 +1043,40 @@ int main(void)
  */
 void CheckPowerOnConditions(void)
 {
-    if (!state.auto_power_on)
-        return;
-
     uint32_t now_ticks = sched_flags.tick_counter;
     uint8_t battery_ok = (state.battery_percent > state.low_battery_percent);
     uint8_t battery_above_protection = (state.battery_voltage_mv > (uint16_t)(state.protection_voltage_mv + PROTECTION_HYSTERESIS_MV));
     /* Charger physically connected (PRESENT or FORCED_OFF_WINDOW); distinct from Charger_IsInfluencingVBAT */
     uint8_t charger_present = (sys_state.charger_state == CHARGER_STATE_PRESENT ||
                               sys_state.charger_state == CHARGER_STATE_FORCED_OFF_WINDOW);
-    uint8_t true_vbat_fresh = IsTrueVbatSampleFresh(now_ticks, state.last_true_vbat_sample_tick);
+    uint8_t true_vbat_fresh = IsTrueVbatUsableForDecision();
+
+    /* Clear PROTECTION_LATCHED when charger present and battery recovered (even if !auto_power_on). */
+    if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
+    {
+        uint8_t recovered = (charger_present && battery_ok && battery_above_protection && true_vbat_fresh);
+        sys_state.power_state = (recovered && state.auto_power_on) ? POWER_STATE_LOAD_ON_DELAY : POWER_STATE_RPI_OFF;
+        sys_state.power_state_entry_ticks = now_ticks;
+        if (sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
+            state.load_on_delay_remaining_sec = state.load_on_delay_config_sec;
+        sys_state.pending_power_cut = 0;
+        sys_state.pending_power_cut_start_ticks = 0;
+        prot_state.below_threshold_count = 0;
+        return;
+    }
+
+    if (!state.auto_power_on)
+        return;
 
     if (sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
     {
         /* Cancel if any required condition fails (plan: battery % must be > low for power decisions) */
         if (!battery_ok)
         {
-            sys_state.power_state = POWER_STATE_RPI_OFF;
+            /* Below protection threshold: latch to prevent immediate re-entry into LOAD_ON_DELAY */
+            sys_state.power_state = battery_above_protection ? POWER_STATE_RPI_OFF : POWER_STATE_PROTECTION_LATCHED;
             sys_state.power_state_entry_ticks = now_ticks;
             state.load_on_delay_remaining_sec = 0;
-        }
-        return;
-    }
-
-    if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
-    {
-        /* Staleness: if charger present, require fresh true-VBAT for percent-based decision */
-        if (charger_present && battery_ok && battery_above_protection && true_vbat_fresh)
-        {
-            sys_state.power_state = POWER_STATE_LOAD_ON_DELAY;
-            sys_state.power_state_entry_ticks = now_ticks;
-            state.load_on_delay_remaining_sec = state.load_on_delay_config_sec;
-            sys_state.pending_power_cut = 0;
-            sys_state.pending_power_cut_start_ticks = 0;
-            prot_state.below_threshold_count = 0;
-        }
-        else
-        {
-            sys_state.power_state = POWER_STATE_RPI_OFF;
-            sys_state.power_state_entry_ticks = now_ticks;
-            sys_state.pending_power_cut = 0;
-            sys_state.pending_power_cut_start_ticks = 0;
-            prot_state.below_threshold_count = 0;
         }
         return;
     }
@@ -1121,6 +1126,7 @@ void FactoryReset(void)
     state.current_runtime_sec = 0;
     state.last_true_vbat_sample_tick = 0;
     state.last_true_vbat_mv = 0;
+    state.persisted_true_vbat_age_sec = 0;
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.factory_test_selector = 0;
 
@@ -1149,6 +1155,7 @@ void FactoryReset(void)
     BatteryPlateau_Init();
     min_vbat_while_load_on_mv = 0xFFFFu;
     empty_persisted_this_session = 0;
+    empty_learn_brownout_tick = 0u;
 }
 
 extern const uint8_t __flash_storage_start__[];
@@ -1204,8 +1211,11 @@ static void Flash_ApplyRecordToState(const flash_persistent_data_t *rec)
     state.battery_params_self_programmed = (rec->battery_params_self_programmed != 0u) ? 1u : 0u;
     state.low_battery_percent = rec->low_battery_percent;
     state.load_on_delay_config_sec = rec->load_on_delay_config_sec;
+    state.last_true_vbat_mv = rec->last_true_vbat_mv;
+    state.persisted_true_vbat_age_sec = rec->last_true_vbat_age_sec;
     state.cumulative_runtime_sec = rec->cumulative_runtime_sec;
     state.charging_time_sec = rec->charging_time_sec;
+    cumulative_runtime_sec_at_flash_load = rec->cumulative_runtime_sec;
 
     /* Clamp to valid ranges (same policy as InitAuthoritativeStateFromBuffer) */
     if (!Validate_FullVoltage(state.full_voltage_mv)) state.full_voltage_mv = DEFAULT_VBAT_FULL_MV;
@@ -1237,8 +1247,25 @@ static void Flash_FillRecordFromState(flash_persistent_data_t *rec, uint16_t seq
     rec->battery_params_self_programmed = (state.battery_params_self_programmed != 0u) ? 1u : 0u;
     rec->low_battery_percent = state.low_battery_percent;
     rec->load_on_delay_config_sec = state.load_on_delay_config_sec;
-    rec->last_reset_cause = (uint8_t)((boot_reset_csr >> RCC_CSR_RESET_FLAGS_SHIFT) & RCC_CSR_RESET_FLAGS_MASK);
-    rec->last_reset_seq = (uint8_t)(flash_sequence & 0xFFu);  /* Save-time sequence context (diagnostic only). */
+    /* Store age_sec; use 1 as minimum when valid to avoid collision with sentinel 0 = "no sample". */
+    if (state.last_true_vbat_sample_tick != 0u) {
+        uint32_t age_ticks = sched_flags.tick_counter - state.last_true_vbat_sample_tick;
+        uint32_t age_sec = age_ticks / (uint32_t)TICKS_PER_1S;
+        if (age_sec <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC)
+            rec->last_true_vbat_age_sec = (age_sec == 0u) ? 1u : (uint16_t)age_sec;
+        else
+            rec->last_true_vbat_age_sec = 0u;
+    } else if (state.persisted_true_vbat_age_sec != 0u) {
+        uint32_t elapsed = state.cumulative_runtime_sec - cumulative_runtime_sec_at_flash_load;
+        uint32_t effective_age = state.persisted_true_vbat_age_sec + elapsed;
+        if (effective_age <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC)
+            rec->last_true_vbat_age_sec = (effective_age == 0u) ? 1u : (uint16_t)effective_age;
+        else
+            rec->last_true_vbat_age_sec = 0u;
+    } else {
+        rec->last_true_vbat_age_sec = 0u;
+    }
+    rec->last_true_vbat_mv = state.last_true_vbat_mv;
     rec->cumulative_runtime_sec = state.cumulative_runtime_sec;
     rec->charging_time_sec = state.charging_time_sec;
     /* Bootloader OTA byte at 0x08003C64: 0 = run app, 0x7F = enter OTA (set when factory test 0xFC = 0x7F) */
@@ -1294,13 +1321,11 @@ static uint8_t Flash_ProgramBuffer(uint32_t address, const uint8_t *data, uint32
     if (len == 0u || len > FLASH_PAGE_SIZE)
         return 0;
 
+    /* Stride-2 format: each struct byte occupies one 16-bit halfword (LSByte = data,
+     * MSByte = 0xFF). Matches the bootloader's read/write format so settings survive OTA. */
     while (i < len)
     {
-        uint8_t low = data[i];
-        uint8_t high = 0xFFu;
-        if ((i + 1u) < len)
-            high = data[i + 1u];
-        halfword = (uint16_t)low | ((uint16_t)high << 8);
+        halfword = (uint16_t)data[i] | 0xFF00u;
 
         FLASH->SR = FLASH_SR_EOP | FLASH_SR_PGERR | FLASH_SR_WRPRTERR;
         SET_BIT(FLASH->CR, FLASH_CR_PG);
@@ -1324,7 +1349,7 @@ static uint8_t Flash_ProgramBuffer(uint32_t address, const uint8_t *data, uint32
         }
 
         addr += 2u;
-        i += 2u;
+        i += 1u;
     }
     SET_BIT(FLASH->CR, FLASH_CR_LOCK);
     return 1;
@@ -1344,34 +1369,35 @@ void Flash_Init(void)
 void Flash_Load(void)
 {
     flash_persistent_data_t rec;
+    size_t i;
+    const uint8_t *flash_base = (const uint8_t *)FlashStorageStartPtr();
     size_t storage_size = (size_t)(FlashStorageEndPtr() - FlashStorageStartPtr());
-    if (storage_size < sizeof(rec))
+    /* Stride-2 format: each struct byte is the LSByte of a 16-bit halfword in flash. */
+    if (storage_size < sizeof(rec) * 2u)
     {
         FactoryReset();
         RequestFlashSave(0, 1);
         flash_sequence = 0;
         return;
     }
-    memcpy(&rec, (const void *)FlashStorageStartPtr(), sizeof(rec));
+    for (i = 0u; i < sizeof(rec); i++)
+        ((uint8_t *)&rec)[i] = flash_base[i * 2u];
     flash_record_valid_boot = Flash_RecordIsValid(&rec);
     flash_auto_power_on_loaded = 0u;
 
     if (flash_record_valid_boot)
     {
         Flash_ApplyRecordToState(&rec);
-        last_persisted_reset_cause = rec.last_reset_cause;
-        last_persisted_reset_seq = rec.last_reset_seq;
         flash_auto_power_on_loaded = (rec.auto_power_on != 0u) ? 1u : 0u;
         UpdateDerivedState();
+        /* Recompute battery_percent from persisted true-VBAT so auto power-on can proceed after reset (issue 4). */
+        UpdateBatteryPercentage();
         flash_sequence = rec.sequence_number;
         flash_dirty = 0;
         flash_last_write_sec = state.cumulative_runtime_sec;
     }
     else
     {
-        /* 0 = unknown / no prior boot record (invalid or missing flash). */
-        last_persisted_reset_cause = 0u;
-        last_persisted_reset_seq = 0u;
         FactoryReset();
         RequestFlashSave(0, 1);
         flash_sequence = 0;
@@ -1392,7 +1418,8 @@ uint8_t Flash_Save(uint8_t bypass)
         return 1u;
     if (!bypass && !Flash_CanWrite())
         return 0u;
-    if (storage_size < sizeof(rec))
+    /* Stride-2 format: each struct byte occupies one halfword in flash. */
+    if (storage_size < sizeof(rec) * 2u)
         return 0u;
 
     flash_save_attempted = 1u;
@@ -1410,7 +1437,12 @@ uint8_t Flash_Save(uint8_t bypass)
     if (!ok)
         return 0u;
 
-    memcpy(&verify, (const void *)FlashStorageStartPtr(), sizeof(verify));
+    {
+        size_t vi;
+        const uint8_t *flash_base = (const uint8_t *)FlashStorageStartPtr();
+        for (vi = 0u; vi < sizeof(verify); vi++)
+            ((uint8_t *)&verify)[vi] = flash_base[vi * 2u];
+    }
     if (!Flash_RecordIsValid(&verify) || verify.sequence_number != next_seq)
         return 0u;
 
@@ -1501,15 +1533,21 @@ __attribute__((noinline)) static uint16_t EmptyVoltageMaxMv(void)
  * Commit tracked discharge-session minimum to state.empty_voltage_mv (spec: commit at
  * load-off, protection trigger, or output-current validity loss). Call with request_flash=0
  * when the caller will request flash anyway (e.g. protection path).
+ * reset_min=1: reset min_vbat_while_load_on_mv (real shutdown: load-off or protection trigger).
+ * reset_min=0: keep tracking (validity-loss commit — may be a polling gap, not a true shutdown).
  */
-static void EmptyLearn_CommitTrackedMin(uint8_t request_flash)
+static void EmptyLearn_CommitTrackedMin(uint8_t request_flash, uint8_t reset_min)
 {
     if (min_vbat_while_load_on_mv == 0xFFFFu)
+        return;
+    /* Do not commit if min is too close to full — no meaningful discharge (e.g. I2C stuck near full). */
+    if ((uint32_t)min_vbat_while_load_on_mv + (uint32_t)EMPTY_LEARN_MIN_MEANINGFUL_DISCHARGE_MV >= (uint32_t)state.full_voltage_mv)
         return;
     uint16_t new_empty = ClampU16(min_vbat_while_load_on_mv, state.protection_voltage_mv, EmptyVoltageMaxMv());
     uint16_t old_empty = state.empty_voltage_mv;
     state.empty_voltage_mv = new_empty;
-    min_vbat_while_load_on_mv = 0xFFFFu;
+    if (reset_min)
+        min_vbat_while_load_on_mv = 0xFFFFu;
 
     if (request_flash &&
         AbsDiffU16(new_empty, old_empty) >= EMPTY_PERSIST_MIN_CHANGE_MV &&
@@ -1533,8 +1571,12 @@ void UpdateBatteryMinMax(void)
         {
             min_vbat_while_load_on_mv = 0xFFFFu;
             empty_persisted_this_session = 0;
+            empty_learn_load_off_start_tick = 0u;
+            empty_learn_brownout_tick = 0u;
         }
-        else
+        /* Only track/commit empty when charger is ABSENT (actual discharge). Exclude FORCED_OFF_WINDOW
+         * because the 1.5s calibration window causes an artificial VBAT dip—that min is not true empty. */
+        else if (sys_state.charger_state == CHARGER_STATE_ABSENT)
         {
             /* Track min VBAT when load is on; when INA invalid but RPi on, assume load on (brownout). */
             int16_t out_ma = state.output_current_mA;
@@ -1548,12 +1590,24 @@ void UpdateBatteryMinMax(void)
 
             if ((load_on || assume_load_on) && state.battery_voltage_mv >= state.protection_voltage_mv)
             {
+                empty_learn_load_off_start_tick = 0u;  /* Load is on; clear load_off debounce */
                 if (min_vbat_while_load_on_mv == 0xFFFFu ||
                     state.battery_voltage_mv < min_vbat_while_load_on_mv)
                     min_vbat_while_load_on_mv = state.battery_voltage_mv;
             }
             if (load_off && min_vbat_while_load_on_mv != 0xFFFFu)
-                EmptyLearn_CommitTrackedMin(1);
+            {
+                uint32_t now = sched_flags.tick_counter;
+                if (empty_learn_load_off_start_tick == 0u)
+                    empty_learn_load_off_start_tick = now;
+                else if ((now - empty_learn_load_off_start_tick) >= EMPTY_LEARN_LOAD_OFF_HOLD_TICKS)
+                {
+                    EmptyLearn_CommitTrackedMin(1, 1);
+                    empty_learn_load_off_start_tick = 0u;
+                }
+            }
+            else if (!load_off)
+                empty_learn_load_off_start_tick = 0u;
         }
     }
     state.empty_voltage_mv = ClampU16(state.empty_voltage_mv, state.protection_voltage_mv, EmptyVoltageMaxMv());
@@ -1564,10 +1618,9 @@ void UpdateBatteryPercentage(void)
     int32_t range = (int32_t)state.full_voltage_mv - (int32_t)state.empty_voltage_mv;
     if (range < MIN_VOLTAGE_DELTA_MV)
         return;
-    uint32_t now_ticks = sched_flags.tick_counter;
-    uint8_t true_vbat_fresh = IsTrueVbatSampleFresh(now_ticks, state.last_true_vbat_sample_tick);
+    uint8_t true_vbat_usable = IsTrueVbatUsableForDecision();
     uint8_t charging = Charger_IsInfluencingVBAT(&sys_state);
-    if (charging && !true_vbat_fresh)
+    if (charging && !true_vbat_usable)
         return;
     int32_t voltage = charging ? (int32_t)state.last_true_vbat_mv
                                : (int32_t)state.battery_voltage_mv;
@@ -1629,6 +1682,9 @@ static uint8_t I2C1_BusIdleStable500us(void)
     return 1u;
 }
 
+/* If no I2C master activity for this long (ticks), allow INA219 reads unconditionally. */
+#define I2C_MASTER_IDLE_ALLOW_READ_TICKS  (5u * TICKS_PER_1S)
+
 static uint8_t I2C1_GuardWindowReady(void)
 {
     uint16_t now_us = (uint16_t)LL_TIM_GetCounter(TIM3);
@@ -1639,6 +1695,34 @@ static uint8_t I2C1_GuardWindowReady(void)
     if (txn_active)
         return 0u;
 
+    /* Track last I2C master activity in tick resolution so we can allow reads when master has been idle > 5 s. */
+    {
+        static uint16_t last_seen_stop_us = 0u;
+        static uint16_t last_seen_addr_us = 0u;
+        static uint32_t last_i2c_activity_tick = 0u;
+        uint32_t now_ticks = sched_flags.tick_counter;
+
+        if (last_stop_us != last_seen_stop_us || last_addr_us != last_seen_addr_us)
+        {
+            last_i2c_activity_tick = now_ticks;
+            last_seen_stop_us = last_stop_us;
+            last_seen_addr_us = last_addr_us;
+        }
+
+        /* No master activity observed yet, or master idle long enough: no collision risk, allow after bus checks. */
+        if (last_i2c_activity_tick == 0u ||
+            (now_ticks - last_i2c_activity_tick) > I2C_MASTER_IDLE_ALLOW_READ_TICKS)
+        {
+            if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
+                !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
+                return 0u;
+            if (!I2C1_BusIdleStable500us())
+                return 0u;
+            return 1u;
+        }
+    }
+
+    /* Master recently active: apply 50 ms guard window to avoid collision. */
     if ((uint16_t)(now_us - last_stop_us) > 50000u)
         return 0u;
 
@@ -1660,7 +1744,9 @@ static uint8_t I2C1_GuardWindowReady(void)
 
 static void BatteryPlateau_UpdateBatteryFullClear(uint32_t now_ticks)
 {
-    if (sys_state.charger_state != CHARGER_STATE_PRESENT)
+    /* Clear FULL only on physical charger removal (ABSENT). FORCED_OFF_WINDOW is a calibration
+     * window -- the charger remains physically connected, so the FULL latch is preserved. */
+    if (sys_state.charger_state == CHARGER_STATE_ABSENT)
     {
         battery_full = 0;
         battery_full_clear_start_ticks = 0;
@@ -1682,7 +1768,8 @@ static void BatteryPlateau_UpdateBatteryFullClear(uint32_t now_ticks)
 static void BatteryPlateau_Tick1s(void)
 {
     uint32_t now_ticks = sched_flags.tick_counter;
-    uint8_t charger_present = (sys_state.charger_state == CHARGER_STATE_PRESENT) ? 1u : 0u;
+    /* Only reset when charger physically absent; FORCED_OFF_WINDOW is still "connected" (calibration window). */
+    uint8_t charger_connected = (sys_state.charger_state != CHARGER_STATE_ABSENT) ? 1u : 0u;
 
     if (state.battery_params_self_programmed != 0u)
     {
@@ -1690,39 +1777,49 @@ static void BatteryPlateau_Tick1s(void)
         battery_full_clear_start_ticks = 0;
         BatteryPlateau_ResetSession();
         plateau_last_charger_state = sys_state.charger_state;
-        plateau_last_power_state = sys_state.power_state;
         return;
     }
 
-    if (!charger_present)
+    if (!charger_connected)
     {
         battery_full = 0;
         battery_full_clear_start_ticks = 0;
         BatteryPlateau_ResetSession();
         plateau_last_charger_state = sys_state.charger_state;
-        plateau_last_power_state = sys_state.power_state;
         return;
     }
 
-    if (plateau_last_charger_state != CHARGER_STATE_PRESENT && charger_present)
+    /* Reset window only when transitioning from unplugged to connected, not on PRESENT <-> FORCED_OFF_WINDOW. */
+    if (plateau_last_charger_state == CHARGER_STATE_ABSENT && sys_state.charger_state != CHARGER_STATE_ABSENT)
         BatteryPlateau_ResetSession();
     plateau_last_charger_state = sys_state.charger_state;
 
-    /* Reset plateau window on power-state transition so the 30-min window is continuous under RPI_ON. */
-    if (plateau_last_power_state != POWER_STATE_RPI_ON && sys_state.power_state == POWER_STATE_RPI_ON)
-        BatteryPlateau_ResetWindow();
-    plateau_last_power_state = sys_state.power_state;
-
     BatteryPlateau_UpdateBatteryFullClear(now_ticks);
 
-    /* Taper gate: hold time that battery (charging) current <= I_TAPER_MA with valid; else reset */
+    /* Taper accumulation: |battery_current_mA| <= I_TAPER_MA with fresh reading; else reset.
+     * Bidirectional: slight discharge draws (negative current) count -- normal operation draws
+     * small loads from the battery even while charging. Stale/invalid readings reset the timer. */
     if (state.battery_current_valid &&
-        state.battery_current_mA >= 0 &&
+        state.battery_current_mA >= -(int16_t)I_TAPER_MA &&
         state.battery_current_mA <= (int16_t)I_TAPER_MA)
         taper_hold_ticks += (uint32_t)TICKS_PER_1S;
     else
         taper_hold_ticks = 0;
 
+    /* Taper path: independent of plateau window stability.
+     * Declares FULL if current has been within +/-I_TAPER_MA for TAPER_HOLD_SEC and VBAT is at
+     * near-top voltage. No learned-full update from this path (no plateau mean available). */
+    if (taper_hold_ticks >= (uint32_t)(TAPER_HOLD_SEC * TICKS_PER_1S) &&
+        filtered_vbat_mv >= VBAT_FULL_MIN_MV)
+    {
+        battery_full = 1;
+        battery_full_clear_start_ticks = 0;
+        if (!plateau_suppressed)
+            plateau_suppressed = 1;
+    }
+
+    /* Plateau path: stable 30-min voltage window at near-top voltage.
+     * Also updates the learned full-voltage calibration value. */
     plateau_eval_counter++;
     if (plateau_eval_counter < PLATEAU_EVAL_PERIOD_SEC)
         return;
@@ -1736,14 +1833,6 @@ static void BatteryPlateau_Tick1s(void)
         plateau_sample_index = 0;
 
     if (plateau_sample_count < PLATEAU_WINDOW_SAMPLES)
-        return;
-    if (plateau_suppressed)
-        return;
-    if (filtered_vbat_mv < VBAT_FULL_MIN_MV)
-        return;
-    if (sys_state.power_state != POWER_STATE_RPI_ON || sys_state.power_state_entry_ticks == 0u)
-        return;
-    if ((now_ticks - sys_state.power_state_entry_ticks) < (uint32_t)(PLATEAU_POWER_STABLE_SEC * TICKS_PER_1S))
         return;
 
     uint16_t min_v = 0xFFFFu;
@@ -1762,19 +1851,20 @@ static void BatteryPlateau_Tick1s(void)
     if ((uint16_t)(max_v - min_v) > PLATEAU_DELTA_MV)
         return;
 
-    /* Optional taper gate: if current is valid, require taper hold; else plateau-only (no stale current) */
-    if (state.battery_current_valid &&
-        taper_hold_ticks < (uint32_t)(TAPER_HOLD_SEC * TICKS_PER_1S))
+    uint16_t plateau_mean = (uint16_t)(sum / plateau_sample_count);
+    if (plateau_mean < PLATEAU_MEAN_MIN_MV)
+        return;
+
+    /* Plateau path requires VBAT at near-top voltage; taper is handled independently above. */
+    if (filtered_vbat_mv < VBAT_FULL_MIN_MV)
         return;
 
     if (state.full_voltage_mv < LEARNED_FULL_MIN_MV || state.full_voltage_mv > LEARNED_FULL_MAX_MV)
         state.full_voltage_mv = VBAT_FULL_MIN_MV;
 
-    uint16_t plateau_mean = (uint16_t)(sum / plateau_sample_count);
     uint16_t learned_full = state.full_voltage_mv;
     uint16_t old_full = state.full_voltage_mv;
 
-    if (AbsDiffU16(plateau_mean, learned_full) >= PLATEAU_MIN_CHANGE_MV)
     {
         uint32_t num = (uint32_t)learned_full * (uint32_t)(PLATEAU_ALPHA_DEN - PLATEAU_ALPHA_NUM) +
                        (uint32_t)plateau_mean * (uint32_t)PLATEAU_ALPHA_NUM +
@@ -1801,7 +1891,8 @@ static void BatteryPlateau_Tick1s(void)
 
     battery_full = 1;
     battery_full_clear_start_ticks = 0;
-    plateau_suppressed = 1;
+    if (!plateau_suppressed)
+        plateau_suppressed = 1;
 }
 
 /* DMA only sets adc_ready; main loop processes ADC and updates state */
@@ -1889,7 +1980,7 @@ static void Protection_Step(void)
         sys_state.pending_power_cut_start_ticks = sched_flags.tick_counter;
         /* Empty learning: commit tracked min before power cut (spec commit condition (2)). */
         if (state.battery_params_self_programmed == 0)
-            EmptyLearn_CommitTrackedMin(0);
+            EmptyLearn_CommitTrackedMin(0, 1);
     }
     RequestFlashSave(1, 1);
     sys_state.pending_power_cut = 1;
@@ -2097,11 +2188,44 @@ static void CurrentAge_Tick10ms(void)
     state.battery_current_valid =
         (((uint32_t)state.battery_current_age_10ms) <= CURRENT_VALID_AGE_TICKS) ? 1u : 0u;
 
-    /* Empty learning: commit on loss of output-current validity while RPi on (spec condition (3)). */
-    if (prev_output_valid && !state.output_current_valid &&
-        sys_state.power_state == POWER_STATE_RPI_ON &&
-        state.battery_params_self_programmed == 0)
-        EmptyLearn_CommitTrackedMin(1);
+    /* Empty learning condition (3): output-current validity loss while RPi is on.
+     * Intended to catch abrupt brownouts where the Pi dies before current drops to ~0.
+     * Problem: validity also expires ~2s after any I2C polling gap (no master activity
+     * → INA guard blocks reads → age exceeds CURRENT_VALID_AGE_SEC). An immediate commit
+     * on each validity-loss transition would fire on every script run, committing a
+     * non-minimum value from a short fresh-session window.
+     * Fix: debounce — start a timer on validity loss; commit only after
+     * EMPTY_LEARN_BROWNOUT_HOLD_TICKS of sustained validity loss. Cancel if validity
+     * is restored before the hold expires (polling gap case). A genuine brownout results
+     * in no further I2C activity, so the hold fires and commits correctly.
+     * reset_min=0: preserve tracking across validity gaps so the accumulated minimum
+     * is not discarded on transient gaps. Conditions (1)/(2) use reset_min=1. */
+    if (state.battery_params_self_programmed == 0 &&
+        sys_state.power_state == POWER_STATE_RPI_ON)
+    {
+        if (prev_output_valid && !state.output_current_valid &&
+            min_vbat_while_load_on_mv != 0xFFFFu)
+        {
+            /* Validity just dropped — start brownout debounce */
+            empty_learn_brownout_tick = sched_flags.tick_counter;
+        }
+        else if (state.output_current_valid)
+        {
+            /* Validity restored — cancel debounce (was a polling gap, not a brownout) */
+            empty_learn_brownout_tick = 0u;
+        }
+        else if (empty_learn_brownout_tick != 0u &&
+                 (sched_flags.tick_counter - empty_learn_brownout_tick) >= EMPTY_LEARN_BROWNOUT_HOLD_TICKS)
+        {
+            /* Sustained validity loss — likely a real brownout; commit and clear */
+            EmptyLearn_CommitTrackedMin(1, 0);
+            empty_learn_brownout_tick = 0u;
+        }
+    }
+    else
+    {
+        empty_learn_brownout_tick = 0u;
+    }
 
     if (state.output_current_valid != prev_output_valid ||
         state.battery_current_valid != prev_battery_valid)
@@ -2236,16 +2360,12 @@ static void Button_DispatchActions(void)
 
     if (button_handler.pending_click == BUTTON_CLICK_SHORT)
     {
-        if (sys_state.power_state == POWER_STATE_RPI_OFF)
+        if (sys_state.power_state == POWER_STATE_RPI_OFF ||
+            sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
         {
             uint8_t allow_power_on = 1;
-            if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
+            if (Charger_IsInfluencingVBAT(&sys_state) && !IsTrueVbatUsableForDecision())
                 allow_power_on = 0;
-            if (Charger_IsInfluencingVBAT(&sys_state) &&
-                !IsTrueVbatSampleFresh(sched_flags.tick_counter, state.last_true_vbat_sample_tick))
-            {
-                allow_power_on = 0;
-            }
             if (state.battery_voltage_mv <= state.protection_voltage_mv)
                 allow_power_on = 0;
             if (allow_power_on)

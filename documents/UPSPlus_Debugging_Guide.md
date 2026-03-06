@@ -8,6 +8,49 @@ Authoritative behavior reference: `documents/UPSPlus_Behavior_Spec.md`
 
 ---
 
+## I2C Reading Examples
+
+I2C address: `0x17` on bus `1` (Raspberry Pi default).
+
+```bash
+# Read a single byte register
+i2cget -y 1 0x17 0x01
+
+# Read a 16-bit little-endian register (e.g. full voltage)
+i2cget -y 1 0x17 0x0D w
+
+# Dump all registers
+i2cdump -y 1 0x17
+```
+
+Use `i2cdetect -y 1` to confirm the device is visible on the bus. If it
+does not appear at `0x17`, check power, wiring, and I2C bus number.
+
+---
+
+## Entering OTA Mode via I2C Command
+
+**Caution:** This method reboots the UPSPlus immediately. Power to the
+Raspberry Pi will be interrupted and the Pi will restart.
+
+With the firmware running and the UPSPlus on the I2C bus, write **0x7F**
+to register **0xFC**. The firmware persists the bootloader OTA flag, saves
+flash, and reboots immediately into the bootloader. The device will stay in
+OTA mode until a firmware update is performed.
+
+```bash
+i2cset -y 1 0x17 0xFC 0x7F b
+```
+
+Use the same I2C bus as your setup (e.g. `0` or `1` on Raspberry Pi).
+After a few seconds the device resets into bootloader OTA mode. Verify with
+`i2cdetect -y 1`; the bootloader appears at address `0x18`.
+
+The button sequence (remove power, hold Func Key, reinsert batteries) is
+the recommended alternative when avoiding a Pi restart is important.
+
+---
+
 ## 1. Debugging Script Overview
 
 Scripts:
@@ -141,8 +184,6 @@ Factory test pages:
 - Selector 5 validates flash status and auto power on bitfields.
 - Selector 6 reports INA boot presence bits.
 - Selector 7 reports output/battery age in 10 ms units (saturated to 255).
-- **Selector 0x08 (reset cause this boot):** 0xFD = raw RCC_CSR reset-flag byte (bits 31:25). 0xFE = CSR bits 23:16; 0xFF = CSR bits 31:24 (high 16 bits of CSR, not little-endian). Flag byte bits: 6=LPWRRSTF, 5=WWDGRSTF, 4=IWDGRSTF, 3=SFTRSTF, 2=PORRSTF, 1=PINRSTF, 0=BORRSTF. Client interprets raw; multiple bits can be set.
-- **Selector 0x09 (last persisted reset cause):** 0xFD = last_reset_cause (same raw flag byte from the run that last did a flash save). 0xFE = last_reset_seq (save-time sequence low byte; diagnostic context only). 0xFF = 0. If no valid prior boot record, 0xFD and 0xFE are 0 (unknown).
 - Unknown selector returns zeros for page data.
 - Writes to 0xFD-0xFF are ignored.
 
@@ -219,6 +260,4 @@ Persistence checks:
 - Use `i2cdetect -y 1` to confirm the device is visible on the bus.
 - If tests time out, confirm the I2C bus number and address.
 - If the factory reset test is not running, ensure `--allow-destructive` is set.
-
-**Reset cause (e.g. after unexpected reboot):** Set factory test selector to 0x08 and read 0xFD–0xFF for this boot’s reset flags (raw RCC_CSR). Set selector to 0x09 to read the last persisted reset cause and sequence from the previous run. Zero in 0xFD/0xFE on page 0x09 means no valid prior boot record. See factory test pages above for byte layout and flag bit meanings.
 

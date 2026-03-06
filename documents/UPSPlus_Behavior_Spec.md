@@ -156,14 +156,8 @@ It is intended as the source of truth for feature development and future changes
   - 0xFD: output_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFE: battery_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFF: 0  
-- Selector 0x08: Reset cause (this boot)  
-  - 0xFD: raw reset-flag byte (RCC CSR bits 31:25): bit6=LPWRRSTF, bit5=WWDGRSTF, bit4=IWDGRSTF, bit3=SFTRSTF, bit2=PORRSTF, bit1=PINRSTF, bit0=BORRSTF  
-  - 0xFE–0xFF: CSR bits 23:16 and 31:24 (high 16 bits of RCC_CSR). Client interprets; no firmware normalization.  
-- Selector 0x09: Last persisted reset cause (from flash)  
-  - 0xFD: last_reset_cause (raw reset-flag byte as stored at last flash save)  
-  - 0xFE: last_reset_seq (sequence byte from flash)  
-  - 0xFF: reserved (0)  
 
+**Reset cause not reported:** The application does not have access to the bootloader source. The bootloader clears the RCC reset flags (e.g. writes `RMVF=1` to `RCC_CSR`) before jumping to the application, so by the time the app runs the reset cause is already lost. Reset cause is not recorded or reported via I2C or factory test.
 ### 4.5 I2C Bus Robustness
 - I2C input filters (analog and digital, 1 I2C clock digital filter) are enabled at init to improve robustness in noisy environments.
 - Stuck-bus recovery is performed in software (e.g. SCL toggling); no hardware I2C timeout is used. Recovery behavior is internal and does not change the external I2C register contract.
@@ -182,6 +176,13 @@ It is intended as the source of truth for feature development and future changes
   **slave → master → slave** and restores slave mode immediately after the read.
 - Sampling cadence alternates channels at 500 ms intervals (each channel updates ~1 Hz) when
   the master window can be safely entered.
+- **Standalone operation (no I2C master):** INA219 master reads are opportunistic and require
+  recent I2C bus activity to confirm it is safe to switch to master mode. If no I2C master has
+  been active within the last ~50 ms, the guard window blocks the read attempt. As a result,
+  `output_current_valid` and `battery_current_valid` remain 0 in standalone operation (no RPi
+  or other I2C master present). This is a deliberate constraint: the taper full-detection path
+  will not trigger without a master present, and empty-learning falls back to assuming load-on
+  whenever `power_state == RPI_ON` and current validity is absent.
 
 ---
 
@@ -196,12 +197,13 @@ States:
 
 Key transitions:
 - `RPI_OFF → LOAD_ON_DELAY`: auto-power-on enabled AND charger present AND battery percent > low threshold AND battery voltage > protection threshold (+ hysteresis).
-- `LOAD_ON_DELAY → RPI_ON`: delay elapsed AND conditions still valid.
-- `LOAD_ON_DELAY → RPI_OFF`: conditions invalid.
+- `LOAD_ON_DELAY → RPI_ON`: delay elapsed AND battery percent > low threshold.
+- `LOAD_ON_DELAY → PROTECTION_LATCHED`: battery voltage drops below protection threshold while delay is in progress.
+- `LOAD_ON_DELAY → RPI_OFF`: battery percent falls below low threshold (but battery still above protection threshold).
 - `RPI_ON → PROTECTION_LATCHED`: battery below protection voltage for required samples.
 - `RPI_ON → RPI_OFF`: manual off (long press).
-- `PROTECTION_LATCHED → LOAD_ON_DELAY`: charger present AND battery percent > low threshold AND battery voltage > protection threshold (+ hysteresis).
-- `PROTECTION_LATCHED → RPI_OFF`: charger disconnected or conditions invalid.
+- `PROTECTION_LATCHED → LOAD_ON_DELAY`: **auto-power-on enabled** AND charger present AND battery percent > low threshold AND battery voltage > protection threshold (+ hysteresis).
+- `PROTECTION_LATCHED → RPI_OFF`: charger disconnected or conditions insufficient for power-on. **This transition is not gated on auto-power-on** — the latch must always clear when conditions do not support power-on, regardless of the auto-power-on setting, so the state machine cannot become permanently stuck.
 - Battery percent is derived from true-VBAT when the charger is influencing VBAT; if true-VBAT is stale, percent is held.
 
 ### 5.2 Charger State Machine (`charger_state_t`)
@@ -225,7 +227,8 @@ Key behaviors:
 
 ### 5.4 Button FSM
 - Debounced at 50ms.
-- Short press: power on if off and safe.
+- Short press: power on if in `RPI_OFF` **or** `PROTECTION_LATCHED`, subject to safety checks
+  (battery above protection threshold; true-VBAT fresh if charger is present).
 - Long press (>= 10s):
   - If ON → power off.
   - If OFF → factory reset.
@@ -255,47 +258,48 @@ Key behaviors:
 - Battery percent update direction uses charger state (charger path enabled), not VBUS voltage.
 - Protection voltage is enforced with hysteresis (50mV).
 - Protection latch requires multiple ADC samples below threshold (3 samples).
-- **Full battery detection (hybrid: plateau + optional current taper)** (self-programming enabled):
+- **Full battery detection (plateau OR taper, independent paths)** (self-programming enabled):
+  - **Overview:** FULL is declared when **either** the plateau path **or** the taper path
+    independently satisfies its conditions (OR semantics). Both paths run concurrently; whichever
+    triggers first declares FULL. The learned full-voltage calibration value is updated only from
+    the plateau path (taper path has no plateau mean to learn from).
   - **Definitions:**
-    - **Filtered VBAT:** the filtered battery voltage used everywhere in this algorithm.
+    - **Filtered VBAT:** the IIR-smoothed battery voltage used in both paths.
     - **Plateau window:** over `PLATEAU_WINDOW_SEC`, with tolerance `PLATEAU_DELTA_MV`:
       within the window, `max(VBAT) - min(VBAT) <= PLATEAU_DELTA_MV`. Default
       `PLATEAU_WINDOW_SEC` is **1800 seconds (30 minutes)** and default `PLATEAU_DELTA_MV` is **40 mV**.
     - **Current freshness:** a current measurement is usable only when the corresponding
       `*_current_valid` flag is set (fresh within the validity window).
-  - **Primary full criterion (plateau)** — baseline behavior, MUST be supported. While charger
-    state is `PRESENT`, the battery is considered **FULL** when:
-    1. The plateau condition holds continuously for `PLATEAU_WINDOW_SEC`, and
-    2. Filtered VBAT is at or above a near-top minimum, `VBAT_FULL_MIN_MV` (prevents plateauing
-       at mid-voltage from being misclassified as full). Recommended **4150–4180 mV**, default **4180 mV**.
-  - **Optional secondary criterion (taper gate):** If reliable charge-current telemetry exists
-    (e.g. INA219 battery-path current) and the measurement is fresh, plateau qualification MAY
-    be tightened by requiring a taper condition during the final portion of the plateau window.
-    The taper hold interval is evaluated **concurrently** with the final portion of the plateau
-    window. When enabled, the plateau is only accepted as FULL if, in addition to the primary criterion:
-    3. Battery charge current is low (taper): battery current is <= `I_TAPER_MA` for at least
-       `TAPER_HOLD_SEC` continuously, and the battery-current measurement is fresh
-       (`battery_current_valid` set) for all samples contributing to the hold time. Battery charge
-       current refers to **positive** (charging) battery current; negative current (discharge) does
-       not satisfy the taper condition.
-    If current telemetry is not fresh for a sustained period, the taper gate is skipped and the
-    decision falls back to voltage plateau only.
+  - **Plateau path:** While the charger state is not `ABSENT`, the battery is considered **FULL** when:
+    1. The plateau condition holds continuously for `PLATEAU_WINDOW_SEC`,
+    2. The plateau mean is at or above `PLATEAU_MEAN_MIN_MV` (prevents mid-voltage plateau
+       misclassification; default **4150 mV**), and
+    3. Filtered VBAT is at or above `VBAT_FULL_MIN_MV` (near-top guard; default **4180 mV**).
+  - **Taper path:** Independent of plateau window stability. The battery is considered **FULL** when:
+    1. `|battery_current_mA| <= I_TAPER_MA` continuously for `TAPER_HOLD_SEC`, with
+       `battery_current_valid` set for every accumulating tick (stale/invalid readings reset
+       the hold timer to zero), and
+    2. Filtered VBAT is at or above `VBAT_FULL_MIN_MV` (same near-top guard as the plateau path).
+    The taper window accepts both positive (charge) and negative (discharge) current within
+    `+/-I_TAPER_MA`: slight power draws from the battery occur during normal operation and are
+    consistent with a full-charge state. If `battery_current_valid` is never set (no INA219
+    present, or no I2C master driving reads -- see Section 4.6), the taper path never triggers.
   - **Defaults / recommended values:**
-    - `VBAT_FULL_MIN_MV`: 4150–4180 mV (default 4180 mV).
+    - `VBAT_FULL_MIN_MV`: 4150-4180 mV (default **4180 mV**).
+    - `PLATEAU_MEAN_MIN_MV`: **4150 mV** (plateau-path prerequisite only).
     - `I_TAPER_MA`: conservative, e.g. C/20 equivalent (default **150 mA** for ~3000 mAh cells).
-    - `TAPER_HOLD_SEC`: 300–600 s (default **300 s**).
-  - **Latching and reset semantics:** When FULL is asserted, it is latched until either charger
-    state becomes not `PRESENT`, or filtered VBAT drops below `VBAT_FULL_RESET_MV` for
-    `FULL_RESET_HOLD_SEC`. Recommended: `VBAT_FULL_RESET_MV = VBAT_FULL_MIN_MV - 100 mV`,
-    `FULL_RESET_HOLD_SEC` = **30–60 s**.
-  - **Learning update rule (unchanged):** on a plateau event, compute the plateau level as the mean
-    of filtered VBAT samples within the window; if `abs(plateau - learned_full) >= PLATEAU_MIN_CHANGE_MV`,
-    update learned full (e.g. EMA). Clamp `learned_full` to `[LEARNED_FULL_MIN_MV, LEARNED_FULL_MAX_MV]`.
-    Persist only if change >= `PLATEAU_PERSIST_MIN_CHANGE_MV` and at most once per charger-present session.
-  - **Safety / robustness:** The taper gate MUST NOT use stale current readings: `*_current_valid` must
-    be set. Current taper is a secondary confirmation, not the sole definition of full. The voltage
-    plateau algorithm remains the canonical mechanism for “full” if current telemetry is unavailable
-    or unreliable.
+    - `TAPER_HOLD_SEC`: 300-600 s (default **300 s**).
+  - **Latching and reset semantics:** When FULL is asserted (by either path), it is latched until
+    the charger state becomes `ABSENT` (physical charger removal), or filtered VBAT drops below
+    `VBAT_FULL_RESET_MV` for `FULL_RESET_HOLD_SEC`. The FULL flag is **not** cleared during
+    `FORCED_OFF_WINDOW` measurement windows: the charger remains physically connected during those
+    windows and FULL was correctly detected before the window started.
+    Recommended: `VBAT_FULL_RESET_MV = VBAT_FULL_MIN_MV - 100 mV`, `FULL_RESET_HOLD_SEC` = **30-60 s**.
+  - **Learning update rule:** On a plateau path event, compute the plateau level as the mean of
+    filtered VBAT samples within the window and update learned full (EMA) toward that mean. Clamp
+    `learned_full` to `[LEARNED_FULL_MIN_MV, LEARNED_FULL_MAX_MV]`. Persist only if change >=
+    `PLATEAU_PERSIST_MIN_CHANGE_MV` and at most once per charger-present session. The taper path
+    does **not** trigger a learning update.
 - **Empty voltage learning (self-programming enabled):** While the charger is not influencing VBAT,
   the firmware tracks the **minimum** battery voltage seen while the load is on (output current above
   `EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA`). Output/battery current values are derived directly from
@@ -336,11 +340,28 @@ Key behaviors:
 
 ## 8. Flash Persistence
 
-- Single-slot persistence (1KB page).
+- Single-slot persistence (1KB page at `0x08003C00`).
 - Dirty state is periodically flushed (60s) and on critical events.
 - Flash write attempts are rate limited unless bypassed.
-- Integrity: record structure version **2**; validation uses **hardware CRC**. Records with older structure version or invalid CRC are rejected at load → defaults applied and state marked dirty.
+- Integrity: record structure version **3**; validation uses **hardware CRC** (STM32 polynomial `0x04C11DB7`, init `0xFFFFFFFF`, no reflection). Records with an older structure version or invalid CRC are rejected at load → defaults applied and state marked dirty.
 - CRC and sequence validation performed on load; invalid or wrong-version → defaults + dirty.
+
+### 8.1 Flash Storage Format (Stride-2)
+
+The application persists settings using a **stride-2** format: each byte of the `flash_persistent_data_t` struct occupies one 16-bit halfword in flash, with the data byte in the LSByte and `0xFF` (erased state) in the MSByte.
+
+```
+Flash address:  base+0   base+1   base+2   base+3   ...  base+N*2
+Contents:       data[0]  0xFF     data[1]  0xFF     ...  data[N]
+```
+
+**Why stride-2?** The resident bootloader reads and writes the settings page in exactly this format (one byte per halfword), using its internal 255-byte buffer indexed by halfword position. If the application were to pack two struct bytes per halfword (the default STM32 halfword-write pattern), the bootloader's save-restore cycle during OTA would destroy all odd-indexed struct bytes, corrupting the magic number and all multi-byte fields. Using the same stride-2 format ensures the bootloader can round-trip the page without corruption.
+
+**OTA flag placement:** The `bootloader_ota_flag` field sits at struct byte offset `0x32`. With stride-2 storage this maps to flash address `0x08003C00 + 0x32 × 2 = 0x08003C64`, which is the address the bootloader checks at boot time. The mapping is enforced by a compile-time `STATIC_ASSERT`.
+
+**CRC scope:** The CRC covers the configuration and runtime-state fields only (`full_voltage_mv` through `charging_time_sec`). The header (magic, version, sequence), the CRC field itself, and the OTA padding + flag are all excluded from the CRC calculation, making the OTA flag self-clearing without invalidating the record.
+
+**Storage size:** Each struct byte uses two flash bytes, so the total flash footprint is `sizeof(flash_persistent_data_t) × 2`. A compile-time assert verifies this fits within the 1 KB settings page.
 
 ---
 
@@ -357,7 +378,7 @@ Key behaviors:
 
 - **Independent Watchdog (IWDG):** Timeout ~8 s (LSI-based). Refreshed **once per main-loop iteration**, after critical work (scheduler, I2C processing, INA probe, flash save, protection/GPIO). **Never** refreshed in ISRs (e.g. I2C ISR); a main-loop hang or I2C deadlock cannot keep the watchdog alive. If the main loop does not complete within the timeout, the device resets.
 - **HardFault safe state (prioritize Pi uptime):** On HardFault the handler drives **IP_EN LOW** (charger path off) and keeps **PWR_EN HIGH** (MCU hold-up), but it **does not force MT_EN LOW**. MT_EN is left unchanged to avoid unnecessarily power-cycling the Raspberry Pi if it is otherwise running normally. The handler then triggers an immediate system reset. Note: if the application’s protection logic later determines the battery is below the protection threshold, it will still perform the normal shutdown sequence (attempt flash save, then cut MT_EN).
-- **Reset cause:** Captured from RCC at boot (before clear). Persisted in flash and exported via I2C: **factory test selector 0x08** = this boot’s raw reset flags and CSR high bits; **selector 0x09** = last persisted reset cause and sequence from flash. Encoding is raw RCC_CSR bits; client interprets (e.g. IWDGRSTF, PINRSTF, PORRSTF).
+- **Reset cause:** The bootloader (which we do not have access to) clears the RCC reset flags before starting the application, so the actual reset cause cannot be read by the app. The firmware does not record or expose reset cause via I2C; the corresponding flash fields are reserved (written as 0) for layout compatibility.
 
 ---
 
@@ -418,37 +439,45 @@ The bootloader does **not** provide a runtime command to exit OTA mode or to jum
 |------|---------------|------|
 | Bootloader | `0x08000000 – 0x080007FF` | Resident; never erased |
 | Application | `0x08000800 – 0x08003BFF` | Erased and reprogrammed during OTA |
-| Device Settings / Persistence | `0x08003C00 – 0x08003FFF` | Erased during OTA |
+| Device Settings / Persistence | `0x08003C00 – 0x08003FFF` | Saved to RAM before erase; restored after (OTA flag cleared) |
 
 - Flash page size is **1 KB (0x400 bytes)**.
-- OTA erase operations cover the entire range `0x08000800` through `0x08003FFF`.
+- OTA erase operations cover all 14 pages from `0x08000800` through `0x08003FFF`.
+- The device settings page is erased as part of this operation but is saved to RAM first and restored afterwards; see Section 14.5.2.
 
 ---
 
 ### 14.3 Boot-Time Mode Selection
 
-On reset, the bootloader determines whether to enter OTA mode or boot the application using the following conditions.
+On reset, the bootloader determines whether to enter OTA mode or boot the application using the following conditions, evaluated **in order**:
+
+1. OTA request flag present at `0x08003C64 == 0x7F` → **enter OTA mode**
+2. Force-boot button asserted (GPIOB IDR bit 1 low) → **enter OTA mode**
+3. Application MSP at `0x08000800` fails SRAM validation → **enter OTA mode**
+4. All checks pass → **boot the application**
 
 #### 14.3.1 Force-Bootloader Button
 
-- A dedicated GPIO input (GPIOB IDR bit 1) is sampled during boot.
-- If asserted, the device **enters OTA mode**.
+- A dedicated GPIO input (GPIOB IDR bit 1, active-low) is sampled during boot.
+- If asserted (pin low), the device **enters OTA mode**.
 - If not asserted, normal application boot is allowed.
 
 #### 14.3.2 OTA Request Flag (Flash)
 
-- A predefined value stored in the device settings flash page requests OTA mode.
-- If present at boot, the bootloader **enters OTA mode**.
-- This flag is **cleared implicitly** when the settings page is erased during OTA.
+- The OTA request flag is a single byte at flash address `0x08003C64` (device settings page, offset `0x64`).
+- The flag value `0x7F` requests OTA mode; any other value is ignored.
+- If the flag is set at boot, the bootloader **enters OTA mode**.
+- The flag is **cleared** as part of OTA entry: the bootloader reads the settings page into RAM, zeroes the flag byte (`settings_buf[0x32] = 0`), erases the flash page, then writes the settings back. The flag does not persist after the first OTA boot.
 
 #### 14.3.3 Application Vector Table Validation
 
 Before booting the application, the bootloader validates the application image:
 
 - Reads initial MSP from `0x08000800`
-- MSP must be within the valid SRAM range (`0x2000xxxx`)
+- MSP must satisfy `(MSP & 0x2FFE0000) == 0x20000000` (confirms address is within valid SRAM)
 - Reads reset handler from `0x08000804`
 - If validation fails, the device remains in OTA mode
+- **Note:** erased flash reads as `0xFFFFFFFF`; `0xFFFFFFFF & 0x2FFE0000 = 0x2FFE0000 ≠ 0x20000000`, so a device with no programmed application loops in OTA mode indefinitely until a valid image is received.
 
 ---
 
@@ -475,33 +504,39 @@ The device enters OTA mode at boot if **any** of the following are true:
 - OTA request flag is present in flash  
 - Application vector table is invalid  
 
-#### 14.5.2 Flash Erase Behaviour
+#### 14.5.2 Flash Erase and Settings Preservation
 
-Upon entering OTA mode, the bootloader:
+Upon entering OTA mode, the bootloader executes the following sequence:
 
-- Unlocks the FLASH peripheral
-- Sequentially erases all 1 KB flash pages from:
-  - `0x08000800` through `0x08003FFF`
-- This erase includes the **device settings / persistence page**
+1. Reads the device settings page (`0x08003C00`, 255 bytes) into RAM using its stride-2 format (LSByte of each halfword), **zeroing the OTA flag byte** (buffer index `0x32`, flash address `0x08003C64`).
+2. Unlocks the FLASH peripheral (keys `0x45670123` / `0xCDEF89AB`).
+3. Sequentially erases all 14 × 1 KB flash pages from `0x08000800` through `0x08003FFF`, including the device settings page.
+4. Writes the saved settings back to `0x08003C00` (with OTA flag cleared to `0x00`).
+5. Sets the flash write pointer to `0x08000800` and begins the OTA receive loop.
 
-Erased flash locations read back as `0xFF`.
-
-As a result, the OTA request flag is cleared automatically during the erase process.
+Erased flash locations read back as `0xFF`. The OTA request flag is zeroed in RAM before the erase begins, so it does not persist regardless of erase outcome. Device settings (battery thresholds, calibration, etc.) are **preserved** across OTA through this save-restore mechanism.
 
 ---
 
 ### 14.6 I²C OTA Programming Interface
 
-- The device operates as an I²C slave at address `0x18`.
-- Programming data is delivered using a framed protocol.
+- The device operates as an I²C slave at address `0x18`, 100 kHz standard mode.
+- Programming data is delivered using a framed block protocol.
+
+Block format (17 bytes total):
+
+| Byte | Value | Description |
+|------|-------|-------------|
+| 0 | `0xFA` | Block marker |
+| 1–16 | data | 8 × 16-bit halfwords, **LSB-first** per halfword |
 
 High-level behaviour:
 
-- Each programming block begins with a marker byte (`0xFA`)
-- Each block programs **16 bytes (8 halfwords)** of flash
-- Flash programming is performed using **16-bit halfword writes**
-- The flash write pointer auto-increments after each halfword
-- Programming continues while valid frames are received
+- Each programming block begins with the marker byte `0xFA`, followed by exactly 16 data bytes.
+- Each block programs **16 bytes (8 halfwords)** of flash starting at the current write pointer.
+- Flash programming is performed using **16-bit halfword writes**; the write pointer auto-increments by 2 after each halfword.
+- Programming starts at `0x08000800` and continues sequentially.
+- The bootloader accepts blocks continuously while valid frames are received; it returns to the application boot check after a long inactivity timeout.
 
 The bootloader does **not** expose:
 
@@ -541,9 +576,10 @@ To boot the application after OTA programming:
 ### 14.8 I²C Register Observations
 
 - The I²C register space is primarily read-only status.
-- Register `0x00` reflects current mode/state.
+- Register `0x00` is set to `0xC8` when OTA mode is active.
 - Internal OTA receive counters are exposed for diagnostics.
-- Registers `0xF0–0xFF` expose identity and version information.
+- Registers `0xF0–0xFB` expose the MCU's 96-bit unique device ID (12 bytes read from hardware UID registers at `0x1FFFF7AC`).
+- Registers `0xFC–0xFF` are unused by the bootloader (read as `0x00`).
 - No register functions as a command mailbox for reset or application boot.
 
 ---
@@ -553,7 +589,8 @@ To boot the application after OTA programming:
 - OTA workflows **must include a reset or power-cycle step** after programming.
 - Application images **must be linked for base address `0x08000800`**.
 - The application vector table must remain valid post-OTA.
-- Device settings stored in the last flash page are erased during OTA and must be reinitialized by the application.
+- Device settings stored in the last flash page are **preserved across OTA**: the bootloader saves the page to RAM before erasing and restores it after programming, with only the OTA flag cleared. The application does not need to reinitialize settings after OTA unless its own CRC/version validation fails.
+- Once OTA mode is entered the application is immediately erased. If OTA programming is interrupted or the device is power-cycled before a complete valid image is received, the device will remain in OTA mode on subsequent boots (MSP validation will fail for erased flash). A complete image must be programmed before normal boot can resume.
 ---
 
 ## 15. Glossary
@@ -573,7 +610,7 @@ To boot the application after OTA programming:
 - If register map changes, revisit: Factory Testing ABI, test scripts, and external tools.
 - If snapshot frequency changes, revisit: I2C coherence assumptions and staleness guarantees.
 - If protection logic changes, revisit: power-cut ordering and flash save semantics.
-- If reliability features change (IWDG timeout, HardFault safe outputs, reset-cause encoding), revisit: Section 10, factory test selectors 0x08/0x09, and any tools that interpret reset cause.
+- If reliability features change (IWDG timeout, HardFault safe outputs), revisit Section 10 and any tools that depend on factory test selectors.
 
 ---
 

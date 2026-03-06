@@ -74,6 +74,14 @@ extern "C" {
 #define VBAT_EMPTY_MAX_MV             4500    /* Maximum allowed empty voltage */
 /* Load detection threshold used by empty-learning logic (load_on vs load_off classification) */
 #define EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA  25   /* |output_current_mA| <= this => load off (mA) */
+/* Empty learning: require load_off sustained this long (10ms ticks) before committing on load-off; avoids committing on single-sample current glitches */
+#define EMPTY_LEARN_LOAD_OFF_HOLD_TICKS          ((uint32_t)(3u * TICKS_PER_1S))   /* 3 seconds */
+/* Empty learning (condition 3): validity must remain lost this long before committing.
+ * Filters polling gaps (validity expires ~2s after last I2C activity) from genuine brownouts.
+ * If I2C resumes before this expires, the debounce is cancelled. */
+#define EMPTY_LEARN_BROWNOUT_HOLD_TICKS          ((uint32_t)(30u * TICKS_PER_1S))  /* 30 seconds */
+/* Empty learning: do not commit if min is this close to full (avoids corrupting empty after I2C failure while battery near full) */
+#define EMPTY_LEARN_MIN_MEANINGFUL_DISCHARGE_MV 300u
 /* Empty learning: persist only if change >= this and at most once per discharge session */
 #define EMPTY_PERSIST_MIN_CHANGE_MV              20u
 
@@ -117,14 +125,13 @@ extern "C" {
 #define PLATEAU_EVAL_PERIOD_SEC       5u      /* Sliding window evaluation period */
 #define PLATEAU_DELTA_MV              40u
 #define VBAT_FULL_MIN_MV              4180u   /* Near-top minimum for plateau full (4150-4180 mV per spec) */
+#define PLATEAU_MEAN_MIN_MV           4150u   /* Min plateau mean to allow learned full update (near-top range) */
 #define VBAT_FULL_RESET_MV            (VBAT_FULL_MIN_MV - 100u)  /* Clear FULL when VBAT below this for FULL_RESET_HOLD_SEC */
 #define FULL_RESET_HOLD_SEC           45u     /* 30-60 s per spec */
 #define I_TAPER_MA                    150     /* Charge current <= this for taper gate (C/20 ~3000mAh) */
 #define TAPER_HOLD_SEC                300u    /* Taper must hold this long (concurrent with plateau) */
-#define PLATEAU_MIN_CHANGE_MV         10u
 #define PLATEAU_ALPHA_NUM             1u      /* EMA alpha = 1/4 = 0.25 (use 4 for shift, no division) */
 #define PLATEAU_ALPHA_DEN             4u
-#define PLATEAU_POWER_STABLE_SEC      60u   /* RPI_ON must be stable this long before plateau evaluation */
 #define PLATEAU_PERSIST_MIN_CHANGE_MV 20u
 #define LEARNED_FULL_MIN_MV           3900u
 #define LEARNED_FULL_MAX_MV           4500u
@@ -169,7 +176,7 @@ STATIC_ASSERT((PLATEAU_WINDOW_SEC % PLATEAU_EVAL_PERIOD_SEC) == 0,
 /* Note: Flash storage is little-endian on STM32; this constant ensures correct
  * byte order when comparing against flash-stored values. */
 #define FLASH_MAGIC_NUMBER            ((uint32_t)('U') | ((uint32_t)('P')<<8) | ((uint32_t)('S')<<16) | ((uint32_t)('P')<<24))
-#define FLASH_STRUCTURE_VERSION       2           /* Increment when structure changes (2 = HW CRC) */
+#define FLASH_STRUCTURE_VERSION       4           /* Increment when structure changes (4 = stride-2 flash format) */
 #define FLASH_WRITE_RATE_LIMIT_SEC    5           /* Minimum seconds between flash writes */
 #define FLASH_DIRTY_MAX_INTERVAL_SEC  60          /* Max seconds before forcing a dirty save */
 #define FLASH_RETRY_BACKOFF_SEC       2           /* Retry backoff after failed save */
@@ -472,6 +479,7 @@ typedef struct {
     uint32_t last_true_vbat_sample_tick; /* Tick when last true-VBAT was captured.
                                            * Must remain uint32_t; do not reintroduce 8-bit tick fields for staleness. */
     uint16_t last_true_vbat_mv;        /* Cached true-VBAT (charger not influencing) for percent calc. */
+    uint16_t persisted_true_vbat_age_sec; /* Age at save time when loaded from flash; 0 = none. Used for freshness after reset. */
 } authoritative_state_t;
 
 /* Charger Voltage Helper - Locks MAX(VBUS, USBIN) rule in code.
@@ -540,7 +548,9 @@ typedef struct {
     uint8_t low_battery_percent;
     uint8_t reserved_padding0;         /* Alignment + deterministic CRC - MUST be zeroed */
     uint16_t load_on_delay_config_sec;
-    uint16_t reserved_padding1;        /* Alignment + deterministic CRC - MUST be zeroed */
+    uint16_t last_true_vbat_mv;         /* True-VBAT at last sample (for crash recovery / auto power-on) */
+    uint16_t last_true_vbat_age_sec;    /* Age in seconds of sample at save time; 0 = no valid sample */
+    uint8_t reserved_padding2[2];      /* Alignment + deterministic CRC - MUST be zeroed */
     /* Note: Provide FlashPersistentData_InitZero(&rec) helper to ensure
      * all reserved/padding fields are zeroed before CRC calculation. */
     
@@ -548,18 +558,17 @@ typedef struct {
     /* Note: power_status (register 0x17) is NOT persisted; it is derived from state machine on boot */
     /* Runtime counters persistence: Always persisted when flash is enabled (on every flash write).
      * These are "optional for recovery" per plan - they aid recovery but are not critical. */
-    uint8_t last_reset_cause;            /* Raw RCC_CSR reset-flag byte (bits 31:25) for run that last did a save. */
-    uint8_t last_reset_seq;             /* Diagnostic context only: flash sequence number at save time (not the cause). */
-    uint8_t reserved_padding2[2];       /* Alignment + deterministic CRC - MUST be zeroed */
     uint32_t cumulative_runtime_sec;
     uint32_t charging_time_sec;
 
-    /* Reserved for bootloader: byte at 0x08003C64 must be 0x7F to enter OTA. Intentionally EXCLUDED from CRC
-     * so the bootloader can read it without affecting record validity. Do not move into CRC-covered region. */
-#define FLASH_OTA_FLAG_OFFSET   0x64
+    /* Reserved for bootloader: flash address 0x08003C64 must be 0x7F to enter OTA.
+     * The bootloader uses a stride-2 format (one byte per 16-bit halfword), so struct byte
+     * offset 0x32 maps to flash address 0x08003C00 + 0x32*2 = 0x08003C64.
+     * Intentionally EXCLUDED from CRC. Do not move into CRC-covered region. */
+#define FLASH_OTA_FLAG_OFFSET   0x32  /* struct byte offset; flash addr = base + offset*2 = 0x08003C64 */
 #define FLASH_PRE_OTA_TAIL_OFFSET  44  /* Must equal first byte after charging_time_sec; assert below */
     uint8_t reserved_ota_padding[FLASH_OTA_FLAG_OFFSET - FLASH_PRE_OTA_TAIL_OFFSET];  /* pad to OTA offset */
-    uint8_t bootloader_ota_flag;  /* At 0x08003C64: 0x7F = enter OTA, 0 = normal; app writes 0 unless OTA requested */
+    uint8_t bootloader_ota_flag;  /* At flash 0x08003C64: 0x7F = enter OTA, 0 = normal */
 } flash_persistent_data_t;
 
 /* CRC calculation span - compile-time offsets for safety (excludes OTA reserved area) */
@@ -570,15 +579,18 @@ typedef struct {
 /* Pre-OTA tail offset must match last CRC field end (no hidden padding) */
 STATIC_ASSERT((offsetof(flash_persistent_data_t, charging_time_sec) + sizeof(((flash_persistent_data_t *)0)->charging_time_sec)) == FLASH_PRE_OTA_TAIL_OFFSET,
                "FLASH_PRE_OTA_TAIL_OFFSET must equal first byte after charging_time_sec");
-/* Bootloader OTA flag must be at fixed address 0x08003C64 */
+/* Bootloader OTA flag must map to flash address 0x08003C64.
+ * Bootloader uses stride-2 format: flash_addr = FLASH_SETTINGS_BASE + struct_offset * 2.
+ * So struct offset 0x32 * 2 = 0x64 -> flash address 0x08003C00 + 0x64 = 0x08003C64. */
 STATIC_ASSERT(offsetof(flash_persistent_data_t, bootloader_ota_flag) == FLASH_OTA_FLAG_OFFSET,
-               "bootloader_ota_flag must be at offset 0x64 for bootloader OTA check");
+               "bootloader_ota_flag must be at struct offset 0x32 (maps to flash 0x08003C64)");
 /* OTA byte must remain outside CRC region (invariant for future edits) */
 STATIC_ASSERT(offsetof(flash_persistent_data_t, bootloader_ota_flag) >= FLASH_CRC_END_OFFSET,
                "bootloader_ota_flag must not be inside CRC-covered region");
-/* Compile-time assertion: flash structure must fit in slot size */
-STATIC_ASSERT(sizeof(flash_persistent_data_t) <= FLASH_PAGE_SIZE,
-               "flash_persistent_data_t exceeds FLASH_PAGE_SIZE");
+/* Compile-time assertion: stride-2 flash usage must fit in slot size.
+ * Each struct byte occupies one 16-bit halfword in flash, so total flash = sizeof * 2. */
+STATIC_ASSERT(sizeof(flash_persistent_data_t) * 2u <= FLASH_PAGE_SIZE,
+               "flash_persistent_data_t stride-2 storage exceeds FLASH_PAGE_SIZE");
 
 /*===========================================================================*/
 /*                         SCHEDULER STRUCTURES                               */
