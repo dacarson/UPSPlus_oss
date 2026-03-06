@@ -2316,15 +2316,12 @@ static void Button_DispatchActions(void)
 
     if (button_handler.pending_click == BUTTON_CLICK_SHORT)
     {
-        if (sys_state.power_state == POWER_STATE_RPI_OFF)
+        if (sys_state.power_state == POWER_STATE_RPI_OFF ||
+            sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
         {
             uint8_t allow_power_on = 1;
-            if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
-                allow_power_on = 0;
             if (Charger_IsInfluencingVBAT(&sys_state) && !IsTrueVbatUsableForDecision())
-            {
                 allow_power_on = 0;
-            }
             if (state.battery_voltage_mv <= state.protection_voltage_mv)
                 allow_power_on = 0;
             if (allow_power_on)
