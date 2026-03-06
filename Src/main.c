@@ -1321,13 +1321,11 @@ static uint8_t Flash_ProgramBuffer(uint32_t address, const uint8_t *data, uint32
     if (len == 0u || len > FLASH_PAGE_SIZE)
         return 0;
 
+    /* Stride-2 format: each struct byte occupies one 16-bit halfword (LSByte = data,
+     * MSByte = 0xFF). Matches the bootloader's read/write format so settings survive OTA. */
     while (i < len)
     {
-        uint8_t low = data[i];
-        uint8_t high = 0xFFu;
-        if ((i + 1u) < len)
-            high = data[i + 1u];
-        halfword = (uint16_t)low | ((uint16_t)high << 8);
+        halfword = (uint16_t)data[i] | 0xFF00u;
 
         FLASH->SR = FLASH_SR_EOP | FLASH_SR_PGERR | FLASH_SR_WRPRTERR;
         SET_BIT(FLASH->CR, FLASH_CR_PG);
@@ -1351,7 +1349,7 @@ static uint8_t Flash_ProgramBuffer(uint32_t address, const uint8_t *data, uint32
         }
 
         addr += 2u;
-        i += 2u;
+        i += 1u;
     }
     SET_BIT(FLASH->CR, FLASH_CR_LOCK);
     return 1;
@@ -1371,15 +1369,19 @@ void Flash_Init(void)
 void Flash_Load(void)
 {
     flash_persistent_data_t rec;
+    size_t i;
+    const uint8_t *flash_base = (const uint8_t *)FlashStorageStartPtr();
     size_t storage_size = (size_t)(FlashStorageEndPtr() - FlashStorageStartPtr());
-    if (storage_size < sizeof(rec))
+    /* Stride-2 format: each struct byte is the LSByte of a 16-bit halfword in flash. */
+    if (storage_size < sizeof(rec) * 2u)
     {
         FactoryReset();
         RequestFlashSave(0, 1);
         flash_sequence = 0;
         return;
     }
-    memcpy(&rec, (const void *)FlashStorageStartPtr(), sizeof(rec));
+    for (i = 0u; i < sizeof(rec); i++)
+        ((uint8_t *)&rec)[i] = flash_base[i * 2u];
     flash_record_valid_boot = Flash_RecordIsValid(&rec);
     flash_auto_power_on_loaded = 0u;
 
@@ -1416,7 +1418,8 @@ uint8_t Flash_Save(uint8_t bypass)
         return 1u;
     if (!bypass && !Flash_CanWrite())
         return 0u;
-    if (storage_size < sizeof(rec))
+    /* Stride-2 format: each struct byte occupies one halfword in flash. */
+    if (storage_size < sizeof(rec) * 2u)
         return 0u;
 
     flash_save_attempted = 1u;
@@ -1434,7 +1437,12 @@ uint8_t Flash_Save(uint8_t bypass)
     if (!ok)
         return 0u;
 
-    memcpy(&verify, (const void *)FlashStorageStartPtr(), sizeof(verify));
+    {
+        size_t vi;
+        const uint8_t *flash_base = (const uint8_t *)FlashStorageStartPtr();
+        for (vi = 0u; vi < sizeof(verify); vi++)
+            ((uint8_t *)&verify)[vi] = flash_base[vi * 2u];
+    }
     if (!Flash_RecordIsValid(&verify) || verify.sequence_number != next_seq)
         return 0u;
 
