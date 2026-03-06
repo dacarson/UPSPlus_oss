@@ -677,10 +677,14 @@ static void ProcessI2CPendingWrite(void)
     case REG_LOAD_ON_DELAY_L:
         if (len >= 2) {
             u16 = (uint16_t)i2c_pending_write.data[0] | ((uint16_t)i2c_pending_write.data[1] << 8);
-            if (Validate_LoadOnDelay(u16) && state.load_on_delay_config_sec != u16) {
-                state.load_on_delay_config_sec = u16;
-                changed = 1;
-                persist_changed = 1;
+            if (Validate_LoadOnDelay(u16)) {
+                if (state.load_on_delay_config_sec != u16) {
+                    state.load_on_delay_config_sec = u16;
+                    changed = 1;
+                    persist_changed = 1;
+                }
+                if (sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
+                    state.load_on_delay_remaining_sec = u16;
             }
         }
         break;
