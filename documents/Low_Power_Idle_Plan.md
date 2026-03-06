@@ -95,11 +95,18 @@ There is a classic sleep race: main checks idle (true) → an interrupt fires an
 The project already has TIM3 for `WaitUs()` (1 MHz, 1 µs resolution). Add `WaitMs()` (or equivalent) and replace every `LL_mDelay()` call:
 
 - `Src/main.c`: 1 call – `LL_mDelay(100)` at startup
-- `Src/I2C_Slave.c`: 11 calls – `LL_mDelay(1)`, `LL_mDelay(10)`, `LL_mDelay(100)` for I2C recovery and probe delays
+- `Src/I2C_Slave.c`: 12 calls – `LL_mDelay(1)` (7×), `LL_mDelay(10)` (4×, via `I2C_PROBE_RETRY_DELAY_MS`), `LL_mDelay(100)` (1×, via `I2C_PROBE_INITIAL_DELAY_MS`) for I2C recovery and probe delays
 
-`WaitMs()` is a busy loop (does not sleep); use only for startup and I2C recovery/probe delays. Do not call it in periodic runtime paths or it will undermine Phase 1 power savings. Ensure `WaitMs()` is available where needed (e.g. declare in a shared header if `I2C_Slave.c` uses it).
+`WaitMs()` is a busy loop (does not sleep); use only for startup and I2C recovery/probe delays. Do not call it in periodic runtime paths or it will undermine Phase 1 power savings.
 
-**FLASH note:** Implement `WaitMs()` as a loop of `WaitUs(1000)` to avoid overflow and keep code small. Keep the loop counter as an unsigned local and avoid division/mod; this should compile very small under -Os. Keep it `static` in the C file(s) where used unless shared use clearly reduces total size. Avoid formatting, printing, logging, and generalized timeout utilities. Replace only the exact `LL_mDelay()` call sites; do not introduce new delays. If both main.c and I2C_Slave.c need it, prefer a single shared implementation only if it does not require pulling in extra headers or new compilation units. If `WaitMs()` is duplicated in two files, keep the implementations identical and `static` to avoid accidental linkage growth.
+**FLASH note – two separate `static` implementations (preferred for FLASH minimisation):**
+
+`WaitUs()` is `static` in `main.c` and is invisible to `I2C_Slave.c`. Do **not** un-static it or add a shared declaration; that adds linker symbol overhead and a header dependency for negligible saving.
+
+- **`main.c`** – add `static void WaitMs(uint16_t ms) { while (ms--) WaitUs(1000); }`. Calls the existing `static WaitUs()`; compiles to ~4 instructions.
+- **`I2C_Slave.c`** – add a self-contained `static void WaitMs(uint16_t ms)` that contains the TIM3 counter loop directly (same idiom as `WaitUs()` but with `1000u` as the target count), because `WaitUs()` is not accessible here. Compiles to ~10–12 instructions.
+
+Total overhead: two small static functions, no new headers, no new compilation units. Keep loop counters as unsigned locals; avoid division/mod. Replace only the exact `LL_mDelay()` call sites; do not introduce new delays.
 
 **Step 2.2 – Configure SysTick for 10 ms (Phase 5)**
 
@@ -200,7 +207,7 @@ In `stm32f0xx_it.c`, remove the 0..9 divider. Call `Scheduler_ISR_Tick10ms()` ev
 - [ ] Button: EXTI wakes CPU; button actions still work. Ensure `pending_click` is cleared promptly after `Button_DispatchActions()` so a sticky value cannot block sleep indefinitely.
 - [ ] Flash save and ADC processing unchanged.
 - [ ] **Phase 2 (optional):** README includes a brief note about sleep-on-idle (if we choose to document it).
-- [ ] **Phase 4:** All `LL_mDelay()` replaced with `WaitMs()`; delays behave as intended.
+- [ ] **Phase 4:** All 13 `LL_mDelay()` calls replaced with `WaitMs()` (1 in main.c, 12 in I2C_Slave.c); delays behave as intended.
 - [ ] **Phase 5:** SysTick 10 ms; `SysTick_Handler` calls `Scheduler_ISR_Tick10ms()` every tick.
 - [ ] **Phase 6 (required):** Behavior Spec: only timing model + 1 ms tick references; do not touch register map or state machine sections.
 - [ ] Power: before/after current on 3.3 V (or MCU VDD) measured and recorded.
