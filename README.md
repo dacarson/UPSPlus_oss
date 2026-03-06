@@ -1,11 +1,6 @@
 # UPSPlus Open Source Firmware
 
 Open-source firmware for the UPSPlus uninterruptible power supply (UPS) module (EP-0136) designed for Raspberry Pi. [The device has been declared as EOL](https://github.com/geeekpi/upsplus/blob/main/firmware/README.md).
-This firmware runs on the STM32F030F4P6 microcontroller and provides battery monitoring, power management, and I2C communication capabilities.
-
-**Flash constraint:** The STM32F030F4P6 has 16 KB total flash; the linker reserves 2 KB for the bootloader and 1 KB for persistence, leaving **13 KB for the application**. Builds must stay under this limit (Release build uses `-Os` and `-ffunction-sections` / `--gc-sections`). When adding features, keep code size in mind.
-
-The code has been re-written from the ground up using a combination of ChatGPT and Cursor and the `documents/UPSPlus_Refactoring_Plan.md` document.
 
 ## Hardware Requirements
 
@@ -14,72 +9,54 @@ The code has been re-written from the ground up using a combination of ChatGPT a
 
 ## Firmware Features
 
-Items marked with `(*)` did not exist in the original factory firmware.
-
 - Battery monitoring via I2C register map.
 - Protection shutdown at configured protection voltage.
-- Auto power-on with configurable low-battery threshold and load-on delay.(*)
-- Boot brownout backoff learning (see [Boot Brownout Backoff](#boot-brownout-backoff)).(*)
-- Improved automatic Battery Full and Empty values. (*)
-- INA219 current reporting via the 0x17 I2C registers (no separate INA bus reads required).(*)
-- Factory Testing pages (0xFC–0xFF) for diagnostics.(*)
-- OTA firmware update support: write 0x7F to register 0xFC to enter legacy bootloader OTA mode (see [Firmware Update](#firmware-update-ota---legacy-bootloader)).(*)
+- Auto power-on with configurable low-battery threshold and load-on delay.
+- Boot brownout backoff learning — automatically increases the power-on delay if the Raspberry Pi repeatedly fails to boot (see [Boot Brownout Backoff](#boot-brownout-backoff)).
+- Automatic battery full and empty voltage learning — no manual calibration required (see [Automatic Battery Calibration](#automatic-battery-calibration)).
+- Output current reporting via I2C (no separate bus reads required).
+- Factory testing pages for diagnostics.
+- OTA firmware update support (see [Firmware Update](#firmware-update-ota---legacy-bootloader)).
 
 ## Button Behavior
 
 - The Func Key button is debounced at 50 ms.
-- If the load is off, short press powers on the load when the UPS is off and conditions are safe (aka there is sufficient charge in the batteries).
-- If the load is on, short press has no action.
+- If the load is off, a short press powers on the load when conditions are safe (sufficient battery charge).
+- If the load is on, a short press has no action.
 - Long press (>= 10 s) when the load is on: powers off.
 - Long press (>= 10 s) when the load is off: triggers a factory reset.
 
 ## Boot Brownout Backoff
 
-If the RPi browns out shortly after power-on (battery voltage drops to or below the protection
-threshold within 5 minutes of RPi being powerd on), the firmware treats this as a boot failure
-and increments the internal `load.on.delay` by 1 minute before the next auto power-on attempt.
-Learning stops after a successful 5-minute run without a protection-triggered shutdown. The
-learned delay is clamped to 60 minutes, persists across power cycles, and is cleared only by
-factory reset. A user write to `load.on.delay` becomes the new baseline; any further learning
-adds minutes on top of that value.
+If the Raspberry Pi loses power shortly after turn-on (battery voltage drops to or below the protection threshold within 5 minutes of the Pi being powered on), the firmware treats this as a failed boot and automatically increases the load-on delay by 1 minute before the next attempt. This gives the battery more time to stabilize before the Pi draws full power.
+
+Learning stops after a successful 5-minute run without a protection-triggered shutdown. The learned delay is capped at 60 minutes, is remembered across power cycles, and is cleared only by factory reset. If you manually set a load-on delay, any further learning adds on top of that value.
 
 ## Automatic Battery Calibration
 
-When battery parameters are self-programmed (register `0x2A` = 0, the default), the firmware learns **full** and **empty** voltages from actual use.
+The firmware learns your battery's actual full and empty voltages from real use, so battery percentage is accurate for your specific batteries.
 
-- **Learn full:** Plug in the HAT and let the batteries **fully charge** with the load on (about 30 minutes or more at a stable high voltage). Full is detected when battery voltage plateaus (stays within a narrow band) for 30 minutes at a near-top level (~4.18 V). If current telemetry is available, the firmware also confirms charge current has tapered to a low level before declaring full. Full clears when you unplug the charger or when voltage stays below the reset level for ~45 seconds.
-- **Learn empty:** Run the unit on battery until the RPi turns off. The firmware records the **lowest voltage under load** right before shutdown as the learned empty value (graceful shutdown, protection cutoff, or abrupt brownout).
+- **Learn full:** Plug in the charger and let the batteries charge fully with the load on (about 30 minutes or more at a stable high voltage). Full is detected when the battery voltage stays within a narrow band near the top (~4.18 V) for 30 minutes. If current readings are available, the firmware also confirms the charge current has tapered before declaring full. Full clears when the charger is unplugged or the voltage stays below the reset level for ~45 seconds.
+- **Learn empty:** Run the unit on battery until the Raspberry Pi turns off. The firmware records the lowest voltage under load just before shutdown as the learned empty value.
 
-**Note** The 18650 batteries can run down to as low as 2.75V safely, however, they are unable to provide the power needed to supply the 5V of the RPi at that level. The Empty battery level is typically around 3V, after which they can no longer provide enough power for the RPi.
+**Note:** 18650 batteries can safely discharge to ~2.75 V, but at that level they can no longer supply enough power for the Raspberry Pi's 5 V rail. Empty is typically learned around 3 V.
 
-Learned full and empty are used for battery percent and protection. For detailed behavior, see `documents/UPSPlus_Behavior_Spec.md` §7. Read or override via registers `0x0D–0x0E` (full) and `0x0F–0x10` (empty). Set `0x2A` = 1 to disable self-programming.
+Learned values are used for battery percentage and protection. You can read or override them via registers `0x0D–0x0E` (full) and `0x0F–0x10` (empty). Write `1` to register `0x2A` to disable self-programming and keep manual values.
 
 ## Firmware Update (OTA - Legacy Bootloader)
 
-This workflow targets the legacy bootloader. The runtime firmware can enter OTA mode either via an I2C command (recommended) or the physical button sequence.
-
 ### Entering OTA mode
 
-**Option A – Button sequence (recommended)**  
-1. Remove all power and batteries.  
-2. Hold the Func Key button and insert batteries.  
+**Button sequence (recommended)**
+1. Remove all power and batteries.
+2. Hold the Func Key button and insert batteries.
 3. The device starts in OTA mode.
 
-**Option B – I2C command**  
-**Caution** If this path is used, UPSPlus device will always reboot into OTA until an OTA Update is performed, and RPi will be restarted as power is interrupted.
-
-
-With the firmware running and the UPSPlus on the I2C bus (e.g. Raspberry Pi at 0x17), write **0x7F** to register **0xFC** (factory test region). This is a one-shot command: the firmware persists the bootloader OTA flag, saves flash, and reboots immediately into the bootloader. Register 0xFC remains 0 for readback (it is not a selector value).
-
-```bash
-i2cset -y 1 0x17 0xFC 0x7F b
-```
-
-Use the same I2C bus as your setup (e.g. `0` or `1` on Raspberry Pi). After a few seconds the device resets into bootloader OTA mode.
+An I2C command can also be used to enter OTA mode. See `documents/UPSPlus_Debugging_Guide.md` for details. Note that the I2C method reboots the device immediately and restarts the Raspberry Pi.
 
 ### Flashing the new firmware
 
-1. Verify OTA mode with `i2cdetect -y 1`; the bootloader should be visible at the expected address `0x18`.
+1. Verify OTA mode with `i2cdetect -y 1`; the bootloader should be visible at address `0x18`.
 2. Copy the compiled binary to the same directory as `tools/OTA_upgrade.py` and rename it to `upsplus_oss.bin` if needed.
 3. Run:
 
@@ -89,21 +66,9 @@ python3 tools/OTA_upgrade.py
 
 After a successful update, remove power and batteries to force a reboot; the device does not reset automatically.
 
-## I2C Register Map and Reading
+## I2C Register Map
 
-I2C address: `0x17` on bus `1` (Raspberry Pi default).
-
-Read examples:
-
-```
-i2cget -y 1 0x17 0x01
-i2cget -y 1 0x17 0x0D w
-i2cdump -y 1 0x17
-```
-
-Note: multi-byte registers are little-endian (LSB at lower address).
-
-### Register Summary
+I2C address: `0x17` on bus `1` (Raspberry Pi default). Multi-byte registers are little-endian (LSB at lower address). For read/write examples and diagnostic commands, see `documents/UPSPlus_Debugging_Guide.md`.
 
 | Address range | Description | Access | Default |
 | --- | --- | --- | --- |
@@ -137,12 +102,11 @@ Note: multi-byte registers are little-endian (LSB at lower address).
 | `0xF0–0xFB` | MCU serial number | RO | - |
 | `0xFC–0xFF` | Factory Testing (selector + pages). Write **0x7F** to **0xFC** = OTA command (one-shot; see Firmware Update) | RW | selector=0 |
 
-
 ## Documentation
 
 - Development setup and build steps: `documents/Development_Guide.md`
 - Behavior specification (contract for features): `documents/UPSPlus_Behavior_Spec.md`
-- Debugging guide and test script usage: `documents/UPSPlus_Debugging_Guide.md`
+- Debugging guide, I2C examples, and test script usage: `documents/UPSPlus_Debugging_Guide.md`
 - Feature development plans are archived in `documents/archive/`.
 
 ## NUT Driver

@@ -8,6 +8,49 @@ Authoritative behavior reference: `documents/UPSPlus_Behavior_Spec.md`
 
 ---
 
+## I2C Reading Examples
+
+I2C address: `0x17` on bus `1` (Raspberry Pi default).
+
+```bash
+# Read a single byte register
+i2cget -y 1 0x17 0x01
+
+# Read a 16-bit little-endian register (e.g. full voltage)
+i2cget -y 1 0x17 0x0D w
+
+# Dump all registers
+i2cdump -y 1 0x17
+```
+
+Use `i2cdetect -y 1` to confirm the device is visible on the bus. If it
+does not appear at `0x17`, check power, wiring, and I2C bus number.
+
+---
+
+## Entering OTA Mode via I2C Command
+
+**Caution:** This method reboots the UPSPlus immediately. Power to the
+Raspberry Pi will be interrupted and the Pi will restart.
+
+With the firmware running and the UPSPlus on the I2C bus, write **0x7F**
+to register **0xFC**. The firmware persists the bootloader OTA flag, saves
+flash, and reboots immediately into the bootloader. The device will stay in
+OTA mode until a firmware update is performed.
+
+```bash
+i2cset -y 1 0x17 0xFC 0x7F b
+```
+
+Use the same I2C bus as your setup (e.g. `0` or `1` on Raspberry Pi).
+After a few seconds the device resets into bootloader OTA mode. Verify with
+`i2cdetect -y 1`; the bootloader appears at address `0x18`.
+
+The button sequence (remove power, hold Func Key, reinsert batteries) is
+the recommended alternative when avoiding a Pi restart is important.
+
+---
+
 ## 1. Debugging Script Overview
 
 Scripts:
