@@ -387,6 +387,19 @@ static uint8_t I2C1_WaitForTC_Window(uint16_t start_us)
     return 1u;
 }
 
+/* Brief bus-idle check: SDA and SCL both high (avoids spurious ADDR on slave re-enable). */
+static uint8_t I2C1_BusIdleBrief(void)
+{
+    if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
+        !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
+        return 0u;
+    LL_mDelay(1u);
+    if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
+        !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
+        return 0u;
+    return 1u;
+}
+
 static void I2C1_EnterMasterWindow(void)
 {
     NVIC_DisableIRQ(I2C1_IRQn);
@@ -409,6 +422,12 @@ static void I2C1_ExitMasterWindow(void)
     I2C1->CR1 = i2c1_slave_cr1;
     LL_I2C_EnableIT_RX(I2C1);
     LL_I2C_EnableIT_TX(I2C1);
+    /* Bus idle check after slave re-enable (CR1 restore sets PE); avoid spurious ADDR before NVIC. */
+    if (!I2C1_BusIdleBrief())
+    {
+        I2C1_BusRecovery();     /* disables, recovers, and restores AF4 pins */
+        LL_I2C_Enable(I2C1);
+    }
     NVIC_EnableIRQ(I2C1_IRQn);
 }
 
