@@ -1069,7 +1069,8 @@ void CheckPowerOnConditions(void)
         /* Cancel if any required condition fails (plan: battery % must be > low for power decisions) */
         if (!battery_ok)
         {
-            sys_state.power_state = POWER_STATE_RPI_OFF;
+            /* Below protection threshold: latch to prevent immediate re-entry into LOAD_ON_DELAY */
+            sys_state.power_state = battery_above_protection ? POWER_STATE_RPI_OFF : POWER_STATE_PROTECTION_LATCHED;
             sys_state.power_state_entry_ticks = now_ticks;
             state.load_on_delay_remaining_sec = 0;
         }
