@@ -1022,8 +1022,7 @@ int main(void)
             adc_ready = 0;
         }
 
-        if (state.auto_power_on)
-            CheckPowerOnConditions();
+        CheckPowerOnConditions();
 
         /* Button actions (short/long press) */
         Button_DispatchActions();
@@ -1040,9 +1039,6 @@ int main(void)
  */
 void CheckPowerOnConditions(void)
 {
-    if (!state.auto_power_on)
-        return;
-
     uint32_t now_ticks = sched_flags.tick_counter;
     uint8_t battery_ok = (state.battery_percent > state.low_battery_percent);
     uint8_t battery_above_protection = (state.battery_voltage_mv > (uint16_t)(state.protection_voltage_mv + PROTECTION_HYSTERESIS_MV));
@@ -1050,6 +1046,23 @@ void CheckPowerOnConditions(void)
     uint8_t charger_present = (sys_state.charger_state == CHARGER_STATE_PRESENT ||
                               sys_state.charger_state == CHARGER_STATE_FORCED_OFF_WINDOW);
     uint8_t true_vbat_fresh = IsTrueVbatUsableForDecision();
+
+    /* Clear PROTECTION_LATCHED when charger present and battery recovered (even if !auto_power_on). */
+    if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
+    {
+        uint8_t recovered = (charger_present && battery_ok && battery_above_protection && true_vbat_fresh);
+        sys_state.power_state = (recovered && state.auto_power_on) ? POWER_STATE_LOAD_ON_DELAY : POWER_STATE_RPI_OFF;
+        sys_state.power_state_entry_ticks = now_ticks;
+        if (sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
+            state.load_on_delay_remaining_sec = state.load_on_delay_config_sec;
+        sys_state.pending_power_cut = 0;
+        sys_state.pending_power_cut_start_ticks = 0;
+        prot_state.below_threshold_count = 0;
+        return;
+    }
+
+    if (!state.auto_power_on)
+        return;
 
     if (sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
     {
@@ -1059,29 +1072,6 @@ void CheckPowerOnConditions(void)
             sys_state.power_state = POWER_STATE_RPI_OFF;
             sys_state.power_state_entry_ticks = now_ticks;
             state.load_on_delay_remaining_sec = 0;
-        }
-        return;
-    }
-
-    if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
-    {
-        /* Staleness: if charger present, require fresh true-VBAT for percent-based decision */
-        if (charger_present && battery_ok && battery_above_protection && true_vbat_fresh)
-        {
-            sys_state.power_state = POWER_STATE_LOAD_ON_DELAY;
-            sys_state.power_state_entry_ticks = now_ticks;
-            state.load_on_delay_remaining_sec = state.load_on_delay_config_sec;
-            sys_state.pending_power_cut = 0;
-            sys_state.pending_power_cut_start_ticks = 0;
-            prot_state.below_threshold_count = 0;
-        }
-        else
-        {
-            sys_state.power_state = POWER_STATE_RPI_OFF;
-            sys_state.power_state_entry_ticks = now_ticks;
-            sys_state.pending_power_cut = 0;
-            sys_state.pending_power_cut_start_ticks = 0;
-            prot_state.below_threshold_count = 0;
         }
         return;
     }
