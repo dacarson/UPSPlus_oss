@@ -176,7 +176,7 @@ STATIC_ASSERT((PLATEAU_WINDOW_SEC % PLATEAU_EVAL_PERIOD_SEC) == 0,
 /* Note: Flash storage is little-endian on STM32; this constant ensures correct
  * byte order when comparing against flash-stored values. */
 #define FLASH_MAGIC_NUMBER            ((uint32_t)('U') | ((uint32_t)('P')<<8) | ((uint32_t)('S')<<16) | ((uint32_t)('P')<<24))
-#define FLASH_STRUCTURE_VERSION       3           /* Increment when structure changes (2 = HW CRC, 3 = last_true_vbat persisted) */
+#define FLASH_STRUCTURE_VERSION       4           /* Increment when structure changes (4 = stride-2 flash format) */
 #define FLASH_WRITE_RATE_LIMIT_SEC    5           /* Minimum seconds between flash writes */
 #define FLASH_DIRTY_MAX_INTERVAL_SEC  60          /* Max seconds before forcing a dirty save */
 #define FLASH_RETRY_BACKOFF_SEC       2           /* Retry backoff after failed save */
@@ -561,12 +561,14 @@ typedef struct {
     uint32_t cumulative_runtime_sec;
     uint32_t charging_time_sec;
 
-    /* Reserved for bootloader: byte at 0x08003C64 must be 0x7F to enter OTA. Intentionally EXCLUDED from CRC
-     * so the bootloader can read it without affecting record validity. Do not move into CRC-covered region. */
-#define FLASH_OTA_FLAG_OFFSET   0x64
+    /* Reserved for bootloader: flash address 0x08003C64 must be 0x7F to enter OTA.
+     * The bootloader uses a stride-2 format (one byte per 16-bit halfword), so struct byte
+     * offset 0x32 maps to flash address 0x08003C00 + 0x32*2 = 0x08003C64.
+     * Intentionally EXCLUDED from CRC. Do not move into CRC-covered region. */
+#define FLASH_OTA_FLAG_OFFSET   0x32  /* struct byte offset; flash addr = base + offset*2 = 0x08003C64 */
 #define FLASH_PRE_OTA_TAIL_OFFSET  44  /* Must equal first byte after charging_time_sec; assert below */
     uint8_t reserved_ota_padding[FLASH_OTA_FLAG_OFFSET - FLASH_PRE_OTA_TAIL_OFFSET];  /* pad to OTA offset */
-    uint8_t bootloader_ota_flag;  /* At 0x08003C64: 0x7F = enter OTA, 0 = normal; app writes 0 unless OTA requested */
+    uint8_t bootloader_ota_flag;  /* At flash 0x08003C64: 0x7F = enter OTA, 0 = normal */
 } flash_persistent_data_t;
 
 /* CRC calculation span - compile-time offsets for safety (excludes OTA reserved area) */
@@ -577,15 +579,18 @@ typedef struct {
 /* Pre-OTA tail offset must match last CRC field end (no hidden padding) */
 STATIC_ASSERT((offsetof(flash_persistent_data_t, charging_time_sec) + sizeof(((flash_persistent_data_t *)0)->charging_time_sec)) == FLASH_PRE_OTA_TAIL_OFFSET,
                "FLASH_PRE_OTA_TAIL_OFFSET must equal first byte after charging_time_sec");
-/* Bootloader OTA flag must be at fixed address 0x08003C64 */
+/* Bootloader OTA flag must map to flash address 0x08003C64.
+ * Bootloader uses stride-2 format: flash_addr = FLASH_SETTINGS_BASE + struct_offset * 2.
+ * So struct offset 0x32 * 2 = 0x64 -> flash address 0x08003C00 + 0x64 = 0x08003C64. */
 STATIC_ASSERT(offsetof(flash_persistent_data_t, bootloader_ota_flag) == FLASH_OTA_FLAG_OFFSET,
-               "bootloader_ota_flag must be at offset 0x64 for bootloader OTA check");
+               "bootloader_ota_flag must be at struct offset 0x32 (maps to flash 0x08003C64)");
 /* OTA byte must remain outside CRC region (invariant for future edits) */
 STATIC_ASSERT(offsetof(flash_persistent_data_t, bootloader_ota_flag) >= FLASH_CRC_END_OFFSET,
                "bootloader_ota_flag must not be inside CRC-covered region");
-/* Compile-time assertion: flash structure must fit in slot size */
-STATIC_ASSERT(sizeof(flash_persistent_data_t) <= FLASH_PAGE_SIZE,
-               "flash_persistent_data_t exceeds FLASH_PAGE_SIZE");
+/* Compile-time assertion: stride-2 flash usage must fit in slot size.
+ * Each struct byte occupies one 16-bit halfword in flash, so total flash = sizeof * 2. */
+STATIC_ASSERT(sizeof(flash_persistent_data_t) * 2u <= FLASH_PAGE_SIZE,
+               "flash_persistent_data_t stride-2 storage exceeds FLASH_PAGE_SIZE");
 
 /*===========================================================================*/
 /*                         SCHEDULER STRUCTURES                               */

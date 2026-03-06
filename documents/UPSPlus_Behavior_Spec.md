@@ -340,11 +340,28 @@ Key behaviors:
 
 ## 8. Flash Persistence
 
-- Single-slot persistence (1KB page).
+- Single-slot persistence (1KB page at `0x08003C00`).
 - Dirty state is periodically flushed (60s) and on critical events.
 - Flash write attempts are rate limited unless bypassed.
-- Integrity: record structure version **2**; validation uses **hardware CRC**. Records with older structure version or invalid CRC are rejected at load → defaults applied and state marked dirty.
+- Integrity: record structure version **3**; validation uses **hardware CRC** (STM32 polynomial `0x04C11DB7`, init `0xFFFFFFFF`, no reflection). Records with an older structure version or invalid CRC are rejected at load → defaults applied and state marked dirty.
 - CRC and sequence validation performed on load; invalid or wrong-version → defaults + dirty.
+
+### 8.1 Flash Storage Format (Stride-2)
+
+The application persists settings using a **stride-2** format: each byte of the `flash_persistent_data_t` struct occupies one 16-bit halfword in flash, with the data byte in the LSByte and `0xFF` (erased state) in the MSByte.
+
+```
+Flash address:  base+0   base+1   base+2   base+3   ...  base+N*2
+Contents:       data[0]  0xFF     data[1]  0xFF     ...  data[N]
+```
+
+**Why stride-2?** The resident bootloader reads and writes the settings page in exactly this format (one byte per halfword), using its internal 255-byte buffer indexed by halfword position. If the application were to pack two struct bytes per halfword (the default STM32 halfword-write pattern), the bootloader's save-restore cycle during OTA would destroy all odd-indexed struct bytes, corrupting the magic number and all multi-byte fields. Using the same stride-2 format ensures the bootloader can round-trip the page without corruption.
+
+**OTA flag placement:** The `bootloader_ota_flag` field sits at struct byte offset `0x32`. With stride-2 storage this maps to flash address `0x08003C00 + 0x32 × 2 = 0x08003C64`, which is the address the bootloader checks at boot time. The mapping is enforced by a compile-time `STATIC_ASSERT`.
+
+**CRC scope:** The CRC covers the configuration and runtime-state fields only (`full_voltage_mv` through `charging_time_sec`). The header (magic, version, sequence), the CRC field itself, and the OTA padding + flag are all excluded from the CRC calculation, making the OTA flag self-clearing without invalidating the record.
+
+**Storage size:** Each struct byte uses two flash bytes, so the total flash footprint is `sizeof(flash_persistent_data_t) × 2`. A compile-time assert verifies this fits within the 1 KB settings page.
 
 ---
 
@@ -422,37 +439,45 @@ The bootloader does **not** provide a runtime command to exit OTA mode or to jum
 |------|---------------|------|
 | Bootloader | `0x08000000 – 0x080007FF` | Resident; never erased |
 | Application | `0x08000800 – 0x08003BFF` | Erased and reprogrammed during OTA |
-| Device Settings / Persistence | `0x08003C00 – 0x08003FFF` | Erased during OTA |
+| Device Settings / Persistence | `0x08003C00 – 0x08003FFF` | Saved to RAM before erase; restored after (OTA flag cleared) |
 
 - Flash page size is **1 KB (0x400 bytes)**.
-- OTA erase operations cover the entire range `0x08000800` through `0x08003FFF`.
+- OTA erase operations cover all 14 pages from `0x08000800` through `0x08003FFF`.
+- The device settings page is erased as part of this operation but is saved to RAM first and restored afterwards; see Section 14.5.2.
 
 ---
 
 ### 14.3 Boot-Time Mode Selection
 
-On reset, the bootloader determines whether to enter OTA mode or boot the application using the following conditions.
+On reset, the bootloader determines whether to enter OTA mode or boot the application using the following conditions, evaluated **in order**:
+
+1. OTA request flag present at `0x08003C64 == 0x7F` → **enter OTA mode**
+2. Force-boot button asserted (GPIOB IDR bit 1 low) → **enter OTA mode**
+3. Application MSP at `0x08000800` fails SRAM validation → **enter OTA mode**
+4. All checks pass → **boot the application**
 
 #### 14.3.1 Force-Bootloader Button
 
-- A dedicated GPIO input (GPIOB IDR bit 1) is sampled during boot.
-- If asserted, the device **enters OTA mode**.
+- A dedicated GPIO input (GPIOB IDR bit 1, active-low) is sampled during boot.
+- If asserted (pin low), the device **enters OTA mode**.
 - If not asserted, normal application boot is allowed.
 
 #### 14.3.2 OTA Request Flag (Flash)
 
-- A predefined value stored in the device settings flash page requests OTA mode.
-- If present at boot, the bootloader **enters OTA mode**.
-- This flag is **cleared implicitly** when the settings page is erased during OTA.
+- The OTA request flag is a single byte at flash address `0x08003C64` (device settings page, offset `0x64`).
+- The flag value `0x7F` requests OTA mode; any other value is ignored.
+- If the flag is set at boot, the bootloader **enters OTA mode**.
+- The flag is **cleared** as part of OTA entry: the bootloader reads the settings page into RAM, zeroes the flag byte (`settings_buf[0x32] = 0`), erases the flash page, then writes the settings back. The flag does not persist after the first OTA boot.
 
 #### 14.3.3 Application Vector Table Validation
 
 Before booting the application, the bootloader validates the application image:
 
 - Reads initial MSP from `0x08000800`
-- MSP must be within the valid SRAM range (`0x2000xxxx`)
+- MSP must satisfy `(MSP & 0x2FFE0000) == 0x20000000` (confirms address is within valid SRAM)
 - Reads reset handler from `0x08000804`
 - If validation fails, the device remains in OTA mode
+- **Note:** erased flash reads as `0xFFFFFFFF`; `0xFFFFFFFF & 0x2FFE0000 = 0x2FFE0000 ≠ 0x20000000`, so a device with no programmed application loops in OTA mode indefinitely until a valid image is received.
 
 ---
 
@@ -479,33 +504,39 @@ The device enters OTA mode at boot if **any** of the following are true:
 - OTA request flag is present in flash  
 - Application vector table is invalid  
 
-#### 14.5.2 Flash Erase Behaviour
+#### 14.5.2 Flash Erase and Settings Preservation
 
-Upon entering OTA mode, the bootloader:
+Upon entering OTA mode, the bootloader executes the following sequence:
 
-- Unlocks the FLASH peripheral
-- Sequentially erases all 1 KB flash pages from:
-  - `0x08000800` through `0x08003FFF`
-- This erase includes the **device settings / persistence page**
+1. Reads the device settings page (`0x08003C00`, 255 bytes) into RAM using its stride-2 format (LSByte of each halfword), **zeroing the OTA flag byte** (buffer index `0x32`, flash address `0x08003C64`).
+2. Unlocks the FLASH peripheral (keys `0x45670123` / `0xCDEF89AB`).
+3. Sequentially erases all 14 × 1 KB flash pages from `0x08000800` through `0x08003FFF`, including the device settings page.
+4. Writes the saved settings back to `0x08003C00` (with OTA flag cleared to `0x00`).
+5. Sets the flash write pointer to `0x08000800` and begins the OTA receive loop.
 
-Erased flash locations read back as `0xFF`.
-
-As a result, the OTA request flag is cleared automatically during the erase process.
+Erased flash locations read back as `0xFF`. The OTA request flag is zeroed in RAM before the erase begins, so it does not persist regardless of erase outcome. Device settings (battery thresholds, calibration, etc.) are **preserved** across OTA through this save-restore mechanism.
 
 ---
 
 ### 14.6 I²C OTA Programming Interface
 
-- The device operates as an I²C slave at address `0x18`.
-- Programming data is delivered using a framed protocol.
+- The device operates as an I²C slave at address `0x18`, 100 kHz standard mode.
+- Programming data is delivered using a framed block protocol.
+
+Block format (17 bytes total):
+
+| Byte | Value | Description |
+|------|-------|-------------|
+| 0 | `0xFA` | Block marker |
+| 1–16 | data | 8 × 16-bit halfwords, **LSB-first** per halfword |
 
 High-level behaviour:
 
-- Each programming block begins with a marker byte (`0xFA`)
-- Each block programs **16 bytes (8 halfwords)** of flash
-- Flash programming is performed using **16-bit halfword writes**
-- The flash write pointer auto-increments after each halfword
-- Programming continues while valid frames are received
+- Each programming block begins with the marker byte `0xFA`, followed by exactly 16 data bytes.
+- Each block programs **16 bytes (8 halfwords)** of flash starting at the current write pointer.
+- Flash programming is performed using **16-bit halfword writes**; the write pointer auto-increments by 2 after each halfword.
+- Programming starts at `0x08000800` and continues sequentially.
+- The bootloader accepts blocks continuously while valid frames are received; it returns to the application boot check after a long inactivity timeout.
 
 The bootloader does **not** expose:
 
@@ -545,9 +576,10 @@ To boot the application after OTA programming:
 ### 14.8 I²C Register Observations
 
 - The I²C register space is primarily read-only status.
-- Register `0x00` reflects current mode/state.
+- Register `0x00` is set to `0xC8` when OTA mode is active.
 - Internal OTA receive counters are exposed for diagnostics.
-- Registers `0xF0–0xFF` expose identity and version information.
+- Registers `0xF0–0xFB` expose the MCU's 96-bit unique device ID (12 bytes read from hardware UID registers at `0x1FFFF7AC`).
+- Registers `0xFC–0xFF` are unused by the bootloader (read as `0x00`).
 - No register functions as a command mailbox for reset or application boot.
 
 ---
@@ -557,7 +589,8 @@ To boot the application after OTA programming:
 - OTA workflows **must include a reset or power-cycle step** after programming.
 - Application images **must be linked for base address `0x08000800`**.
 - The application vector table must remain valid post-OTA.
-- Device settings stored in the last flash page are erased during OTA and must be reinitialized by the application.
+- Device settings stored in the last flash page are **preserved across OTA**: the bootloader saves the page to RAM before erasing and restores it after programming, with only the OTA flag cleared. The application does not need to reinitialize settings after OTA unless its own CRC/version validation fails.
+- Once OTA mode is entered the application is immediately erased. If OTA programming is interrupted or the device is power-cycled before a complete valid image is received, the device will remain in OTA mode on subsequent boots (MSP validation will fail for erased flash). A complete image must be programmed before normal boot can resume.
 ---
 
 ## 15. Glossary
