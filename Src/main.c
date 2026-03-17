@@ -728,7 +728,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.version = 25;
+    state.version = 26;
     state.snapshot_tick = 0;
     state.last_true_vbat_sample_tick = 0;
     state.last_true_vbat_mv = 0;
@@ -1895,19 +1895,6 @@ static void BatteryPlateau_Tick1s(void)
         plateau_suppressed = 1;
 }
 
-/* DMA only sets adc_ready; main loop processes ADC and updates state */
-void DMA1_CH1_IRQHandler(void)
-{
-    if (LL_DMA_IsActiveFlag_TC1(DMA1))
-    {
-        LL_DMA_ClearFlag_TC1(DMA1);
-        adc_ready = 1;
-    }
-    if (LL_DMA_IsActiveFlag_TE1(DMA1) == 1)
-    {
-        LL_DMA_ClearFlag_TE1(DMA1);
-    }
-}
 
 /* Scheduler 10 ms tick: flag-only work, called from SysTick every 10th tick.
  * On Cortex-M0, aligned 32-bit write to tick_counter is atomic; main reads it for deltas. */
@@ -2010,12 +1997,13 @@ static void ChargerStateMachine_Step(void)
         {
             window_mgr.window_active = 0;
             window_mgr.last_window_end_ticks = tick;
-            /* Unplug mid-window: decide PRESENT vs ABSENT from current voltage at window end.
-             * Hysteresis: ABSENT uses > ON_MV for detection; here >= OFF_MV = still present (no 1mV gap). */
-            if (charger_mv >= CHARGER_PRESENT_OFF_MV)
-                sys_state.charger_state = CHARGER_STATE_PRESENT;
-            else
-                sys_state.charger_state = CHARGER_STATE_ABSENT;
+            /* Always return to PRESENT at window end. IP_EN is LOW during the window, which
+             * disconnects the charger path, so all ADC charger-voltage readings taken during
+             * the window are invalid (read ~0). Using charger_mv here would always resolve to
+             * ABSENT, permanently latching IP_EN LOW. If the charger was unplugged during the
+             * window, the normal PRESENT→ABSENT stability path detects it within ~1.5s after
+             * IP_EN goes HIGH and valid ADC readings resume. */
+            sys_state.charger_state = CHARGER_STATE_PRESENT;
             sys_state.charger_state_entry_ticks = tick;
             /* Charger/window are runtime-only (B9); only flush if something else is dirty. */
             MustRefreshVDD = 1;
@@ -2453,8 +2441,8 @@ static void MX_ADC_Init(void)
 
     ADC_REG_InitStruct.TriggerSource = LL_ADC_REG_TRIG_SOFTWARE;
     ADC_REG_InitStruct.SequencerDiscont = LL_ADC_REG_SEQ_DISCONT_DISABLE;
-    ADC_REG_InitStruct.ContinuousMode = LL_ADC_REG_CONV_CONTINUOUS;
-    ADC_REG_InitStruct.DMATransfer = LL_ADC_REG_DMA_TRANSFER_LIMITED;
+    ADC_REG_InitStruct.ContinuousMode = LL_ADC_REG_CONV_SINGLE;  /* single-shot; 500ms tick triggers each scan */
+    ADC_REG_InitStruct.DMATransfer = LL_ADC_REG_DMA_TRANSFER_UNLIMITED;  /* CIRC=1 in DMA CCR requires DMACFG=1; LIMITED+CIRC is prohibited per RM */
     ADC_REG_InitStruct.Overrun = LL_ADC_REG_OVR_DATA_PRESERVED;
 
     LL_ADC_REG_Init(ADC1, &ADC_REG_InitStruct);
@@ -2466,6 +2454,7 @@ static void MX_ADC_Init(void)
     {
     };
     LL_ADC_Enable(ADC1);
+    while (!LL_ADC_IsActiveFlag_ADRDY(ADC1)) {}  /* wait for ADC ready before starting */
     LL_ADC_REG_StartConversion(ADC1);
 }
 

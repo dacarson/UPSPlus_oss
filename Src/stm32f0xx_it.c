@@ -25,6 +25,7 @@
 #include "stm32f0xx.h"
 #include "ups_state.h"
 /* USER CODE END Includes */
+#include "stm32f0xx_ll_dma.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
@@ -163,6 +164,25 @@ void PendSV_Handler(void)
 /******************************************************************************/
 
 /* USER CODE BEGIN 1 */
+
+/**
+ * @brief DMA1 Channel1 interrupt handler — fires on ADC DMA transfer complete.
+ * Sets adc_ready; main loop processes ADC buffer and updates state.
+ * Defined here (not main.c) so the strong symbol survives LTO and correctly
+ * overrides the weak assembly alias in the vector table.
+ */
+void DMA1_CH1_IRQHandler(void)
+{
+    if (LL_DMA_IsActiveFlag_TC1(DMA1))
+    {
+        LL_DMA_ClearFlag_TC1(DMA1);
+        adc_ready = 1;
+    }
+    if (LL_DMA_IsActiveFlag_TE1(DMA1))
+    {
+        LL_DMA_ClearFlag_TE1(DMA1);
+    }
+}
 
 /* USER CODE END 1 */
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
