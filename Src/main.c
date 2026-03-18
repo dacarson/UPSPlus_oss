@@ -2441,8 +2441,8 @@ static void MX_ADC_Init(void)
 
     ADC_REG_InitStruct.TriggerSource = LL_ADC_REG_TRIG_SOFTWARE;
     ADC_REG_InitStruct.SequencerDiscont = LL_ADC_REG_SEQ_DISCONT_DISABLE;
-    ADC_REG_InitStruct.ContinuousMode = LL_ADC_REG_CONV_SINGLE;  /* single-shot; 500ms tick triggers each scan */
-    ADC_REG_InitStruct.DMATransfer = LL_ADC_REG_DMA_TRANSFER_UNLIMITED;  /* CIRC=1 in DMA CCR requires DMACFG=1; LIMITED+CIRC is prohibited per RM */
+    ADC_REG_InitStruct.ContinuousMode = LL_ADC_REG_CONV_CONTINUOUS;
+    ADC_REG_InitStruct.DMATransfer = LL_ADC_REG_DMA_TRANSFER_LIMITED;
     ADC_REG_InitStruct.Overrun = LL_ADC_REG_OVR_DATA_PRESERVED;
 
     LL_ADC_REG_Init(ADC1, &ADC_REG_InitStruct);
@@ -2454,7 +2454,6 @@ static void MX_ADC_Init(void)
     {
     };
     LL_ADC_Enable(ADC1);
-    while (!LL_ADC_IsActiveFlag_ADRDY(ADC1)) {}  /* wait for ADC ready before starting */
     LL_ADC_REG_StartConversion(ADC1);
 }
 

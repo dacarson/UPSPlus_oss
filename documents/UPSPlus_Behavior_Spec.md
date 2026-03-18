@@ -218,12 +218,6 @@ Key behaviors:
 - `PRESENT → FORCED_OFF_WINDOW`: `sample_period_minutes` elapsed **while charger is present** (window due).
 - `FORCED_OFF_WINDOW → PRESENT`: window elapsed (1.5s); always returns to PRESENT (see note below).
 
-**Note — charger voltage readings are only valid when IP_EN is HIGH.** IP_EN is LOW during
-`FORCED_OFF_WINDOW`, which disconnects the charger path. ADC charger-voltage readings taken
-during the window are therefore invalid (~0). The window always exits to `PRESENT`; if the
-charger was physically removed during the window, the normal `PRESENT → ABSENT` stability
-path detects this within ~1.5s after IP_EN goes HIGH and valid ADC readings resume.
-
 ### 5.3 Calibration Window Flag (`learning_mode_t`)
 - **Legacy name:** `learning_mode_t` is retained for ABI compatibility.
 - Indicates **calibration window active** (charger forced off for true VBAT sampling).
@@ -248,13 +242,10 @@ path detects this within ~1.5s after IP_EN goes HIGH and valid ADC readings resu
   - **IP_EN is forced LOW** (charger path disabled).
   - “Charger influencing VBAT” is treated as **false** for measurement purposes.
 - Window is never interrupted or restarted early.
-- **Charger voltage is invalid during the window.** IP_EN is LOW, disconnecting the charger
-  path, so ADC readings of charger voltage (VBUS_SENSE / USB_IN_SENSE) are ~0 and must not
-  be used to determine charger presence. The window always exits to `PRESENT`.
 - If the charger is unplugged mid-window:
   - The window still completes, and VBAT samples taken during the window are considered **true VBAT**.
   - At window end, charger state returns to `PRESENT`; the normal `PRESENT → ABSENT` stability
-    path detects the disconnection within ~1.5s once IP_EN goes HIGH and ADC readings are valid.
+    path detects the disconnection within ~1.5s.
 - Window states are represented in Factory Testing selector 0x03.
 - `learning_mode_t` reports **ACTIVE** during the window.
 - Purpose: eliminate charger influence on VBAT measurement and provide a stable condition for ADC-based calibration and decision-making.
