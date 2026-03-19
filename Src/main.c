@@ -51,8 +51,10 @@ __IO uint8_t MustRefreshVDD = 1;
 #define IWDG_PR_256   6u
 #define IWDG_RLR_VAL  1748u
 
-/* I2C stuck-bus recovery: if ADDR flag set for this many seconds, re-init slave (clock-stretch watchdog). */
-#define I2C_STUCK_ADDR_RECOVERY_SEC  5u
+/* I2C stuck-bus recovery: if ADDR flag set for this many seconds, re-init slave (clock-stretch watchdog).
+ * Keep this at 1s so the master (RPi bcm2835) gets a bus error promptly rather than waiting
+ * through its own kernel-level timeout (~15-20s), which causes sustained I2C stall storms. */
+#define I2C_STUCK_ADDR_RECOVERY_SEC  1u
 
 typedef void (*pFunction)(void);
 __IO pFunction JumpToAplication;
@@ -728,7 +730,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.version = 26;
+    state.version = 27;
     state.snapshot_tick = 0;
     state.last_true_vbat_sample_tick = 0;
     state.last_true_vbat_mv = 0;
@@ -1322,10 +1324,18 @@ static uint8_t Flash_ProgramBuffer(uint32_t address, const uint8_t *data, uint32
         return 0;
 
     /* Stride-2 format: each struct byte occupies one 16-bit halfword (LSByte = data,
-     * MSByte = 0xFF). Matches the bootloader's read/write format so settings survive OTA. */
+     * MSByte = 0xFF). Matches the bootloader's read/write format so settings survive OTA.
+     *
+     * IRQs are disabled only for the atomic write+BSY-poll per halfword (~40µs each).
+     * Re-enabling between halfwords lets the I2C ISR fire in the gaps, preventing
+     * sustained I2C unresponsiveness during the program phase. */
     while (i < len)
     {
+        uint32_t primask;
         halfword = (uint16_t)data[i] | 0xFF00u;
+
+        primask = __get_PRIMASK();
+        __disable_irq();
 
         FLASH->SR = FLASH_SR_EOP | FLASH_SR_PGERR | FLASH_SR_WRPRTERR;
         SET_BIT(FLASH->CR, FLASH_CR_PG);
@@ -1338,10 +1348,16 @@ static uint8_t Flash_ProgramBuffer(uint32_t address, const uint8_t *data, uint32
             {
                 CLEAR_BIT(FLASH->CR, FLASH_CR_PG);
                 SET_BIT(FLASH->CR, FLASH_CR_LOCK);
+                if (!primask)
+                    __enable_irq();
                 return 0;
             }
         }
         CLEAR_BIT(FLASH->CR, FLASH_CR_PG);
+
+        if (!primask)
+            __enable_irq();
+
         if (FLASH->SR & (FLASH_SR_PGERR | FLASH_SR_WRPRTERR))
         {
             SET_BIT(FLASH->CR, FLASH_CR_LOCK);
@@ -1410,7 +1426,6 @@ uint8_t Flash_Save(uint8_t bypass)
     flash_persistent_data_t verify;
     uint16_t next_seq = (uint16_t)(flash_sequence + 1u);
     uint32_t target_addr = (uint32_t)(uintptr_t)FlashStorageStartPtr();
-    uint32_t primask;
     uint8_t ok;
     size_t storage_size = (size_t)(FlashStorageEndPtr() - FlashStorageStartPtr());
 
@@ -1427,13 +1442,12 @@ uint8_t Flash_Save(uint8_t bypass)
 
     Flash_FillRecordFromState(&rec, next_seq);
 
-    primask = __get_PRIMASK();
-    __disable_irq();
+    /* No global IRQ disable here. Flash_ErasePage stalls flash reads for ~20ms (hardware
+     * constraint on STM32F0 — unavoidable), but Flash_ProgramBuffer re-enables IRQs between
+     * each halfword write so the I2C ISR can fire in the ~40µs gaps between writes. */
     ok = Flash_ErasePage(target_addr);
     if (ok)
         ok = Flash_ProgramBuffer(target_addr, (const uint8_t *)&rec, sizeof(rec));
-    if (!primask)
-        __enable_irq();
     if (!ok)
         return 0u;
 

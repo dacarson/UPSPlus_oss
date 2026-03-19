@@ -161,6 +161,8 @@ It is intended as the source of truth for feature development and future changes
 ### 4.5 I2C Bus Robustness
 - I2C input filters (analog and digital, 1 I2C clock digital filter) are enabled at init to improve robustness in noisy environments.
 - Stuck-bus recovery is performed in software (e.g. SCL toggling); no hardware I2C timeout is used. Recovery behavior is internal and does not change the external I2C register contract.
+- **Stuck-ADDR recovery timeout: ≤ 1 second.** If the I2C ADDR flag remains asserted continuously (master holding the bus waiting for a slow MCU response), the firmware reinitialises the I2C slave peripheral to recover. This timeout must be **≤ 1 second** so that the master (RPi) receives a bus error promptly rather than waiting through a kernel-level I2C timeout (~15–20 s on bcm2835). Shorter recovery reduces the window during which the RPi I2C driver stalls and fails to receive data updates.
+- **Flash save must not disable I2C interrupts.** The I2C slave ISR must remain active during flash erase and program operations. A global `__disable_irq()` across the full flash write sequence causes the STM32 to be unresponsive to I2C for tens of milliseconds per write, and repeated writes (e.g. during calibration state changes) can produce sustained I2C timeout storms visible at the master. Flash write operations must be structured so only the minimum required flash-controller critical section disables interrupts, and the I2C IRQ is never masked during the erase/program wait loops.
 
 ### 4.6 Current Measurement Behavior
 - Output and battery current values come from the INA219 **shunt voltage** register (0x01).
@@ -343,6 +345,7 @@ Key behaviors:
 - Single-slot persistence (1KB page at `0x08003C00`).
 - Dirty state is periodically flushed (60s) and on critical events.
 - Flash write attempts are rate limited unless bypassed.
+- **I2C interrupt must remain enabled during flash save.** The flash erase and program sequence must not use `__disable_irq()` across the full operation. Only the minimum flash-controller critical section (FLASH_CR_PG set / BSY poll / FLASH_CR_PG clear per halfword, and the page erase trigger) requires atomicity; the I2C ISR must be able to fire between halfword writes. Disabling all interrupts for the entire erase+program duration (tens of milliseconds) prevents I2C slave responses and causes timeout storms at the master during periods of frequent flash activity.
 - Integrity: record structure version **3**; validation uses **hardware CRC** (STM32 polynomial `0x04C11DB7`, init `0xFFFFFFFF`, no reflection). Records with an older structure version or invalid CRC are rejected at load → defaults applied and state marked dirty.
 - CRC and sequence validation performed on load; invalid or wrong-version → defaults + dirty.
 
