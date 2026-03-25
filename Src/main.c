@@ -2363,7 +2363,8 @@ static void Button_DispatchActions(void)
     if (button_handler.pending_click == BUTTON_CLICK_SHORT)
     {
         if (sys_state.power_state == POWER_STATE_RPI_OFF ||
-            sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
+            sys_state.power_state == POWER_STATE_PROTECTION_LATCHED ||
+            sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
         {
             uint8_t allow_power_on = 1;
             if (Charger_IsInfluencingVBAT(&sys_state) && !IsTrueVbatUsableForDecision())
