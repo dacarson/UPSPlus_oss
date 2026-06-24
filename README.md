@@ -1,4 +1,7 @@
 # UPSPlus Open Source Firmware
+[![License: MIT](https://img.shields.io/github/license/dacarson/UPSPlus_oss)](LICENSE)
+[![Version](https://img.shields.io/github/v/release/dacarson/UPSPlus_oss)](https://github.com/dacarson/UPSPlus_oss/releases)
+[![Downloads](https://img.shields.io/github/downloads/dacarson/UPSPlus_oss/total)](https://github.com/dacarson/UPSPlus_oss/releases)
 
 Open-source firmware for the UPSPlus uninterruptible power supply (UPS) module (EP-0136) designed for Raspberry Pi. [The device has been declared as EOL](https://github.com/geeekpi/upsplus/blob/main/firmware/README.md).
 
