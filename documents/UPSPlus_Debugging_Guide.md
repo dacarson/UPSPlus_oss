@@ -184,6 +184,10 @@ Factory test pages:
 - Selector 5 validates flash status and auto power on bitfields.
 - Selector 6 reports INA boot presence bits.
 - Selector 7 reports output/battery age in 10 ms units (saturated to 255).
+- Selector 0x0A reports the raw battery-channel ADC code (channel 1),
+  pre-scaling/pre-clamp — see "Diagnosing Bad/Noisy Battery Voltage
+  Readings" below. Compiled out by default (see note there); requires a
+  firmware build with `UPS_ADC_FACTORY_DIAG_ENABLED=1`.
 - Unknown selector returns zeros for page data.
 - Writes to 0xFD-0xFF are ignored.
 
@@ -260,4 +264,58 @@ Persistence checks:
 - Use `i2cdetect -y 1` to confirm the device is visible on the bus.
 - If tests time out, confirm the I2C bus number and address.
 - If the factory reset test is not running, ensure `--allow-destructive` is set.
+
+---
+
+## 6. Diagnosing Bad/Noisy Battery Voltage Readings
+
+Symptoms: register `0x05` (battery voltage) reads a fixed, implausibly low
+value that never moves (e.g. pinned at or near the protection voltage,
+register `0x11`), or it fluctuates wildly from read to read instead of
+tracking the battery smoothly.
+
+`state.battery_voltage_mv` is computed from ADC channel 1 and then
+floor-clamped so it can never read below `max(VBAT_MIN_VALID_MV,
+protection_voltage_mv)` (`Src/main.c:1072`). Since `protection_voltage_mv`
+has a hard minimum of `VBAT_PROTECT_MIN_MV` (2800 mV,
+`Inc/ups_state.h:71`), a frozen reading of ~2800 mV usually means the true
+computed voltage is being clamped away, not that the ADC/DMA pipeline has
+stalled. Use factory test selector `0x0A` to see the real value underneath
+the clamp:
+
+```bash
+i2cset -y 1 0x17 0xFC 0x0A     # select page 0x0A
+i2cget -y 1 0x17 0xFC i 4      # [0]=0x0A selector echo, [1..2]=raw ADC code (LE), [3]=reserved
+```
+
+Note: this selector (and 0x0B-0x0E, covering the other ADC channels and
+the temperature-sensor calibration constants) is compiled out by default
+to save flash on this part — see `UPS_ADC_FACTORY_DIAG_ENABLED` near the
+top of `Src/main.c`. Rebuild with it set to `1` before using this section.
+
+Decode: `raw = byte[1] | (byte[2] << 8)` (0-4095, 12-bit). Estimate the
+voltage the MCU is actually seeing at the pin with `pin_mV = raw / 4095 *
+mcu_voltage_mv` (register `0x01`), and compare against the divider
+assumption in the code (`state.mcu_voltage_mv * 2` at `Src/main.c:1067`,
+i.e. a 2:1 divider expected on VBAT_SENSE).
+
+What the raw code tells you:
+- **Stable but far below what a 2:1 divider predicts**: likely a real
+  hardware fault or divider mismatch on the VBAT_SENSE sense path (wrong
+  resistor value, bad joint, lifted pad) — check continuity/values against
+  the schematic.
+- **Wildly different value on every consecutive read** (large peak-to-peak
+  swings, worse when a charger is actively connected/switching): the ADC
+  input is floating/high-impedance rather than solidly referenced, so it's
+  picking up EMI from nearby switching activity instead of measuring the
+  battery.
+
+Known cause (2026-07-20): on a HAT installation where the Raspberry Pi is
+powered from a separate supply for testing, leaving 40-pin header pins 2,
+4, and 6 (5V/5V/GND) disconnected left VBAT_SENSE without its expected
+reference — frozen-low when idle, noisy when a charger was attached.
+Reconnecting those header pins restored a stable, correctly-scaled
+reading. If you see this symptom while bench-testing with the Pi powered
+separately, reconnect (or jumper) pins 2/4/6 before suspecting the ADC
+firmware or sense-divider hardware.
 
