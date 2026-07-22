@@ -7,3 +7,4 @@ firmware.bin
 .DS_Store
 .cproject
 *.launch
+bootloader.bin
