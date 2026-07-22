@@ -154,10 +154,6 @@ static uint16_t min_vbat_while_load_on_mv = 0xFFFF;
 static uint8_t empty_persisted_this_session = 0;
 /* Debounce: only commit empty on load_off after sustained load_off (0 = not in load_off, else tick when load_off started) */
 static uint32_t empty_learn_load_off_start_tick = 0u;
-/* Condition (3) debounce: 0 = not pending; else tick when output validity loss was first detected.
- * Commit fires after EMPTY_LEARN_BROWNOUT_HOLD_TICKS of sustained validity loss (genuine brownout).
- * Cancelled if validity is restored before the hold expires (polling gap, not a real brownout). */
-static uint32_t empty_learn_brownout_tick = 0u;
 static uint8_t battery_full = 0;
 static uint32_t battery_full_clear_start_ticks = 0;
 static uint32_t taper_hold_ticks = 0;   /* Seconds (in ticks) battery current <= I_TAPER_MA with valid; for taper gate */
@@ -1249,7 +1245,6 @@ void FactoryReset(void)
     BatteryPlateau_Init();
     min_vbat_while_load_on_mv = 0xFFFFu;
     empty_persisted_this_session = 0;
-    empty_learn_brownout_tick = 0u;
 }
 
 extern const uint8_t __flash_storage_start__[];
@@ -1678,7 +1673,6 @@ void UpdateBatteryMinMax(void)
             min_vbat_while_load_on_mv = 0xFFFFu;
             empty_persisted_this_session = 0;
             empty_learn_load_off_start_tick = 0u;
-            empty_learn_brownout_tick = 0u;
         }
         /* Only track/commit empty when charger is ABSENT (actual discharge). Exclude FORCED_OFF_WINDOW
          * because the 1.5s calibration window causes an artificial VBAT dip—that min is not true empty. */
@@ -1788,55 +1782,53 @@ static uint8_t I2C1_BusIdleStable500us(void)
     return 1u;
 }
 
-/* If no I2C master activity for this long (ticks), allow INA219 reads unconditionally. */
+/* Minimum ticks since the last STM32-addressed STOP before the fine-grained (TIM3,
+ * microsecond) proximity check is no longer needed and live bus-idle sensing alone is
+ * trusted, with no upper bound. Tick-resolution tracking (I2C1_GetLastStopTick(),
+ * I2C1_GetLastAddrTick() — 32-bit, 10 ms resolution) has no wraparound ceiling, unlike TIM3's
+ * 16-bit/~65.536 ms range, so this closes the starvation gap a steadily-polling master (e.g.
+ * NUT's ~2 s critical_update_interval) used to hit between the old ~50 ms window and an idle
+ * bypass: NUT's traffic clusters at one point per poll, leaving the bus genuinely quiet for
+ * most of each cycle — this lets that quiet time be used, not just a sliver right after the
+ * last transaction. Below this threshold, true elapsed time is guaranteed well under TIM3's
+ * wrap range, so the microsecond check remains valid there. */
+#define I2C_STOP_SETTLE_TICKS  1u
+
+/* If no STM32-addressed I2C activity has EVER been observed (true standalone operation, or
+ * shortly after boot with no RPi present), allow INA219 reads once idle this long. Kept at
+ * the original, conservative value: I2C_STOP_SETTLE_TICKS above now closes the steady-polling
+ * starvation gap directly, so this branch is only a defense-in-depth fallback for the
+ * "no master ever" case, not the primary mechanism. */
 #define I2C_MASTER_IDLE_ALLOW_READ_TICKS  (5u * TICKS_PER_1S)
 
 static uint8_t I2C1_GuardWindowReady(void)
 {
     uint16_t now_us = (uint16_t)LL_TIM_GetCounter(TIM3);
     uint16_t last_stop_us = I2C1_GetLastStopUs();
-    uint16_t last_addr_us = I2C1_GetLastAddrUs();
     uint8_t txn_active = I2C1_GetSlaveTxnActive();
 
     if (txn_active)
         return 0u;
 
-    /* Track last I2C master activity in tick resolution so we can allow reads when master has been idle > 5 s. */
+    uint32_t now_ticks = sched_flags.tick_counter;
+    uint32_t last_stop_tick = I2C1_GetLastStopTick();
+    uint32_t last_addr_tick = I2C1_GetLastAddrTick();
+
+    if (last_stop_tick == 0u && last_addr_tick == 0u)
     {
-        static uint16_t last_seen_stop_us = 0u;
-        static uint16_t last_seen_addr_us = 0u;
-        static uint32_t last_i2c_activity_tick = 0u;
-        uint32_t now_ticks = sched_flags.tick_counter;
-
-        if (last_stop_us != last_seen_stop_us || last_addr_us != last_seen_addr_us)
-        {
-            last_i2c_activity_tick = now_ticks;
-            last_seen_stop_us = last_stop_us;
-            last_seen_addr_us = last_addr_us;
-        }
-
-        /* No master activity observed yet, or master idle long enough: no collision risk, allow after bus checks. */
-        if (last_i2c_activity_tick == 0u ||
-            (now_ticks - last_i2c_activity_tick) > I2C_MASTER_IDLE_ALLOW_READ_TICKS)
-        {
-            if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
-                !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
-                return 0u;
-            if (!I2C1_BusIdleStable500us())
-                return 0u;
-            return 1u;
-        }
+        /* No STM32-addressed activity observed since boot. */
+        if (now_ticks <= I2C_MASTER_IDLE_ALLOW_READ_TICKS)
+            return 0u;
     }
-
-    /* Master recently active: apply 50 ms guard window to avoid collision. */
-    if ((uint16_t)(now_us - last_stop_us) > 50000u)
-        return 0u;
-
-    if ((uint16_t)(now_us - last_addr_us) > 50000u)
-        return 0u;
-
-    if ((uint16_t)(now_us - last_stop_us) < 500u)
-        return 0u;
+    else if ((now_ticks - last_stop_tick) < I2C_STOP_SETTLE_TICKS)
+    {
+        /* Within the same (or immediately preceding) 10 ms tick as the last STM32-addressed
+         * STOP: true elapsed time is necessarily well under TIM3's 65.536 ms wrap range, so
+         * fall back to the fine microsecond check for the mandatory 500 us settle time
+         * (design plan Sec 5.1.3) that tick resolution alone can't guarantee. */
+        if ((uint16_t)(now_us - last_stop_us) < 500u)
+            return 0u;
+    }
 
     if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
         !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
@@ -2007,6 +1999,7 @@ static void BatteryPlateau_Tick1s(void)
 void Scheduler_ISR_Tick10ms(void)
 {
     sched_flags.tick_counter++;
+    I2C1_SetTickCounter(sched_flags.tick_counter);
     sched_flags.tick_10ms = 1;
     if (--ticks_until_100ms == 0u)
     {
@@ -2282,44 +2275,17 @@ static void CurrentAge_Tick10ms(void)
     state.battery_current_valid =
         (((uint32_t)state.battery_current_age_10ms) <= CURRENT_VALID_AGE_TICKS) ? 1u : 0u;
 
-    /* Empty learning condition (3): output-current validity loss while RPi is on.
-     * Intended to catch abrupt brownouts where the Pi dies before current drops to ~0.
-     * Problem: validity also expires ~2s after any I2C polling gap (no master activity
-     * → INA guard blocks reads → age exceeds CURRENT_VALID_AGE_SEC). An immediate commit
-     * on each validity-loss transition would fire on every script run, committing a
-     * non-minimum value from a short fresh-session window.
-     * Fix: debounce — start a timer on validity loss; commit only after
-     * EMPTY_LEARN_BROWNOUT_HOLD_TICKS of sustained validity loss. Cancel if validity
-     * is restored before the hold expires (polling gap case). A genuine brownout results
-     * in no further I2C activity, so the hold fires and commits correctly.
-     * reset_min=0: preserve tracking across validity gaps so the accumulated minimum
-     * is not discarded on transient gaps. Conditions (1)/(2) use reset_min=1. */
-    if (state.battery_params_self_programmed == 0 &&
-        sys_state.power_state == POWER_STATE_RPI_ON)
-    {
-        if (prev_output_valid && !state.output_current_valid &&
-            min_vbat_while_load_on_mv != 0xFFFFu)
-        {
-            /* Validity just dropped — start brownout debounce */
-            empty_learn_brownout_tick = sched_flags.tick_counter;
-        }
-        else if (state.output_current_valid)
-        {
-            /* Validity restored — cancel debounce (was a polling gap, not a brownout) */
-            empty_learn_brownout_tick = 0u;
-        }
-        else if (empty_learn_brownout_tick != 0u &&
-                 (sched_flags.tick_counter - empty_learn_brownout_tick) >= EMPTY_LEARN_BROWNOUT_HOLD_TICKS)
-        {
-            /* Sustained validity loss — likely a real brownout; commit and clear */
-            EmptyLearn_CommitTrackedMin(1, 0);
-            empty_learn_brownout_tick = 0u;
-        }
-    }
-    else
-    {
-        empty_learn_brownout_tick = 0u;
-    }
+    /* Empty-learning brownout detection (formerly "condition (3)") was removed: it inferred a
+     * dead Pi from output-current validity loss and/or I2C master silence, but neither signal
+     * actually indicates that. Validity loss usually means the bus is busy (a live master is
+     * actively transacting). I2C silence alone is also unsafe: it's indistinguishable from
+     * "NUT isn't running" while the Pi is otherwise perfectly healthy. The one signal that
+     * actually reflects whether the Pi has lost power is the measured output current itself,
+     * which condition (1) (`load_off`, below) already uses directly — and now that
+     * I2C_STOP_SETTLE_TICKS lets the INA219 probe get prompt, valid readings regardless of
+     * whether NUT is polling, condition (1) alone is sufficient: a live-but-NUT-less Pi reads
+     * back normal current (no false trigger); a genuinely dead Pi reads back near-zero current
+     * (correctly triggers). */
 
     if (state.output_current_valid != prev_output_valid ||
         state.battery_current_valid != prev_battery_valid)

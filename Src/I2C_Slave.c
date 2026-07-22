@@ -56,6 +56,11 @@ static volatile uint8_t i2c_addr_matched_since_stop = 0u;
 static volatile uint16_t i2c_last_addr_us = 0u;
 static volatile uint16_t i2c_last_stop_us = 0u;
 
+/* Scheduler-tick mirrors of the two timestamps above; see I2C_Slave.h for why these exist. */
+static volatile uint32_t i2c_current_tick = 0u;
+static volatile uint32_t i2c_last_addr_tick = 0u;
+static volatile uint32_t i2c_last_stop_tick = 0u;
+
 static uint32_t i2c1_slave_timing = 0u;
 static uint32_t i2c1_slave_cr1 = 0u;
 static uint32_t i2c1_slave_cr2 = 0u;
@@ -681,6 +686,21 @@ uint16_t I2C1_GetLastStopUs(void)
     return i2c_last_stop_us;
 }
 
+void I2C1_SetTickCounter(uint32_t tick_counter)
+{
+    i2c_current_tick = tick_counter;
+}
+
+uint32_t I2C1_GetLastAddrTick(void)
+{
+    return i2c_last_addr_tick;
+}
+
+uint32_t I2C1_GetLastStopTick(void)
+{
+    return i2c_last_stop_tick;
+}
+
 void I2C1_RunIna219Probe(void)
 {
     /* Re-run INA219 probe safely by reinitializing the slave afterward. */
@@ -779,6 +799,7 @@ void I2C1_IRQHandler(void)
             i2c_slave_txn_active = 1u;
             i2c_addr_matched_since_stop = 1u;
             i2c_last_addr_us = (uint16_t)LL_TIM_GetCounter(TIM3);
+            i2c_last_addr_tick = i2c_current_tick;
             if (LL_I2C_GetTransferDirection(I2C1) == LL_I2C_DIRECTION_READ) {
                 /* Read: latch which reg_image buffer to use for whole transaction */
                 latched_reg_image = active_reg_image;
@@ -870,6 +891,7 @@ void I2C1_IRQHandler(void)
         write_byte_index = 0;
         if (i2c_addr_matched_since_stop) {
             i2c_last_stop_us = (uint16_t)LL_TIM_GetCounter(TIM3);
+            i2c_last_stop_tick = i2c_current_tick;
         }
         i2c_addr_matched_since_stop = 0u;
         i2c_slave_txn_active = 0u;

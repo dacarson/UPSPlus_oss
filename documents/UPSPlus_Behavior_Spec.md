@@ -343,10 +343,16 @@ Key behaviors:
   `EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA`). Output/battery current values are derived directly from
   the INA219 shunt-voltage register; on this board the shunt resistor is 10 mΩ so the register count
   equals 1 mA per LSB. The learned empty voltage is committed when the Pi is
-  effectively off or about to turn off, detected by any of: **(1)** output current dropping to near zero
-  (graceful shutdown / load removed); **(2)** a low-VBAT protection trigger that initiates a pending
-  power cut; or **(3)** loss of output-current validity while the system is in `POWER_STATE_RPI_ON`
-  (covers abrupt brownouts where telemetry stops before current reaches ~0). The committed value is
+  effectively off or about to turn off, detected by either: **(1)** output current dropping to near zero
+  (graceful shutdown / load removed); or **(2)** a low-VBAT protection trigger that initiates a pending
+  power cut. (A third condition — inferring an abrupt brownout from output-current-validity loss
+  and/or I2C master silence — was considered and removed: neither signal reliably indicates a dead
+  Pi. Validity loss usually means the I2C bus is *busy*, i.e. a master is actively transacting.
+  I2C silence alone is equally unsafe: it's indistinguishable from "NUT isn't running" while the
+  Pi is otherwise healthy. Condition (1) already uses the one signal that's actually meaningful —
+  measured current — and with the guard window's `I2C_STOP_SETTLE_TICKS` fix letting the INA219
+  probe get prompt readings regardless of whether NUT is polling, it's sufficient on its own.)
+  The committed value is
   that minimum—i.e. the lowest under-load voltage **before** the Pi turned off, not the rebound voltage
   after load removal. The tracked discharge-session minimum is an internal candidate value; the
   externally visible “empty voltage” (registers 0x0F–0x10) reflects only the last committed learned
