@@ -156,38 +156,11 @@ It is intended as the source of truth for feature development and future changes
   - 0xFD: output_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFE: battery_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFF: 0  
-- Selector 0x08: INA219 probe diagnostic page. Both counters are saturating (cap at 255) and
-  cumulative for the whole power-on session -- never reset automatically. Callers diff two
-  samples to get a rate over a window; see `tools/upsplus_ina_probe_diag.py`. A gap between the
-  two counts means the guard window is permitting master-mode attempts that are then failing at
-  the actual I2C transaction level -- measured as consistently bus_error (BERR/ARLO/OVR), i.e.
-  genuine collision with another master, not that the guard itself is denying; see selector 0x10
-  for the retry mechanism that recovers from this.  
-  - 0xFD: ina_guard_open_count (uint8) -- incremented each time `I2C1_GuardWindowReady()` allows an attempt  
-  - 0xFE: ina_read_success_count (uint8) -- incremented each time the master-mode INA219 read actually succeeds  
-  - 0xFF: ina_probe_max_wait_ticks (uint8, 10ms units, saturating at 255 = 2550ms) -- session-long
-    max time a FRESH (non-retry) request sat pending before the guard first granted it. Retries
-    have their own known ~50ms cadence and are excluded, so this isolates how long a *new*
-    request typically has to wait for its first opportunity, separate from collision recovery.  
-- Selector 0x10: retry effectiveness (saturating, never auto-reset -- diff two samples, same
-  pattern as selector 0x08). `recovered` should track close to `attempted` if the same-channel
-  retry (see "Failure retry" above) is working as intended.  
-  - 0xFD: ina_probe_retry_attempt_count (uint8) -- a retry was scheduled after a failure  
-  - 0xFE: ina_probe_retry_recovered_count (uint8) -- a probe succeeded after >=1 retry  
-  - 0xFF: 0 (reserved -- a third "exhausted" counter was removed to reclaim flash; it read 0 in
-    every test, i.e. `INA_PROBE_MAX_RETRIES` was never once exceeded)  
-- Selector 0x11: guard-window inputs tracked **internally** by `GuardDiagnostics_Update()`, called
-  every main loop iteration regardless of whether an INA219 probe happens to be pending. Unlike
-  `I2C1_GetLastStopTick()` itself, these are immune to the observer-effect problem external I2C
-  polling has (reading `I2C1_GetLastStopTick()` via a register read is itself STM32-addressed
-  traffic that resets the very value being read) -- safe to sample at any time via
-  `tools/upsplus_ina_probe_diag.py`. Session-long maximums (10ms units, saturating at 255 =
-  2.55s), never auto-reset.  
-  - 0xFD: max ticks since the last STM32-addressed ADDR/STOP, ever observed this session --
-    confirms whether the firmware actually sees NUT's multi-second quiet stretches  
-  - 0xFE: max consecutive ticks `I2C1_GetSlaveTxnActive()` was continuously observed stuck at 1
-    -- a large value here would alone explain chronic guard denial, since that's checked first  
-  - 0xFF: `I2C1_GetSlaveTxnActive()`'s current live value, for a quick sanity check  
+- Selectors 0x08, 0x10, and 0x11 (INA219 guard-open/read-success counts, retry effectiveness,
+  and internal guard-window quiet-time tracking) were removed to reclaim flash once they'd
+  served their purpose: they traced a chronic STM32 I2C reliability problem to an external root
+  cause (a NUT driver bug aliasing a reserved core variable name, busy-looping the driver ~17x
+  faster than its configured poll interval) rather than anything in this firmware.
 
 **Reset cause not reported:** The application does not have access to the bootloader source. The bootloader clears the RCC reset flags (e.g. writes `RMVF=1` to `RCC_CSR`) before jumping to the application, so by the time the app runs the reset cause is already lost. Reset cause is not recorded or reported via I2C or factory test.
 ### 4.5 I2C Bus Robustness
@@ -210,18 +183,8 @@ It is intended as the source of truth for feature development and future changes
   **slave → master → slave** and restores slave mode immediately after the read.
 - Sampling cadence alternates channels at 500 ms intervals (each channel updates ~1 Hz) when
   the master window can be safely entered.
-<<<<<<< Updated upstream
-- **Standalone operation (no I2C master):** INA219 master reads are opportunistic and require
-  recent I2C bus activity to confirm it is safe to switch to master mode. If no I2C master has
-  been active within the last ~50 ms, the guard window blocks the read attempt. As a result,
-  `output_current_valid` and `battery_current_valid` remain 0 in standalone operation (no RPi
-  or other I2C master present). This is a deliberate constraint: the taper full-detection path
-  will not trigger without a master present, and empty-learning falls back to assuming load-on
-  whenever `power_state == RPI_ON` and current validity is absent.
-=======
 - **Failure retry:** a failed master-mode read (measured in practice as consistently
-  BERR/ARLO/OVR -- see `tools/upsplus_ina_probe_diag.py`'s failure-reason breakdown) is normal,
-  recoverable multi-master I2C behavior: NUT's poll timer runs independently and doesn't
+  BERR/ARLO/OVR) is normal, recoverable multi-master I2C behavior: NUT's poll timer runs independently and doesn't
   coordinate with the STM32 in real time, so the guard's pre-check can reduce collision odds but
   can't eliminate them. Rather than waiting for the next full 500 ms alternation (and only after
   the other channel's turn), the same channel is retried after `INA_PROBE_RETRY_DELAY_TICKS`
@@ -258,7 +221,6 @@ It is intended as the source of truth for feature development and future changes
   before the 5 s fallback is first reached. This is a deliberate constraint: the taper
   full-detection path will not trigger without a master present, and empty-learning falls back
   to assuming load-on whenever `power_state == RPI_ON` and current validity is absent.
->>>>>>> Stashed changes
 
 ---
 

@@ -124,75 +124,16 @@ static uint32_t ina_probe_due_ticks = 0;
 static uint8_t ina_probe_is_output = 1u;
 static uint8_t ina_next_is_output = 1u;
 /* A failed master-mode INA219 read (measured: consistently BERR/ARLO/OVR, i.e. a genuine
- * collision with another master -- see tools/upsplus_ina_probe_diag.py's failure-reason
- * breakdown) is normal, recoverable multi-master I2C behavior, not evidence the channel is
- * stuck. The guard's pre-check can reduce collision odds but can't eliminate them, since NUT's
- * poll timer runs independently and doesn't coordinate with the STM32 in real time. Retry the
+ * collision with another master) is normal, recoverable multi-master I2C behavior, not
+ * evidence the channel is stuck. The guard's pre-check can reduce collision odds but can't
+ * eliminate them, since NUT's poll timer runs independently and doesn't coordinate with the
+ * STM32 in real time. Retry the
  * SAME channel shortly after a failure instead of waiting for the next full alternation (up to
  * 500ms later, and only after the other channel's turn) -- bounded so a persistently
  * unresponsive device still falls back to normal alternation rather than retrying forever. */
 #define INA_PROBE_MAX_RETRIES        3u
 #define INA_PROBE_RETRY_DELAY_TICKS  5u  /* ~50ms: long enough for a colliding transaction to finish */
 static uint8_t ina_probe_retry_count = 0u;
-/* Diagnostic-only, saturating counters (factory test selector 0x08): how often the guard
- * window allows an attempt vs. how often the actual master-mode INA219 read succeeds. A gap
- * between the two means attempts are being permitted but failing at the transaction level
- * (e.g. NACK/arbitration loss triggering I2C1_TryBusRecovery()), not that the guard itself is
- * the bottleneck. Never reset automatically; callers diff two samples to get a rate. */
-static uint8_t ina_guard_open_count = 0u;
-static uint8_t ina_read_success_count = 0u;
-/* Diagnostic-only: how long a FRESH probe request (not a retry -- those have their own known
- * ~50ms cadence) sits pending before I2C1_GuardWindowReady() first grants it. Session-long max
- * (10ms units, saturating at 255 = 2550ms), never auto-reset -- exposed as selector 0x08 byte 3.
- * Answers "the guard eventually opens, and internal tracking shows multi-second quiet stretches
- * exist, so why does a *new* request often wait so long before its first attempt?" */
-static uint32_t ina_probe_pending_since_tick = 0u;
-static uint8_t ina_probe_max_wait_ticks = 0u;
-/* Diagnostic-only, saturating counters (factory test selector 0x10): retry effectiveness.
- * attempted: a retry was scheduled after a failure. recovered: a probe succeeded after >=1
- * retry (the retry mechanism actually saved this read). Never reset automatically.
- * (A third "exhausted" counter -- all retries used up with no success -- was removed to
- * reclaim flash: it read 0 in every test, i.e. INA_PROBE_MAX_RETRIES was never once exceeded.) */
-static uint8_t ina_probe_retry_attempt_count = 0u;
-static uint8_t ina_probe_retry_recovered_count = 0u;
-
-/* Diagnostic-only (factory test selector 0x11): tracks guard-window inputs internally, every
- * main loop iteration, regardless of whether an INA219 probe happens to be pending -- immune
- * to the observer-effect problem external I2C polling has here (sampling I2C1_GetLastStopTick()
- * via a register read is itself STM32-addressed traffic that resets the very value being read).
- * Session-long maximums, saturating at 255 (10ms units, i.e. 2.55s), never auto-reset. */
-static uint32_t ina_diag_max_ticks_since_stm32_activity = 0u;
-static uint32_t ina_diag_txn_active_since_tick = 0u;   /* 0 = not currently stuck active */
-static uint32_t ina_diag_max_txn_active_stuck_ticks = 0u;
-
-static void GuardDiagnostics_Update(void)
-{
-    uint32_t now_ticks = sched_flags.tick_counter;
-    uint32_t last_stop_tick = I2C1_GetLastStopTick();
-    uint32_t last_addr_tick = I2C1_GetLastAddrTick();
-    uint32_t last_activity_tick = (last_addr_tick > last_stop_tick) ? last_addr_tick : last_stop_tick;
-    /* last_activity_tick == 0 (never seen any STM32-addressed activity) is still meaningful
-     * here: "since" becomes ticks-since-boot, which is a valid (and informative) signal. */
-    uint32_t since = now_ticks - last_activity_tick;
-    if (since > ina_diag_max_ticks_since_stm32_activity)
-        ina_diag_max_ticks_since_stm32_activity = since;
-
-    if (I2C1_GetSlaveTxnActive())
-    {
-        if (ina_diag_txn_active_since_tick == 0u)
-            ina_diag_txn_active_since_tick = now_ticks;
-        else
-        {
-            uint32_t stuck = now_ticks - ina_diag_txn_active_since_tick;
-            if (stuck > ina_diag_max_txn_active_stuck_ticks)
-                ina_diag_max_txn_active_stuck_ticks = stuck;
-        }
-    }
-    else
-    {
-        ina_diag_txn_active_since_tick = 0u;
-    }
-}
 
 static void MX_TIM3_Init(void);
 static uint8_t I2C1_GuardWindowReady(void);
@@ -486,48 +427,14 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
                                                         auth->battery_current_age_10ms : 255u);
             buf[REG_FACTORY_TEST_START + 3] = 0x00u;
             break;
-        case 0x08u:
-            /* Diagnostic: INA219 guard-window open count vs. actual read success count
-             * (saturating, never auto-reset -- diff two samples to get a rate). A gap between
-             * the two means the guard permits attempts that then fail at the transaction
-             * level -- measured as consistently bus_error (BERR/ARLO/OVR), i.e. genuine
-             * collision with another master, not a stuck device; see selector 0x10 for the
-             * retry mechanism that recovers from this.
-             * Byte 3: session-long max ticks (10ms units) a FRESH (non-retry) request sat
-             * pending before the guard first granted it -- see ina_probe_pending_since_tick. */
-            buf[REG_FACTORY_TEST_START + 1] = ina_guard_open_count;
-            buf[REG_FACTORY_TEST_START + 2] = ina_read_success_count;
-            buf[REG_FACTORY_TEST_START + 3] = ina_probe_max_wait_ticks;
-            break;
-        /* 0x09 (reset cause) and 0x0F (INA219 failure-reason breakdown: NACK/bus error/timeout)
-         * removed to reclaim flash. 0x0F's question was conclusively answered by testing
-         * (consistently bus_error, never NACK/timeout -- see selector 0x08's comment) before
-         * removal, not left unanswered. */
-        case 0x10u:
-            /* Diagnostic: retry effectiveness (saturating, never auto-reset -- diff two
-             * samples). attempted: a retry was scheduled after a failure. recovered: a probe
-             * succeeded after >=1 retry (retry actually saved the read). recovered should
-             * track close to attempted if retries are working as intended. */
-            buf[REG_FACTORY_TEST_START + 1] = ina_probe_retry_attempt_count;
-            buf[REG_FACTORY_TEST_START + 2] = ina_probe_retry_recovered_count;
-            buf[REG_FACTORY_TEST_START + 3] = 0x00u;
-            break;
-        case 0x11u:
-            /* Diagnostic: guard-window inputs tracked internally every main loop iteration
-             * (GuardDiagnostics_Update()), immune to the observer-effect problem external I2C
-             * polling has here. Session-long maximums (10ms units, saturating at 255 = 2.55s),
-             * never auto-reset -- query after letting the system run a while.
-             * Byte 1 near 190-200 confirms the firmware really does see NUT's ~1.9s quiet
-             * stretch each cycle; near 0 means something generates STM32-addressed traffic far
-             * more often than expected. Byte 2 > ~0 confirms txn_active gets and stays stuck,
-             * which would explain chronic guard denial on its own (checked first, unconditional
-             * deny). Byte 3 is txn_active's CURRENT live state for a quick sanity check. */
-            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)((ina_diag_max_ticks_since_stm32_activity <= 255u) ?
-                                                        ina_diag_max_ticks_since_stm32_activity : 255u);
-            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)((ina_diag_max_txn_active_stuck_ticks <= 255u) ?
-                                                        ina_diag_max_txn_active_stuck_ticks : 255u);
-            buf[REG_FACTORY_TEST_START + 3] = I2C1_GetSlaveTxnActive();
-            break;
+        /* 0x08 (guard-open/read-success counts), 0x09 (reset cause), 0x10 (retry effectiveness),
+         * and 0x11 (internal guard-window quiet-time tracking) were removed to reclaim flash
+         * once they'd served their purpose: they traced a chronic STM32 I2C reliability problem
+         * to an external root cause (a NUT driver bug aliasing a reserved core variable name,
+         * busy-looping the driver ~17x faster than its configured poll interval) rather than
+         * anything in this firmware. 0x0F (INA219 failure-reason breakdown) was removed earlier
+         * for the same reason: its question was conclusively answered by testing (consistently
+         * bus_error, never NACK/timeout) before removal, not left unanswered. */
 #if UPS_ADC_FACTORY_DIAG_ENABLED
         case 0x0Au: /* raw ADC code, battery channel (idx 1), pre-scaling */
         case 0x0Bu: /* raw ADC code, USB-C/VBUS channel (idx 2), pre-scaling */
@@ -1038,7 +945,6 @@ int main(void)
                 ina_probe_due_ticks = sched_flags.tick_counter + 1u; /* ~10 ms */
                 ina_probe_is_output = ina_next_is_output;
                 ina_next_is_output = (ina_next_is_output == 0u) ? 1u : 0u;
-                ina_probe_pending_since_tick = sched_flags.tick_counter;
             }
             sched_flags.tick_500ms = 0;
         }
@@ -1075,10 +981,6 @@ int main(void)
         /* Apply I2C writes to authoritative state (RO rejected, bounds checked) */
         ProcessI2CPendingWrite();
 
-        /* Runs every iteration regardless of whether a probe is pending -- see comment at
-         * declaration for why this needs to observe continuously, not just when checked. */
-        GuardDiagnostics_Update();
-
         if (ina_probe_requested)
         {
             uint32_t now_ticks = sched_flags.tick_counter;
@@ -1086,23 +988,10 @@ int main(void)
                 I2C1_GuardWindowReady())
             {
                 int16_t shunt_raw = 0;
-                if (ina_probe_retry_count == 0u)
-                {
-                    /* First attempt of a fresh sequence (not a retry) just got through the
-                     * guard -- record how long it sat pending waiting for that. */
-                    uint32_t wait_ticks = now_ticks - ina_probe_pending_since_tick;
-                    uint8_t wait_capped = (uint8_t)((wait_ticks <= 255u) ? wait_ticks : 255u);
-                    if (wait_capped > ina_probe_max_wait_ticks)
-                        ina_probe_max_wait_ticks = wait_capped;
-                }
                 ina_probe_requested = 0;
                 if (I2C1_ReadIna219Shunt(ina_probe_is_output, &shunt_raw))
                 {
-                    if (ina_probe_retry_count > 0u && ina_probe_retry_recovered_count < 0xFFu)
-                        ina_probe_retry_recovered_count++;
                     ina_probe_retry_count = 0u;
-                    if (ina_read_success_count < 0xFFu)
-                        ina_read_success_count++;
                     if (ina_probe_is_output)
                     {
                         state.output_current_mA = shunt_raw;
@@ -1122,8 +1011,6 @@ int main(void)
                     /* Likely transient collision (BERR/ARLO/OVR) -- retry the same channel
                      * shortly rather than waiting for the next full alternation. */
                     ina_probe_retry_count++;
-                    if (ina_probe_retry_attempt_count < 0xFFu)
-                        ina_probe_retry_attempt_count++;
                     ina_probe_requested = 1u;
                     ina_probe_due_ticks = sched_flags.tick_counter + INA_PROBE_RETRY_DELAY_TICKS;
                 }
@@ -1958,8 +1845,6 @@ static uint8_t I2C1_GuardWindowReady(void)
     if (!I2C1_BusIdleStable500us())
         return 0u;
 
-    if (ina_guard_open_count < 0xFFu)
-        ina_guard_open_count++;
     return 1u;
 }
 
