@@ -675,8 +675,6 @@ typedef struct {
  * multiple times per sample or on non-sample cycles. Every sample-qualified consumer
  * keeps its own last_seen_seq and gates on (adc_sample_seq != last_seen_seq).
  */
-/* ADC buffer size - must match ADC_CONVERTED_DATA_BUFFER_SIZE in main.c */
-/* Use guard to prevent redefinition if already defined elsewhere (e.g., CubeMX) */
 /* ADC Channel Ordering (verified from MX_ADC_Init sequence):
  * aADCxConvertedData[0] = Channel 0 (PIVCC)
  * aADCxConvertedData[1] = Channel 1 (VBAT)
@@ -685,8 +683,16 @@ typedef struct {
  * aADCxConvertedData[4] = TEMPSENSOR (Temperature)
  * aADCxConvertedData[5] = VREFINT (for VDD calibration)
  * Channel ordering must match existing MX_ADC_Init sequence; do not reorder. */
+/* Use guards to prevent redefinition if already defined elsewhere (e.g., CubeMX) */
+#ifndef ADC_CHANNEL_COUNT
+#define ADC_CHANNEL_COUNT 6
+#endif
+/* DMA runs one-shot (NORMAL mode, re-armed each cycle in the main loop) rather
+ * than circular/continuous: the ADC is only ever active for one 6-channel
+ * burst every 500ms, then idle, so the buffer is stable for the main loop to
+ * read directly the rest of that window -- no ping-pong/snapshot needed. */
 #ifndef ADC_CONVERTED_DATA_BUFFER_SIZE
-#define ADC_CONVERTED_DATA_BUFFER_SIZE 6
+#define ADC_CONVERTED_DATA_BUFFER_SIZE ADC_CHANNEL_COUNT
 #endif
 
 /* ADC flags and data - declared extern here, defined in main.c */
