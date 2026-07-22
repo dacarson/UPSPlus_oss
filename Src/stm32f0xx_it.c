@@ -167,6 +167,9 @@ void PendSV_Handler(void)
 
 /**
  * @brief DMA1 Channel1 interrupt handler — fires on ADC DMA transfer complete.
+ * DMA runs NORMAL (one-shot), re-armed each cycle in the main loop, so it's
+ * idle between bursts and aADCxConvertedData is stable for the main loop to
+ * read directly once this fires.
  * Sets adc_ready; main loop processes ADC buffer and updates state.
  * Defined here (not main.c) so the strong symbol survives LTO and correctly
  * overrides the weak assembly alias in the vector table.

@@ -31,11 +31,19 @@ void UpdateBatteryMinMax(void);
 void FactoryReset(void);
 void CheckPowerOnConditions(void);
 
+/* Set to 1 to re-enable factory-test selectors 0x0A-0x0E (raw per-channel ADC
+ * codes + TS_CAL1/TS_CAL2 readback; read with tools/upsplus_adc_diag.py).
+ * Left at 0 normally: this part's flash is nearly full, and these registers
+ * are only needed when re-investigating this class of ADC/temperature bug. */
+#ifndef UPS_ADC_FACTORY_DIAG_ENABLED
+#define UPS_ADC_FACTORY_DIAG_ENABLED 0
+#endif
+
 /* Everything below needs to be mapped to registers */
 
-#define ADC_CONVERTED_DATA_BUFFER_SIZE 6
-
-/* Raw ADC buffer; DMA fills, main loop processes into state */
+/* Raw ADC buffer; DMA fills, main loop processes into state. DMA runs
+ * one-shot (see MX_DMA_Init/tick_500ms re-arm), so this is stable and idle
+ * between bursts -- safe to read directly. */
 __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
 
 /* Timing/button helpers (canonical 10 ms tick/EXTI). Authoritative state is state/sys_state only;
@@ -409,6 +417,34 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
             buf[REG_FACTORY_TEST_START + 3] = 0x00u;
             break;
         /* 0x08/0x09 (reset cause) removed: bootloader clears RCC_CSR before app runs, so values were always 0. */
+#if UPS_ADC_FACTORY_DIAG_ENABLED
+        case 0x0Au: /* raw ADC code, battery channel (idx 1), pre-scaling */
+        case 0x0Bu: /* raw ADC code, USB-C/VBUS channel (idx 2), pre-scaling */
+        case 0x0Cu: /* raw ADC code, TEMPSENSOR channel (idx 4), pre-formula */
+        {
+            /* Shared body: selector 0x0A/B/C map to aADCxConvertedData[1]/[2]/[4]
+             * (indices are 1<<offset, avoids a lookup table). Compare against
+             * registers 0x05/0x07/0x0B to recompute the corresponding
+             * __LL_ADC_CALC_* formula by hand. */
+            uint16_t raw = aADCxConvertedData[1u << (selector - 0x0Au)];
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(raw & 0xFFu);
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)(raw >> 8);
+            buf[REG_FACTORY_TEST_START + 3] = 0x00u;
+            break;
+        }
+        case 0x0Du: /* factory TS_CAL1, raw ADC code at 30 DegC, Vref=3.3V */
+        case 0x0Eu: /* factory TS_CAL2, raw ADC code at 110 DegC, Vref=3.3V */
+        {
+            /* If either looks unprogrammed (0x0000/0xFFFF) or CAL2<=CAL1, the
+             * temperature formula's calibration inputs are bad on this part,
+             * independent of anything ADC/DMA related. */
+            uint16_t cal = (selector == 0x0Du) ? *TEMPSENSOR_CAL1_ADDR : *TEMPSENSOR_CAL2_ADDR;
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(cal & 0xFFu);
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)(cal >> 8);
+            buf[REG_FACTORY_TEST_START + 3] = 0x00u;
+            break;
+        }
+#endif /* UPS_ADC_FACTORY_DIAG_ENABLED */
         default:
             break;
         }
@@ -730,7 +766,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.version = 27;
+    state.version = 28;
     state.snapshot_tick = 0;
     state.last_true_vbat_sample_tick = 0;
     state.last_true_vbat_mv = 0;
@@ -861,7 +897,30 @@ int main(void)
         if (sched_flags.tick_500ms)
         {
             if (!adc_ready)
-                LL_ADC_REG_StartConversion(ADC1);
+            {
+                /* DMA runs NORMAL (one-shot): each burst's completion leaves
+                 * NDTR at 0, so it must be explicitly re-armed before the next
+                 * trigger, every cycle (not just after a deadlock). */
+                LL_DMA_DisableChannel(DMA1, LL_DMA_CHANNEL_1);
+                LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_1, ADC_CONVERTED_DATA_BUFFER_SIZE);
+                LL_DMA_EnableChannel(DMA1, LL_DMA_CHANNEL_1);
+
+                if (!LL_ADC_IsEnabled(ADC1))
+                {
+                    /* ADEN=0 with ADSTART=1 is a deadlock: RS bits prevent clearing
+                     * ADSTART by writing 0. Use APB peripheral reset to restore all
+                     * ADC registers to reset state, then re-initialise (which also
+                     * re-triggers conversion). Should be rare now that DMA no longer
+                     * runs the CIRC+LIMITED combination suspected to cause this. */
+                    LL_APB1_GRP2_ForceReset(LL_APB1_GRP2_PERIPH_ADC1);
+                    LL_APB1_GRP2_ReleaseReset(LL_APB1_GRP2_PERIPH_ADC1);
+                    MX_ADC_Init();
+                }
+                else
+                {
+                    LL_ADC_REG_StartConversion(ADC1);
+                }
+            }
             if (!ina_probe_requested)
             {
                 ina_probe_requested = 1;
@@ -2363,7 +2422,8 @@ static void Button_DispatchActions(void)
     if (button_handler.pending_click == BUTTON_CLICK_SHORT)
     {
         if (sys_state.power_state == POWER_STATE_RPI_OFF ||
-            sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
+            sys_state.power_state == POWER_STATE_PROTECTION_LATCHED ||
+            sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
         {
             uint8_t allow_power_on = 1;
             if (Charger_IsInfluencingVBAT(&sys_state) && !IsTrueVbatUsableForDecision())
@@ -2490,7 +2550,12 @@ static void MX_ADC_Init(void)
 
     LL_DMA_SetDataTransferDirection(DMA1, LL_DMA_CHANNEL_1, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
     LL_DMA_SetChannelPriorityLevel(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PRIORITY_LOW);
-    LL_DMA_SetMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MODE_CIRCULAR);
+    /* NORMAL (one-shot), not CIRCULAR: pairs with the ADC's DMATransfer=LIMITED
+     * per the reference manual (CIRC=1 with DMACFG=0 is a documented-prohibited
+     * combination, and is suspected to be the root cause of the ADEN/ADSTART
+     * deadlock this part has hit). Re-armed explicitly each cycle in the
+     * tick_500ms handler alongside LL_ADC_REG_StartConversion(). */
+    LL_DMA_SetMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MODE_NORMAL);
     LL_DMA_SetPeriphIncMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PERIPH_NOINCREMENT);
     LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MEMORY_INCREMENT);
     LL_DMA_SetPeriphSize(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PDATAALIGN_HALFWORD);
