@@ -156,6 +156,11 @@ It is intended as the source of truth for feature development and future changes
   - 0xFD: output_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFE: battery_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFF: 0  
+- Selectors 0x08, 0x10, and 0x11 (INA219 guard-open/read-success counts, retry effectiveness,
+  and internal guard-window quiet-time tracking) were removed to reclaim flash once they'd
+  served their purpose: they traced a chronic STM32 I2C reliability problem to an external root
+  cause (a NUT driver bug aliasing a reserved core variable name, busy-looping the driver ~17x
+  faster than its configured poll interval) rather than anything in this firmware.
 
 **Reset cause not reported:** The application does not have access to the bootloader source. The bootloader clears the RCC reset flags (e.g. writes `RMVF=1` to `RCC_CSR`) before jumping to the application, so by the time the app runs the reset cause is already lost. Reset cause is not recorded or reported via I2C or factory test.
 ### 4.5 I2C Bus Robustness
@@ -178,13 +183,44 @@ It is intended as the source of truth for feature development and future changes
   **slave → master → slave** and restores slave mode immediately after the read.
 - Sampling cadence alternates channels at 500 ms intervals (each channel updates ~1 Hz) when
   the master window can be safely entered.
-- **Standalone operation (no I2C master):** INA219 master reads are opportunistic and require
-  recent I2C bus activity to confirm it is safe to switch to master mode. If no I2C master has
-  been active within the last ~50 ms, the guard window blocks the read attempt. As a result,
-  `output_current_valid` and `battery_current_valid` remain 0 in standalone operation (no RPi
-  or other I2C master present). This is a deliberate constraint: the taper full-detection path
-  will not trigger without a master present, and empty-learning falls back to assuming load-on
-  whenever `power_state == RPI_ON` and current validity is absent.
+- **Failure retry:** a failed master-mode read (measured in practice as consistently
+  BERR/ARLO/OVR) is normal, recoverable multi-master I2C behavior: NUT's poll timer runs independently and doesn't
+  coordinate with the STM32 in real time, so the guard's pre-check can reduce collision odds but
+  can't eliminate them. Rather than waiting for the next full 500 ms alternation (and only after
+  the other channel's turn), the same channel is retried after `INA_PROBE_RETRY_DELAY_TICKS`
+  (~50 ms) -- long enough for the colliding transaction to finish. Bounded to
+  `INA_PROBE_MAX_RETRIES` (3) attempts, after which the channel falls back to normal alternation
+  rather than retrying forever (e.g. if the device is genuinely unresponsive).
+- **Guard window (`I2C1_GuardWindowReady()`):** the STM32 tracks the last STOP/ADDR event
+  addressed to its own slave address at **two** resolutions in parallel, captured at the same
+  ISR moments (`I2C_Slave.c`'s ADDR/STOP handlers):
+  - Microsecond (16-bit, free-running TIM3, `I2C1_GetLastStopUs()`/`GetLastAddrUs()`) — wraps
+    every ~65.5 ms, so only trustworthy for very short "how long ago" comparisons.
+  - Tick (32-bit, 10 ms resolution, `I2C1_GetLastStopTick()`/`GetLastAddrTick()`) — pushed in
+    from main.c's `Scheduler_ISR_Tick10ms()` via `I2C1_SetTickCounter()` (since `sched_flags` is
+    private to main.c); no realistic wraparound.
+  Entry logic, always followed by a live bus-idle-stable-500us GPIO check before actually
+  switching to master mode:
+  1. If no STM32-addressed activity has ever been observed, wait `I2C_MASTER_IDLE_ALLOW_READ_TICKS`
+     (5 s) since boot, then proceed to the live check — a defense-in-depth fallback for true
+     standalone operation (no RPi/other I2C master ever present).
+  2. Otherwise, once at least `I2C_STOP_SETTLE_TICKS` (1 tick) has passed since the last STOP,
+     proceed straight to the live check, with **no** upper bound — tick resolution has no wrap
+     ceiling, so trust doesn't need to expire the way it did under a microsecond-only scheme.
+  3. Only when still within that first tick (true elapsed time necessarily under TIM3's wrap
+     range) does the fine microsecond check apply: require ≥500 us since the STOP event
+     (`I2C1_GetLastStopUs()`), per the original 500 us settle-time requirement.
+  A master that polls steadily (e.g. NUT's default ~2 s `critical_update_interval`) leaves the
+  STM32-addressed traffic clustered at one point in each cycle (per `upsdrv_updateinfo()`'s call
+  order, the STM32 register-map read happens last), followed by a genuinely quiet bus for most
+  of the remaining cycle — case (2) lets the STM32 use that entire quiet stretch, not just a
+  sliver right after its own last transaction, closing what used to be a starvation gap between
+  a short post-transaction window and a multi-second full-idle threshold.
+  `output_current_valid`/`battery_current_valid` remain 0 whenever none of the above has applied
+  recently enough (age > `CURRENT_VALID_AGE_SEC`, 2 s) — mainly in true standalone operation
+  before the 5 s fallback is first reached. This is a deliberate constraint: the taper
+  full-detection path will not trigger without a master present, and empty-learning falls back
+  to assuming load-on whenever `power_state == RPI_ON` and current validity is absent.
 
 ---
 
@@ -307,10 +343,16 @@ Key behaviors:
   `EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA`). Output/battery current values are derived directly from
   the INA219 shunt-voltage register; on this board the shunt resistor is 10 mΩ so the register count
   equals 1 mA per LSB. The learned empty voltage is committed when the Pi is
-  effectively off or about to turn off, detected by any of: **(1)** output current dropping to near zero
-  (graceful shutdown / load removed); **(2)** a low-VBAT protection trigger that initiates a pending
-  power cut; or **(3)** loss of output-current validity while the system is in `POWER_STATE_RPI_ON`
-  (covers abrupt brownouts where telemetry stops before current reaches ~0). The committed value is
+  effectively off or about to turn off, detected by either: **(1)** output current dropping to near zero
+  (graceful shutdown / load removed); or **(2)** a low-VBAT protection trigger that initiates a pending
+  power cut. (A third condition — inferring an abrupt brownout from output-current-validity loss
+  and/or I2C master silence — was considered and removed: neither signal reliably indicates a dead
+  Pi. Validity loss usually means the I2C bus is *busy*, i.e. a master is actively transacting.
+  I2C silence alone is equally unsafe: it's indistinguishable from "NUT isn't running" while the
+  Pi is otherwise healthy. Condition (1) already uses the one signal that's actually meaningful —
+  measured current — and with the guard window's `I2C_STOP_SETTLE_TICKS` fix letting the INA219
+  probe get prompt readings regardless of whether NUT is polling, it's sufficient on its own.)
+  The committed value is
   that minimum—i.e. the lowest under-load voltage **before** the Pi turned off, not the rebound voltage
   after load removal. The tracked discharge-session minimum is an internal candidate value; the
   externally visible “empty voltage” (registers 0x0F–0x10) reflects only the last committed learned

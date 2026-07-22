@@ -76,10 +76,6 @@ extern "C" {
 #define EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA  25   /* |output_current_mA| <= this => load off (mA) */
 /* Empty learning: require load_off sustained this long (10ms ticks) before committing on load-off; avoids committing on single-sample current glitches */
 #define EMPTY_LEARN_LOAD_OFF_HOLD_TICKS          ((uint32_t)(3u * TICKS_PER_1S))   /* 3 seconds */
-/* Empty learning (condition 3): validity must remain lost this long before committing.
- * Filters polling gaps (validity expires ~2s after last I2C activity) from genuine brownouts.
- * If I2C resumes before this expires, the debounce is cancelled. */
-#define EMPTY_LEARN_BROWNOUT_HOLD_TICKS          ((uint32_t)(30u * TICKS_PER_1S))  /* 30 seconds */
 /* Empty learning: do not commit if min is this close to full (avoids corrupting empty after I2C failure while battery near full) */
 #define EMPTY_LEARN_MIN_MEANINGFUL_DISCHARGE_MV 300u
 /* Empty learning: persist only if change >= this and at most once per discharge session */
