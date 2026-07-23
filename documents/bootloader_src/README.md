@@ -94,8 +94,10 @@ The binary was disassembled using `arm-none-eabi-objdump -D -b binary -m arm -M 
 - No explicit end-of-image command; bootloader returns after a long timeout
 
 ### Flash Erase
-- Uses **aliased** address `0x00800800–0x00803FFF` (14 pages of 1 KB)
-- Corresponding real addresses: `0x08000800–0x08003FFF`
+- Uses `FLASH->AR = 0x00800800–0x00803FFF` (14 pages of 1 KB) instead of the
+  expected `0x08000800–0x08003FFF` — see limitation #2 below; likely a typo
+  in the original firmware that's harmless because the erase controller only
+  decodes the low-order page-offset bits
 - Settings page `0x08003C00` is saved to RAM before erase and restored after
 
 ### Boot Decision (in order)
@@ -126,50 +128,51 @@ reset-like effect comes entirely from the initial LOW pulse in
 
 ## Known Limitations / Uncertainties
 
+These are the items where cross-checking against the real CMSIS/HAL/LL
+headers did **not** resolve the uncertainty — either because the question is
+about application-level protocol logic rather than register definitions, or
+because the observed behavior is confirmed but its cause/intent is not.
+
 1. **I2C ISR detail (MED)**: The exact interplay between `rx_index`, the OTA
    buffer offset, and the status byte transitions was inferred from the ISR
-   disassembly. The reconstructed C ISR captures the essential logic but the
-   byte-by-byte state machine may differ in edge cases.
+   disassembly. Switching to `stm32f0xx_ll_i2c.h` firmed up the register-level
+   parts (flag checks, ADDCODE, DIR — see resolved items below), but the
+   byte-by-byte state machine around `rx_index`/OTA buffer offsets is
+   protocol logic specific to this firmware, not something a header
+   cross-check can verify. It may still differ in edge cases.
 
-2. **GPIO alternate function number (MED, now HIGH)**: PA9/PA10 are configured
-   as AF with function 1 (`LL_GPIO_AF_1`). This matches the STM32F030
-   datasheet (AF1 = I2C1 on PA9/PA10). The AF register field encoding is now
-   expressed via `LL_GPIO_SetAFPin_8_15()`, whose `AFRH` bitfield math is
-   identical to what the disassembly showed, resolving the earlier
-   uncertainty in the hand-rolled `gpio_set_afr()` helper.
+2. **Flash erase address is likely a typo, not intentional aliasing (HIGH –
+   observed)**: The binary stores `0x00800800` (not `0x08000800`) as the
+   starting address for `FLASH->AR`. The two differ only in bit 27 vs. bit 23
+   (`0x08000000` vs `0x00800000`); both mask to the same low-order page offset
+   (`& 0x3FFF == 0x0800`), which is all the erase controller needs to select
+   the correct 1 KB page on this 16 KB part. That makes this look like an
+   off-by-a-region-bit mistake in the original firmware (e.g. computed from
+   the wrong base address) that happened to be harmless — not a deliberate
+   choice to use the alias region. Independent of the header cross-check;
+   this is about the firmware's own arithmetic, not a register definition.
 
-3. **Flash erase aliased addresses (HIGH – observed)**: The binary stores
-   `0x00800800` (not `0x08000800`) as the starting address for `FLASH->AR`.
-   This is unusual; most bootloaders use the non-aliased address. The
-   STM32F030 appears to accept either, and this is what the binary actually
-   does.
+3. **I2C `TIMINGR` vs. system clock**: `TIMINGR = 0x00901850` is correct for
+   100 kHz standard mode at 48 MHz. The bootloader binary itself does not
+   configure the PLL, suggesting either: (a) it runs at a lower effective
+   speed, or (b) the MCU was already at 48 MHz when the bootloader was burned
+   and timing tolerances are wide enough for I2C slave operation. This is a
+   system-clock question, not a register-definition one, so the header
+   cross-check doesn't bear on it.
 
-4. **I2C TIMINGR vs system clock**: `TIMINGR = 0x00901850` is correct for
-   48 MHz. The bootloader binary itself does not configure the PLL, suggesting
-   either: (a) it runs at a lower effective speed, or (b) the MCU was already
-   at 48 MHz when the bootloader was burned and timing tolerances are wide
-   enough for I2C slave operation.
-
-5. **`gpio_set_ospeedr` encoding (MED, now HIGH)**: The disassembly at
-   `0x08000300` showed an inconsistent-looking field computation versus the
-   other GPIO helpers. Replacing it with `LL_GPIO_SetPinSpeed()` — ST's own
-   `(Pin*Pin)`-based OSPEEDR field math — removes this uncertainty entirely;
-   the earlier hand-rolled `p^4` formula was an artifact of a MED-confidence
-   disassembly read, not a real difference in the OSPEEDR encoding.
-
-6. **`I2C_ISR_DIR` bit position (bug, now fixed)**: The original
-   `stm32f030_periph.h` defined `I2C_ISR_DIR` as bit 24. Cross-checking
-   against `stm32f030x6.h` shows DIR is actually bit 16 of `I2C->ISR`. The
-   ADDCODE extraction in `I2C1_IRQHandler()` was unaffected (it never used
-   this macro, just a shift+mask), but the `dir_bit` check that gated
-   TX vs. RX setup on ADDR match was reading the wrong bit. This is now
-   expressed via `LL_I2C_GetTransferDirection()`.
-
-7. **FLASH lock/unlock ordering (HIGH – observed, unresolved)**:
+4. **FLASH lock/unlock ordering (HIGH – observed, unresolved)**:
    `save_settings_to_flash()` re-locks `FLASH->CR` (`HAL_FLASH_Lock()`) at
    its end, and the OTA receive loop in `bootloader_main()` that follows it
    never calls `HAL_FLASH_Unlock()` again before programming incoming
    blocks. On real silicon a locked `FLASH->CR` ignores writes to `PG`. This
    is reproduced as observed in the disassembly rather than corrected, since
    this file documents the shipped binary's actual behaviour; see the note
-   above `bootloader_main()` in `bootloader.c`.
+   above `bootloader_main()` in `bootloader.c`. The HAL flash header
+   cross-check confirmed the lock/unlock/program call shapes are right — it's
+   the *ordering* between two otherwise-correct calls that's in question, so
+   this stays open.
+
+(GPIO alternate-function number, `gpio_set_ospeedr` encoding, and the
+`I2C_ISR_DIR` bit position were previously listed here as uncertainties; the
+CMSIS/HAL/LL cross-check resolved all three — see the note near the top of
+this file.)
