@@ -412,10 +412,21 @@ Contents:       data[0]  0xFF     data[1]  0xFF     ...  data[N]
 
 ## 9. GPIO Behavior
 
-- **IP_EN (PA5)**: controls charger path.
+- **IP_EN (PA5)**: controls charger path. Also suspected to drive the IP5328's **KEY** pin
+  (button-detect input, IP5328 pin 26) rather than being a plain charger-enable line — see note below.
 - **MT_EN (PA6)**: controls RPi power.
 - **PWR_EN (PA7)**: always HIGH.
 - **Button (PB1)**: EXTI edge → main-loop FSM.
+
+**IP_EN / KEY pin hypothesis (unconfirmed against schematic):** The original vendor firmware
+(`Original-app/Src/main.c`) periodically pulses `IP_EN` low then high in patterns explicitly
+commented as "retrigger the button" (每隔一段这个时间就重新触发按钮) and "flicker-disconnect to
+help re-identify battery level" (闪断,有助于重新识别电量). That behavior matches KEY-pin button-press
+emulation on power-bank ICs (a brief low pulse toggles the chip's output/wake state) rather than a
+simple charger-enable line, and mirrors how the newer deHarro (IP5389-based) firmware pulses its
+dedicated `BIT_CTRL_IP5389` line to the chip's KEY pin. Assumed true for this spec's purposes; if
+so, forcing `IP_EN` LOW during the measurement window (Section 6) also asserts the IP5328's button
+input, not merely disabling the charger path.
 
 ---
 
