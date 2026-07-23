@@ -133,16 +133,15 @@ headers did **not** resolve the uncertainty — either because the question is
 about application-level protocol logic rather than register definitions, or
 because the observed behavior is confirmed but its cause/intent is not.
 
-1. **I2C ISR detail (MED)**: The exact interplay between `rx_index`, the OTA
+1. **I2C ISR detail**: The exact interplay between `rx_index`, the OTA
    buffer offset, and the status byte transitions was inferred from the ISR
    disassembly. Switching to `stm32f0xx_ll_i2c.h` firmed up the register-level
-   parts (flag checks, ADDCODE, DIR — see resolved items below), but the
-   byte-by-byte state machine around `rx_index`/OTA buffer offsets is
+   parts, but the byte-by-byte state machine around `rx_index`/OTA buffer offsets is
    protocol logic specific to this firmware, not something a header
    cross-check can verify. It may still differ in edge cases.
 
-2. **Flash erase address is likely a typo, not intentional aliasing (HIGH –
-   observed)**: The binary stores `0x00800800` (not `0x08000800`) as the
+2. **Flash erase address is likely a typo, not intentional aliasing**: 
+   The binary stores `0x00800800` (not `0x08000800`) as the
    starting address for `FLASH->AR`. The two differ only in bit 27 vs. bit 23
    (`0x08000000` vs `0x00800000`); both mask to the same low-order page offset
    (`& 0x3FFF == 0x0800`), which is all the erase controller needs to select
@@ -160,7 +159,7 @@ because the observed behavior is confirmed but its cause/intent is not.
    system-clock question, not a register-definition one, so the header
    cross-check doesn't bear on it.
 
-4. **FLASH lock/unlock ordering (HIGH – observed, unresolved)**:
+4. **FLASH lock/unlock ordering**:
    `save_settings_to_flash()` re-locks `FLASH->CR` (`HAL_FLASH_Lock()`) at
    its end, and the OTA receive loop in `bootloader_main()` that follows it
    never calls `HAL_FLASH_Unlock()` again before programming incoming
@@ -171,8 +170,3 @@ because the observed behavior is confirmed but its cause/intent is not.
    cross-check confirmed the lock/unlock/program call shapes are right — it's
    the *ordering* between two otherwise-correct calls that's in question, so
    this stays open.
-
-(GPIO alternate-function number, `gpio_set_ospeedr` encoding, and the
-`I2C_ISR_DIR` bit position were previously listed here as uncertainties; the
-CMSIS/HAL/LL cross-check resolved all three — see the note near the top of
-this file.)
