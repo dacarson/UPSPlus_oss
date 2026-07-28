@@ -161,6 +161,28 @@ static uint32_t taper_hold_ticks = 0;   /* Seconds (in ticks) battery current <=
 static uint8_t restart_phase = 0;       /* 0=idle, 1=MT_EN low, counting down */
 static uint16_t restart_remaining_ticks = 0;
 
+/* Section 9.3: IP_EN arbitration -- single shared ownership so the Section 9.1 periodic reset
+ * and Section 9.2 battery-level LED check pulses cannot interleave or corrupt each other's hold
+ * timing. Section 10's HardFault handler deliberately bypasses this (see stm32f0xx_it.c): it
+ * runs in a dedicated fault context and resets the MCU immediately afterward, so it can never
+ * meaningfully overlap with either driver here. */
+typedef enum {
+    IP_EN_OWNER_NONE = 0,
+    IP_EN_OWNER_PERIODIC_RESET,
+    IP_EN_OWNER_LED_CHECK
+} ip_en_owner_t;
+static ip_en_owner_t ip_en_owner = IP_EN_OWNER_NONE;
+static uint32_t ip_en_release_tick = 0;        /* tick_counter value at which to release IP_EN HIGH */
+
+/* Section 9.1: periodic IP5328 reset. See ups_state.h for why only a baseline snapshot of
+ * charging_time_sec is needed instead of a dedicated countdown. */
+static uint32_t ip5328_reset_baseline_sec = 0; /* charging_time_sec value at last arm/rearm */
+static uint8_t ip5328_reset_pending = 0;       /* Due; consumed by IPEnArbitration_Tick10ms */
+static uint8_t ip5328_reset_pulse_count = 0;   /* Saturating; factory-test selector 0x08 */
+
+/* Section 9.2: battery-level LED check request (set by button dispatch, consumed by arbitration) */
+static uint8_t led_check_requested = 0;
+
 static void InitAuthoritativeStateFromDefaults(void);
 static void ProcessI2CPendingWrite(void);
 static void Scheduler_Tick10ms(void);
@@ -173,6 +195,7 @@ static void BatteryPlateau_Init(void);
 static void BatteryPlateau_OnAdcSample(uint16_t raw_vbat_mv);
 static void BatteryPlateau_Tick1s(void);
 static void CurrentAge_Tick10ms(void);
+static void IPEnArbitration_Tick10ms(void);
 
 /*===========================================================================*/
 /* Validation functions (register bounds, RO enforcement in apply)           */
@@ -404,18 +427,36 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
                                                         auth->battery_current_age_10ms : 255u);
             buf[REG_FACTORY_TEST_START + 3] = 0x00u;
             break;
-        /* 0x08 and 0x09 previously held guard-open/read-success counts and reset cause, then
-         * briefly held a charge-disconnect current diagnostic (entry/during-window battery
-         * current around the since-removed FORCED_OFF_WINDOW pulse). Both uses were removed to
-         * reclaim flash once they'd served their purpose and conclusively answered their
-         * question: the first traced a chronic STM32 I2C reliability problem to an external root
-         * cause (a NUT driver bug aliasing a reserved core variable name) rather than anything in
-         * this firmware; the second confirmed via live measurement that IP_EN has no effect on
-         * battery current, i.e. cannot gate the charge path (see UPSPlus_Behavior_Spec.md Section
-         * 9), which is why FORCED_OFF_WINDOW itself was then removed. 0x10 (retry effectiveness)
-         * and 0x11 (internal guard-window quiet-time tracking) were removed for the same original
-         * reason and remain free. 0x0F (INA219 failure-reason breakdown) was removed earlier for
-         * the same reason: its question was conclusively answered by testing (consistently
+        case 0x08u:
+        {
+            /* Section 9.1 periodic-reset diagnostics. Minutes remaining is derived from the
+             * charging_time_sec elapsed-basis (see ups_state.h) rather than a stored countdown;
+             * 0 whenever charger_state != PRESENT (timer not running, per behavior spec). */
+            uint16_t minutes_remaining = 0u;
+            if (sys->charger_state == CHARGER_STATE_PRESENT)
+            {
+                uint32_t elapsed_sec = auth->charging_time_sec - ip5328_reset_baseline_sec;
+                uint32_t remaining_sec = (elapsed_sec < IP5328_RESET_PERIOD_SEC) ?
+                    (IP5328_RESET_PERIOD_SEC - elapsed_sec) : 0u;
+                minutes_remaining = (uint16_t)(remaining_sec / 60u);
+            }
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(minutes_remaining & 0xFFu);
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)(minutes_remaining >> 8);
+            buf[REG_FACTORY_TEST_START + 3] = ip5328_reset_pulse_count;
+            break;
+        }
+        /* 0x09 previously held guard-open/read-success counts and reset cause, then briefly held
+         * a charge-disconnect current diagnostic (entry/during-window battery current around the
+         * since-removed FORCED_OFF_WINDOW pulse). Both uses were removed to reclaim flash once
+         * they'd served their purpose and conclusively answered their question: the first traced
+         * a chronic STM32 I2C reliability problem to an external root cause (a NUT driver bug
+         * aliasing a reserved core variable name) rather than anything in this firmware; the
+         * second confirmed via live measurement that IP_EN has no effect on battery current, i.e.
+         * cannot gate the charge path (see UPSPlus_Behavior_Spec.md Section 9), which is why
+         * FORCED_OFF_WINDOW itself was then removed. 0x10 (retry effectiveness) and 0x11
+         * (internal guard-window quiet-time tracking) were removed for the same original reason
+         * and remain free. 0x0F (INA219 failure-reason breakdown) was removed earlier for the
+         * same reason: its question was conclusively answered by testing (consistently
          * bus_error, never NACK/timeout) before removal, not left unanswered. */
 #if UPS_ADC_FACTORY_DIAG_ENABLED
         case 0x0Au: /* raw ADC code, battery channel (idx 1), pre-scaling */
@@ -931,7 +972,16 @@ int main(void)
             else
                 state.current_runtime_sec = 0;
             if (Charger_IsInfluencingVBAT(&sys_state))
+            {
                 state.charging_time_sec++;
+                /* Section 9.1: elapsed-charging basis for the periodic IP5328 reset (see
+                 * ups_state.h) -- reuses this counter instead of a separate countdown. */
+                if ((state.charging_time_sec - ip5328_reset_baseline_sec) >= IP5328_RESET_PERIOD_SEC)
+                {
+                    ip5328_reset_pending = 1u;
+                    ip5328_reset_baseline_sec = state.charging_time_sec;
+                }
+            }
             PowerStateMachine_OnTick1s();
             BatteryPlateau_Tick1s();
             if (flash_dirty &&
@@ -1195,6 +1245,16 @@ void FactoryReset(void)
     prot_state.last_seen_seq = 0;
     restart_phase = 0;
     restart_remaining_ticks = 0;
+    /* Section 9.1/9.2/9.3 runtime state: fresh slate. charger_state was just reset to ABSENT
+     * above, so the next ABSENT->PRESENT transition will re-arm the baseline regardless, but
+     * resetting explicitly here avoids relying on that ordering and matches the rest of this
+     * function's treatment of runtime/session state. */
+    ip5328_reset_baseline_sec = 0;
+    ip5328_reset_pending = 0;
+    ip5328_reset_pulse_count = 0;
+    led_check_requested = 0;
+    ip_en_owner = IP_EN_OWNER_NONE;
+    ip_en_release_tick = 0;
     BatteryPlateau_Init();
     min_vbat_while_load_on_mv = 0xFFFFu;
     empty_persisted_this_session = 0;
@@ -1958,19 +2018,22 @@ static void ApplyGPIOFromState(void)
         LL_GPIO_SetOutputPin(GPIOA, MT_EN);
     else
         LL_GPIO_ResetOutputPin(GPIOA, MT_EN);
-    /* IP_EN always HIGH. IP_EN physically drives the IP5328's KEY (button-detect) pin, confirmed
-     * against the datasheet and against a live measurement (see UPSPlus_Behavior_Spec.md Section
-     * 9) -- it is NOT a charger-enable gate. KEY only controls the output boost stage
-     * (VOUT1/VOUT2/USB-C), the battery-level LED display, and the WLED flashlight; it has no
-     * charge-gating function at all. An earlier revision pulsed IP_EN LOW for 1.5s periodically
-     * (CHARGER_STATE_FORCED_OFF_WINDOW), intending to disconnect the charger path for true-VBAT
-     * sampling; measured battery current before/during that pulse was unchanged, confirming the
-     * pulse did nothing but risk spurious IP5328 button clicks. That mechanism has been removed
-     * (see Section 6/7 history); IP_EN is simply held HIGH at all times now. An earlier revision
-     * before that held IP_EN LOW for the entire CHARGER_STATE_ABSENT duration, which under the
-     * KEY-pin model would have held a spurious "button pressed" state indefinitely -- also
-     * removed. */
-    LL_GPIO_SetOutputPin(GPIOA, IP_EN);
+    /* IP_EN: HIGH except during a brief, deliberate KEY pulse owned by Section 9.1 (periodic
+     * IP5328 reset) or Section 9.2 (battery-level LED check) -- see ip_en_owner, arbitrated in
+     * IPEnArbitration_Tick10ms(). IP_EN physically drives the IP5328's KEY (button-detect) pin,
+     * confirmed against the datasheet and a live measurement (UPSPlus_Behavior_Spec.md Section
+     * 9) -- it is NOT a charger-enable gate; KEY only controls the output boost stage
+     * (VOUT1/VOUT2/USB-C), the battery-level LED display, and the WLED flashlight. An earlier
+     * revision pulsed IP_EN LOW for 1.5s periodically (CHARGER_STATE_FORCED_OFF_WINDOW), intending
+     * to disconnect the charger path for true-VBAT sampling; measured battery current
+     * before/during that pulse was unchanged, confirming the pulse did nothing but risk spurious
+     * IP5328 button clicks. That mechanism was removed (see Section 6/7 history) in favor of
+     * holding IP_EN HIGH unconditionally; the two deliberate KEY-press mechanisms above were
+     * added later, reusing the confirmed KEY behavior on purpose instead of trying to avoid it. */
+    if (ip_en_owner != IP_EN_OWNER_NONE)
+        LL_GPIO_ResetOutputPin(GPIOA, IP_EN);
+    else
+        LL_GPIO_SetOutputPin(GPIOA, IP_EN);
     LL_GPIO_SetOutputPin(GPIOA, PWR_EN);
 }
 
@@ -2055,6 +2118,8 @@ static void ChargerStateMachine_Step(void)
                     sys_state.charger_state_entry_ticks = tick;
                     charger_physical.charger_stability_count = 0;
                     charger_physical.charger_physically_present = 1;
+                    /* Section 9.1: (re)arm the periodic-reset elapsed-charging baseline. */
+                    ip5328_reset_baseline_sec = state.charging_time_sec;
                 }
             }
             else
@@ -2071,6 +2136,10 @@ static void ChargerStateMachine_Step(void)
                     sys_state.charger_state_entry_ticks = tick;
                     charger_physical.charger_stability_count = 0;
                     charger_physical.charger_physically_present = 0;
+                    /* Section 9.1: cancel countdown, no partial credit into the next session.
+                     * A reset that became due but hadn't yet fired through arbitration is
+                     * dropped too -- it can only be initiated while charger_state == PRESENT. */
+                    ip5328_reset_pending = 0;
                 }
             }
             else
@@ -2197,11 +2266,48 @@ static void CurrentAge_Tick10ms(void)
         Snapshot_UpdateDerived();
 }
 
+/**
+ * Section 9.3 IP_EN arbitration: single shared ownership so the Section 9.1 periodic reset and
+ * Section 9.2 battery-level LED check pulses cannot interleave or corrupt each other's hold
+ * timing. A due periodic reset always proceeds as soon as IP_EN frees (never postponed by a
+ * nuisance button press); a concurrent LED-check request is dropped, not queued, if IP_EN is
+ * already busy -- a missed LED check is harmless and the user can just press again.
+ */
+static void IPEnArbitration_Tick10ms(void)
+{
+    uint32_t now = sched_flags.tick_counter;
+
+    if (ip_en_owner != IP_EN_OWNER_NONE && (int32_t)(now - ip_en_release_tick) >= 0)
+        ip_en_owner = IP_EN_OWNER_NONE;
+
+    if (ip5328_reset_pending && ip_en_owner == IP_EN_OWNER_NONE &&
+        sys_state.charger_state == CHARGER_STATE_PRESENT)
+    {
+        ip_en_owner = IP_EN_OWNER_PERIODIC_RESET;
+        ip_en_release_tick = now + IP5328_RESET_HOLD_TICKS;
+        ip5328_reset_pending = 0;
+        if (ip5328_reset_pulse_count < 255u)
+            ip5328_reset_pulse_count++;
+    }
+
+    if (led_check_requested)
+    {
+        led_check_requested = 0;  /* Consumed either way; dropped (not queued) if IP_EN is busy */
+        if (ip_en_owner == IP_EN_OWNER_NONE)
+        {
+            ip_en_owner = IP_EN_OWNER_LED_CHECK;
+            ip_en_release_tick = now + KEY_LED_CHECK_HOLD_TICKS;
+        }
+    }
+}
+
 static void Scheduler_Tick10ms(void)
 {
     PowerStateMachine_Step();
     ChargerStateMachine_Step();
-    /* Single place for GPIO: reflects power state and charger state after both FSM steps */
+    IPEnArbitration_Tick10ms();
+    /* Single place for GPIO: reflects power state, charger state, and IP_EN ownership after
+     * all three of the above */
     ApplyGPIOFromState();
 
     /* Button handling (tick_10ms) */
@@ -2343,6 +2449,15 @@ static void Button_DispatchActions(void)
                 BootBackoff_OnPowerOn();
                 Snapshot_UpdateDerived();
             }
+        }
+        else if (sys_state.power_state == POWER_STATE_RPI_ON &&
+                 sys_state.charger_state == CHARGER_STATE_ABSENT)
+        {
+            /* Section 9.2: battery-level LED check. No-op while charger PRESENT (LEDs already
+             * visible via IP5328's own charging-mode display) -- that case simply isn't matched
+             * here. Arbitrated (may be dropped if IP_EN is already busy) in
+             * IPEnArbitration_Tick10ms(). */
+            led_check_requested = 1u;
         }
     }
     else if (button_handler.pending_click == BUTTON_CLICK_LONG)

@@ -164,6 +164,22 @@ extern "C" {
 #define BOOT_BACKOFF_INCREMENT_SEC    60u
 #define BOOT_BACKOFF_MAX_SEC          3600u
 
+/* Section 9.1 (behavior spec): periodic IP5328 reset, avoids the chip's own TEND charge
+ * safety-timer fault. The 20h elapsed-time basis reuses the existing cumulative
+ * "seconds spent charging" counter (charging_time_sec, register 0x20-0x23) rather than a
+ * separate countdown: both only advance while charger_state == PRESENT (see
+ * Charger_IsInfluencingVBAT), so a baseline snapshot of charging_time_sec taken at each
+ * ABSENT->PRESENT transition, compared against its current value, is equivalent to a dedicated
+ * per-session countdown without duplicating the increment logic. */
+#define IP5328_RESET_PERIOD_SEC       (20u * 3600u)   /* 20 hours; TEND datasheet minimum */
+#define IP5328_RESET_HOLD_MS          10500u          /* 10s datasheet min for full reset + 500ms margin */
+#define IP5328_RESET_HOLD_TICKS       ((uint32_t)(IP5328_RESET_HOLD_MS / TICK_PERIOD_MS))
+
+/* Section 9.2 (behavior spec): battery-level LED check, a short KEY (IP_EN) press while
+ * discharging that reuses IP5328's own native discharge-mode LED display. */
+#define KEY_LED_CHECK_HOLD_MS         200u    /* Inside datasheet's 60ms-2s short-press window */
+#define KEY_LED_CHECK_HOLD_TICKS      ((uint32_t)(KEY_LED_CHECK_HOLD_MS / TICK_PERIOD_MS))
+
 /* Compile-time guards: TICK_PERIOD_MS must divide 100/500/1000 cleanly for derived tick constants */
 STATIC_ASSERT((100 % TICK_PERIOD_MS) == 0, "TICK_PERIOD_MS must divide 100");
 STATIC_ASSERT((500 % TICK_PERIOD_MS) == 0, "TICK_PERIOD_MS must divide 500");
