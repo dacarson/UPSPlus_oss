@@ -313,6 +313,20 @@ charger is connected (Section 7).
   true) -- this was already independent of the true-VBAT mechanism and is unchanged by its
   removal.
 - Protection latch requires multiple ADC samples below threshold (3 samples).
+- **Protection voltage minimum (2.6V), grounded in a live measurement:** `protection_voltage_mv`
+  can never be **configured** below **2600 mV** (`VBAT_PROTECT_MIN_MV`), though it still
+  **defaults** to 2800 mV (`DEFAULT_VBAT_PROTECT_MV`, unchanged) -- the lower bound only matters
+  if a user explicitly configures a tighter value. This floor is not arbitrary: a live
+  low-battery event (see `UPSPlus_Hardware_Chips.md`, "Known Issues") showed the IP5328 cuts
+  power to the STM32 itself (and therefore the I2C bus/telemetry) at a measured **2.51 V** --
+  *before* it cuts power to the RPi. For protection to actually execute (3-sample ADC debounce,
+  ~1.5s at the 500ms cadence, then a flash write) rather than being cut off mid-sequence by the
+  STM32 losing its own power, the trigger point must sit above that collapse voltage with enough
+  margin to cover that reaction time; 2.6V provides ~90mV of headroom above the measured 2.51V
+  floor -- less than the 290mV the 2800mV default provides. `empty_voltage_mv`'s self-learned
+  value is clamped to never go below whatever `protection_voltage_mv` is currently configured to
+  (see `UpdateBatteryMinMax`), so it only reaches down to 2.6V if a user configures protection
+  that low; it is otherwise unaffected (`DEFAULT_VBAT_EMPTY_MV` remains 3000 mV).
 - **Full battery detection (plateau OR taper, independent paths)** (self-programming enabled):
   - **Overview:** FULL is declared when **either** the plateau path **or** the taper path
     independently satisfies its conditions (OR semantics). Both paths run concurrently; whichever

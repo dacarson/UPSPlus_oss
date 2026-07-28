@@ -68,7 +68,15 @@ extern "C" {
 /* Voltage Limits */
 /* Note: VBAT_MIN_VALID_MV applied in ADC_ProcessSample() before updating authoritative_state.battery_voltage_mv */
 #define VBAT_MIN_VALID_MV             1000    /* Minimum valid battery voltage reading (ADC sanity filter) */
-#define VBAT_PROTECT_MIN_MV           2800    /* Minimum allowed protection voltage */
+/* VBAT_PROTECT_MIN_MV is grounded in a live measurement (UPSPlus_Hardware_Chips.md "Known
+ * Issues"): during a real low-battery event, the IP5328 cuts power to the STM32 itself (and
+ * therefore the I2C bus/telemetry) at ~2.51V, *before* it cuts power to the RPi. Protection must
+ * trip and finish executing (3-sample ADC debounce, ~1.5s at the 500ms cadence, then a flash
+ * write) while the STM32 still has power, so this floor must stay above that collapse point with
+ * enough margin to cover that reaction time; 2.6V provides ~90mV of headroom above the measured
+ * 2.51V floor. This only lowers how low a user can *configure* protection_voltage_mv --
+ * DEFAULT_VBAT_PROTECT_MV (2800mV) is unchanged and still provides the wider out-of-box margin. */
+#define VBAT_PROTECT_MIN_MV           2600    /* Minimum allowed protection voltage; see rationale above */
 #define VBAT_PROTECT_MAX_MV           4500    /* Maximum allowed protection voltage */
 #define VBAT_FULL_MAX_MV              4500    /* Maximum allowed full voltage */
 #define VBAT_EMPTY_MAX_MV             4500    /* Maximum allowed empty voltage */
