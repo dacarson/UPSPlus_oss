@@ -40,11 +40,14 @@ It is intended as the source of truth for feature development and future changes
   - 100ms heartbeat  
   - 500ms ADC trigger  
   - 1s counters
-- **Measurement window:** 1.5 seconds (charger-off) for true VBAT sampling.
-  - A measurement window is scheduled **only when the charger is physically present** (charger state `PRESENT`).
-  - Every `sample_period_minutes` (registers `0x15–0x16`), the firmware enters a window where **IP_EN is forced LOW** for **1.5 seconds** (`charger_state = FORCED_OFF_WINDOW`).
-  - The purpose is to sample **true VBAT** without charger influence and refresh `last_true_vbat_*` for percent and power-gating decisions.
-  - Windows are **not** scheduled when the charger is absent.
+- **No measurement window / no true-VBAT-via-disconnect.** An earlier revision periodically
+  forced `IP_EN` LOW for 1.5 seconds (`charger_state = FORCED_OFF_WINDOW`) to try to disconnect
+  the charger path and sample "true VBAT" free of charger influence. IP_EN was later confirmed
+  (datasheet review, then a live current measurement) to be the IP5328's KEY pin, which has no
+  charge-gating function at all -- see Section 9 for the full history and Section 7 for how
+  battery percent/protection behave without it. This mechanism has been **removed**; there is no
+  scheduled window and `sample_period_minutes` (registers `0x15-0x16`) no longer has any effect
+  on firmware behavior (kept RW/persisted only for I2C ABI compatibility with existing tools).
 - Countdowns and debounce are driven by 10ms ticks, but only advanced in main loop.
 - Snapshot updates are guaranteed at least once every 100ms while the main loop is running.
 
@@ -101,8 +104,6 @@ It is intended as the source of truth for feature development and future changes
 - **0x2A Battery Parameters Self-Programmed**
   - Write 0: enable self-programming of full/empty parameters; reset learned values.
   - Write 1: disable self-programming; current learned values become user values.
-  - Note: This register controls self-programming only. The periodic calibration
-    measurement window (true VBAT sampling) is independent of 0x2A.
 - **0x2C–0x2D Load On Delay**
   - Read: remaining countdown if active, else configured delay.
   - Write: sets configured delay; if countdown active, resets remaining time.
@@ -129,10 +130,11 @@ It is intended as the source of truth for feature development and future changes
   - 0xFD: `button_state_t`
   - 0xFE: `button_click_t`
   - 0xFF: hold ticks (LSB)
-- Selector 0x03: Charger/Window page  
+- Selector 0x03: Charger page
   - 0xFD: charger physically present (0/1)
-  - 0xFE: window active (0/1)
-  - 0xFF: window due (0/1)
+  - 0xFE: reserved (0x00) -- formerly "window active"; the measurement window feature was
+    removed, see Section 9
+  - 0xFF: reserved (0x00) -- formerly "window due"
 - Selector 0x04: Protection page  
   - 0xFD: protection active (0/1)
   - 0xFE: below-threshold count
@@ -156,11 +158,17 @@ It is intended as the source of truth for feature development and future changes
   - 0xFD: output_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFE: battery_current_age_10ms (uint8, min(age_10ms, 255))  
   - 0xFF: 0  
-- Selectors 0x08, 0x10, and 0x11 (INA219 guard-open/read-success counts, retry effectiveness,
-  and internal guard-window quiet-time tracking) were removed to reclaim flash once they'd
-  served their purpose: they traced a chronic STM32 I2C reliability problem to an external root
-  cause (a NUT driver bug aliasing a reserved core variable name, busy-looping the driver ~17x
-  faster than its configured poll interval) rather than anything in this firmware.
+- Selectors 0x08 and 0x09 (currently free): held INA219 guard-open/read-success counts and
+  reset-cause diagnostics, then briefly held a charge-disconnect current diagnostic (battery
+  current immediately before vs. during a `FORCED_OFF_WINDOW` pulse, used to verify empirically
+  whether IP_EN affected charge current). Both uses were removed once they'd served their purpose
+  and conclusively answered their question: the first traced a chronic STM32 I2C reliability
+  problem to an external root cause (a NUT driver bug aliasing a reserved core variable name,
+  busy-looping the driver ~17x faster than its configured poll interval) rather than anything in
+  this firmware; the second confirmed via live measurement that IP_EN has no effect on battery
+  current (see Section 9), which is why `FORCED_OFF_WINDOW` was then removed entirely.
+- Selectors 0x10 and 0x11 (retry effectiveness, and internal guard-window quiet-time tracking)
+  were removed for the same original I2C-reliability reason and remain free.
 
 **Reset cause not reported:** The application does not have access to the bootloader source. The bootloader clears the RCC reset flags (e.g. writes `RMVF=1` to `RCC_CSR`) before jumping to the application, so by the time the app runs the reset cause is already lost. Reset cause is not recorded or reported via I2C or factory test.
 ### 4.5 I2C Bus Robustness
@@ -242,59 +250,68 @@ Key transitions:
 - `RPI_ON → RPI_OFF`: manual off (long press).
 - `PROTECTION_LATCHED → LOAD_ON_DELAY`: **auto-power-on enabled** AND charger present AND battery percent > low threshold AND battery voltage > protection threshold (+ hysteresis).
 - `PROTECTION_LATCHED → RPI_OFF`: charger disconnected or conditions insufficient for power-on. **This transition is not gated on auto-power-on** — the latch must always clear when conditions do not support power-on, regardless of the auto-power-on setting, so the state machine cannot become permanently stuck.
-- Battery percent is derived from true-VBAT when the charger is influencing VBAT; if true-VBAT is stale, percent is held.
+- Battery percent is derived from the raw/filtered ADC VBAT reading directly, whether or not the
+  charger is present (see Section 7 -- there is no true-VBAT-via-disconnect mechanism; see
+  Section 9 for why).
 
 ### 5.2 Charger State Machine (`charger_state_t`)
 States:
 - `ABSENT`
 - `PRESENT`
-- `FORCED_OFF_WINDOW`
 
 Key behaviors:
 - `ABSENT → PRESENT`: post-scaled connector-referenced charger voltage stable above threshold.
 - `PRESENT → ABSENT`: post-scaled connector-referenced charger voltage stable below threshold.
-- `PRESENT → FORCED_OFF_WINDOW`: `sample_period_minutes` elapsed **while charger is present** (window due).
-- `FORCED_OFF_WINDOW → PRESENT`: window elapsed (1.5s); always returns to PRESENT (see note below).
+
+`CHARGER_STATE_FORCED_OFF_WINDOW` is a third enum value kept only for Factory Testing ABI
+stability (Section 12); the state machine never transitions into it. See Section 9 for why the
+measurement window it represented was removed.
 
 ### 5.3 Calibration Window Flag (`learning_mode_t`)
 - **Legacy name:** `learning_mode_t` is retained for ABI compatibility.
-- Indicates **calibration window active** (charger forced off for true VBAT sampling).
-- `ACTIVE` while the charger state is `FORCED_OFF_WINDOW`, otherwise `INACTIVE`.
-- Calibration windows occur every `sample_period_minutes` and are independent of 0x2A.
+- Derivation is unchanged: `ACTIVE` iff charger state is `FORCED_OFF_WINDOW`, otherwise
+  `INACTIVE`. Since that charger state is never entered (Section 5.2), this always reads
+  `INACTIVE` in practice.
 
 ### 5.4 Button FSM
 - Debounced at 50ms.
-- Short press: power on if in `RPI_OFF` **or** `PROTECTION_LATCHED`, subject to safety checks
-  (battery above protection threshold; true-VBAT fresh if charger is present).
+- Short press: power on if in `RPI_OFF` **or** `PROTECTION_LATCHED`, subject to a safety check
+  (battery above protection threshold).
 - Long press (>= 10s):
   - If ON → power off.
   - If OFF → factory reset.
 
 ---
 
-## 6. Measurement Window
+## 6. Measurement Window (removed)
 
-- Window duration is **1.5 seconds** and is atomic.
-- Window is entered **only when the charger is present** (`charger_state = PRESENT`) and the sample period has elapsed.
-- During the window:
-  - **IP_EN is forced LOW** (charger path disabled).
-  - “Charger influencing VBAT” is treated as **false** for measurement purposes.
-- Window is never interrupted or restarted early.
-- If the charger is unplugged mid-window:
-  - The window still completes, and VBAT samples taken during the window are considered **true VBAT**.
-  - At window end, charger state returns to `PRESENT`; the normal `PRESENT → ABSENT` stability
-    path detects the disconnection within ~1.5s.
-- Window states are represented in Factory Testing selector 0x03.
-- `learning_mode_t` reports **ACTIVE** during the window.
-- Purpose: eliminate charger influence on VBAT measurement and provide a stable condition for ADC-based calibration and decision-making.
+This section previously specified a 1.5-second periodic window (`charger_state =
+FORCED_OFF_WINDOW`) that forced `IP_EN` LOW to disconnect the charger path and sample "true
+VBAT" free of charger influence. It has been **removed**: `IP_EN` was confirmed (datasheet
+review, then a live current measurement) to be the IP5328's KEY pin, which has no charge-gating
+function, so the window never achieved its stated purpose and instead risked spurious IP5328
+button presses (forcing the boost output on) every `sample_period_minutes`. See Section 9 for
+the full investigation and Section 7 for how battery percent/protection behave without it.
+
+There is currently no mechanism to isolate VBAT from charger influence; percent and protection
+decisions use the raw/filtered ADC VBAT reading at all times, accepting reduced accuracy while a
+charger is connected (Section 7).
 
 ---
 
 ## 7. Battery Management
 
-- Battery percent is based on full/empty calibration.
-- Battery percent update direction uses charger state (charger path enabled), not VBUS voltage.
-- Protection voltage is enforced with hysteresis (50mV).
+- Battery percent is based on full/empty calibration, computed from the raw/filtered ADC VBAT
+  reading directly (`battery_voltage_mv`) whether the charger is present or not -- there is no
+  true-VBAT-via-disconnect mechanism (Section 6/9), so no separate stale/fresh gating applies;
+  reduced accuracy while charging is accepted.
+- Battery percent update *direction* still uses charger state (charging vs. not), not VBUS
+  voltage: percent only moves up while charging and down while not, preventing noise-driven
+  reversals.
+- Protection voltage is enforced with hysteresis (50mV). Protection is only evaluated while the
+  charger is absent (`Protection_Step` skips entirely while `Charger_IsInfluencingVBAT()` is
+  true) -- this was already independent of the true-VBAT mechanism and is unchanged by its
+  removal.
 - Protection latch requires multiple ADC samples below threshold (3 samples).
 - **Full battery detection (plateau OR taper, independent paths)** (self-programming enabled):
   - **Overview:** FULL is declared when **either** the plateau path **or** the taper path
@@ -329,9 +346,7 @@ Key behaviors:
     - `TAPER_HOLD_SEC`: 300-600 s (default **300 s**).
   - **Latching and reset semantics:** When FULL is asserted (by either path), it is latched until
     the charger state becomes `ABSENT` (physical charger removal), or filtered VBAT drops below
-    `VBAT_FULL_RESET_MV` for `FULL_RESET_HOLD_SEC`. The FULL flag is **not** cleared during
-    `FORCED_OFF_WINDOW` measurement windows: the charger remains physically connected during those
-    windows and FULL was correctly detected before the window started.
+    `VBAT_FULL_RESET_MV` for `FULL_RESET_HOLD_SEC`.
     Recommended: `VBAT_FULL_RESET_MV = VBAT_FULL_MIN_MV - 100 mV`, `FULL_RESET_HOLD_SEC` = **30-60 s**.
   - **Learning update rule:** On a plateau path event, compute the plateau level as the mean of
     filtered VBAT samples within the window and update learned full (EMA) toward that mean. Clamp
@@ -408,32 +423,74 @@ Contents:       data[0]  0xFF     data[1]  0xFF     ...  data[N]
 
 **Storage size:** Each struct byte uses two flash bytes, so the total flash footprint is `sizeof(flash_persistent_data_t) × 2`. A compile-time assert verifies this fits within the 1 KB settings page.
 
+**Reserved fields:** two `uint16_t` fields formerly held the true-VBAT-at-last-sample value and
+its age (for the since-removed true-VBAT-via-disconnect mechanism, see Section 9). They remain in
+the struct, unused and always written 0, rather than being deleted -- removing them would shift
+every field after them, including `bootloader_ota_flag`, requiring the `FLASH_OTA_FLAG_OFFSET`
+assert and the bootloader's hardcoded `0x08003C64` check to be re-derived by hand with no way to
+verify the result without hardware. Existing records with real values in those bytes still load
+fine (layout and CRC region are unchanged); the values are just no longer read into anything.
+
 ---
 
 ## 9. GPIO Behavior
 
-- **IP_EN (PA5)**: controls charger path. Also suspected to drive the IP5328's **KEY** pin
-  (button-detect input, IP5328 pin 26) rather than being a plain charger-enable line — see note below.
+- **IP_EN (PA5)**: **always HIGH.** Physically drives the IP5328's **KEY** pin (button-detect
+  input, IP5328 pin 26, multiplexed with the WLED flashlight drive) — confirmed against the IP5328
+  datasheet, timing table below, and against a live current measurement. **This is not a
+  charger-enable gate of any kind.** Per the datasheet's "Charge/discharge path management"
+  section, KEY only controls the output boost stage (VOUT1/VOUT2/USB-C), the battery-level LED
+  display, and the WLED flashlight — it has **no effect on the VBUS→battery charge input path**.
+  The firmware never drives this pin LOW; there is no mechanism to disconnect the charger path
+  (see history below and Section 6).
 - **MT_EN (PA6)**: controls RPi power.
 - **PWR_EN (PA7)**: always HIGH.
 - **Button (PB1)**: EXTI edge → main-loop FSM.
 
-**IP_EN / KEY pin hypothesis (unconfirmed against schematic):** The original vendor firmware
-(`Original-app/Src/main.c`) periodically pulses `IP_EN` low then high in patterns explicitly
-commented as "retrigger the button" (每隔一段这个时间就重新触发按钮) and "flicker-disconnect to
-help re-identify battery level" (闪断,有助于重新识别电量). That behavior matches KEY-pin button-press
-emulation on power-bank ICs (a brief low pulse toggles the chip's output/wake state) rather than a
-simple charger-enable line, and mirrors how the newer deHarro (IP5389-based) firmware pulses its
-dedicated `BIT_CTRL_IP5389` line to the chip's KEY pin. Assumed true for this spec's purposes; if
-so, forcing `IP_EN` LOW during the measurement window (Section 6) also asserts the IP5328's button
-input, not merely disabling the charger path.
+**IP5328 KEY pin timing (confirmed from datasheet Section 6, "按键"/Button):**
+
+| IP_EN LOW duration / pattern | IP5328 action                                                     |
+|-------------------------------|--------------------------------------------------------------------|
+| < 30 ms                       | Ignored (debounce)                                                 |
+| 60 ms – 2 s (short press)      | Turns on battery-level LEDs + boost output. Forces VOUT1 on regardless of load; VOUT2/USB-C only if a load is present. If VOUT2/USB-C is in fast-charge mode, a short press first disables fast-charge (a 2nd short press >1s later forces VOUT1 on instead). |
+| > 2 s (long press)             | Toggles WLED flashlight on/off                                    |
+| Two short presses within 1 s   | Turns off boost output, LED display, and WLED                     |
+| ≥ 10 s                         | Full IP5328 reset                                                  |
+
+Electrical timing: short-press wake/debounce (`T_OnDebounce`) typ. 500 ms (min 60 ms); WLED
+turn-on time (`T_Keylight`) typ. 2 s (range 1.2–3 s). In the locked/low-battery-lockout state, KEY
+cannot wake the chip at all — it must first enter charging mode to become active again.
+
+**History — how this was found and fixed:**
+1. The original vendor firmware pulsed this pin periodically in patterns commented as
+   "retrigger the button" and "flicker-disconnect," which read as KEY-pin button-press emulation
+   rather than a charger-enable gate.
+2. An earlier revision of *this* firmware held `IP_EN` LOW for the entire `CHARGER_STATE_ABSENT`
+   duration (continuously, for as long as the unit ran on battery with no charger connected),
+   reasoning there was no charger path to gate anyway. Under the KEY-pin model that held a
+   spurious "button pressed" state indefinitely — worse than a brief pulse, since ABSENT can last
+   indefinitely and would repeatedly force output-on clicks, WLED toggles, and eventually (past
+   10 s continuously LOW) a full IP5328 reset. Fixed by holding `IP_EN` HIGH during `ABSENT` too.
+3. The firmware also periodically forced `IP_EN` LOW for 1.5 s (`CHARGER_STATE_FORCED_OFF_WINDOW`,
+   every `sample_period_minutes` while charging) intending to disconnect the charger path for
+   true-VBAT sampling (Section 6, old). The IP5328 datasheet's KEY timing table above shows a
+   1.5 s pulse is a "short press," which only forces the boost output on and lights the
+   battery-level LEDs — it never touches the charge input path. A live measurement confirmed
+   this: `battery_current_mA` sampled immediately before vs. during the pulse tracked each other
+   within normal measurement noise across multiple pulses while charging (e.g. +294 mA → +291 mA;
+   later, after the load shifted, +267 mA → +269 mA) — IP_EN going LOW produced no measurable
+   change. **Fixed by removing `FORCED_OFF_WINDOW`/true-VBAT-via-disconnect entirely** (Section
+   6, 7): `IP_EN` is now held HIGH unconditionally, and percent/protection decisions use the raw
+   ADC VBAT reading directly instead of a disconnected sample. `CHARGER_STATE_FORCED_OFF_WINDOW`
+   and `LEARNING_ACTIVE` remain declared (unreachable) for Factory Testing ABI stability
+   (Section 12).
 
 ---
 
 ## 10. Reliability and Fail-Safe Behavior
 
 - **Independent Watchdog (IWDG):** Timeout ~8 s (LSI-based). Refreshed **once per main-loop iteration**, after critical work (scheduler, I2C processing, INA probe, flash save, protection/GPIO). **Never** refreshed in ISRs (e.g. I2C ISR); a main-loop hang or I2C deadlock cannot keep the watchdog alive. If the main loop does not complete within the timeout, the device resets.
-- **HardFault safe state (prioritize Pi uptime):** On HardFault the handler drives **IP_EN LOW** (charger path off) and keeps **PWR_EN HIGH** (MCU hold-up), but it **does not force MT_EN LOW**. MT_EN is left unchanged to avoid unnecessarily power-cycling the Raspberry Pi if it is otherwise running normally. The handler then triggers an immediate system reset. Note: if the application’s protection logic later determines the battery is below the protection threshold, it will still perform the normal shutdown sequence (attempt flash save, then cut MT_EN).
+- **HardFault safe state (prioritize Pi uptime):** On HardFault the handler drives **IP_EN LOW** momentarily and keeps **PWR_EN HIGH** (MCU hold-up), but it **does not force MT_EN LOW**. MT_EN is left unchanged to avoid unnecessarily power-cycling the Raspberry Pi if it is otherwise running normally. The handler then triggers an immediate system reset, so the IP_EN pulse is far too brief to register as any IP5328 KEY action (Section 9) — it is inert, not a deliberate "charger off" signal (this handler has not been revisited since IP_EN's actual function was identified; driving it at all here is likely vestigial from when it was believed to gate the charger). Note: if the application's protection logic later determines the battery is below the protection threshold, it will still perform the normal shutdown sequence (attempt flash save, then cut MT_EN).
 - **Reset cause:** The bootloader (which we do not have access to) clears the RCC reset flags before starting the application, so the actual reset cause cannot be read by the app. The firmware does not record or expose reset cause via I2C; the corresponding flash fields are reserved (written as 0) for layout compatibility.
 
 ---
@@ -441,11 +498,15 @@ input, not merely disabling the charger path.
 ## 11. Testing and Validation
 
 - Automated I2C test script: `tools/testing/upsplus_i2c_test.py`.
-- Manual hardware tests still required for charger transitions, measurement windows, and protection latching.
+- Manual hardware tests still required for charger transitions and protection latching.
 - Architecture validation tests:
   - I2C coherence under snapshot swaps.
   - ADC gating correctness.
-  - Window atomicity edge cases.
+- `tools/testing/upsplus_i2c_test.py` and `tools/testing/upsplus_state_machine_interactive.py`
+  both contain measurement-window/`FORCED_OFF_WINDOW`-specific assertions and a stale
+  reset-cause-at-selector-0x08/0x09 test predating this firmware's removal of that feature; these
+  test scripts have not yet been updated to match Sections 6/9's removal of the measurement
+  window and should be revisited.
 
 ---
 
@@ -454,9 +515,10 @@ input, not merely disabling the charger path.
 - `power_state_t`:  
   - `RPI_OFF=0`, `RPI_ON=1`, `PROTECTION_LATCHED=2`, `LOAD_ON_DELAY=3`
 - `charger_state_t`:  
-  - `ABSENT=0`, `PRESENT=1`, `FORCED_OFF_WINDOW=2`
+  - `ABSENT=0`, `PRESENT=1`, `FORCED_OFF_WINDOW=2` (unreachable at runtime, see Section 9; kept
+    for ABI stability)
 - `learning_mode_t`:  
-  - `INACTIVE=0`, `ACTIVE=1`
+  - `INACTIVE=0`, `ACTIVE=1` (`ACTIVE` unreachable since `FORCED_OFF_WINDOW` is, see Section 5.3)
 - `button_state_t`:  
   - `IDLE=0`, `PRESSED=1`, `HELD=2`, `RELEASED_SHORT=3`, `RELEASED_LONG=4`
 - `button_click_t`:  
@@ -651,10 +713,17 @@ To boot the application after OTA programming:
 
 ## 15. Glossary
 
-- **true VBAT**: Battery voltage sampled while charger path is disabled (IP_EN LOW).
+- **true VBAT** (historical): battery voltage intended to be sampled while the charger path was
+  disconnected. No mechanism to disconnect the charger path exists (Section 9), so this concept
+  has been removed from the firmware; percent/protection use the raw ADC VBAT reading directly at
+  all times.
 - **charger present**: Physical charger voltage above presence threshold with stability.
-- **charger influencing VBAT**: Charger path enabled (IP_EN HIGH / `charger_state = PRESENT`) at ADC sample time.
-- **calibration window active (legacy field `learning_mode_t`)**: Charger forced off for true VBAT sampling and ADC calibration.
+- **charger influencing VBAT**: charger is actively charging (`charger_state = PRESENT`) at ADC
+  sample time; used to gate percent-update direction and empty-voltage learning, not to select a
+  different VBAT source (there is only one VBAT source now).
+- **calibration window active (legacy field `learning_mode_t`)** (historical): previously ACTIVE
+  while the charger was forced off for true-VBAT sampling. That mechanism is gone (Section 9), so
+  this always reads INACTIVE; the field is retained only for Factory Testing ABI stability.
 - **snapshot**: Coherent, double-buffered register image used for I2C reads.
 
 ---
@@ -662,7 +731,7 @@ To boot the application after OTA programming:
 ## 16. Change Impact Map
 
 - If the scheduler timebase (10 ms) source changes (e.g. SysTick vs TIM), update Section 3 and all comments referring to the interrupt source.
-- If ADC cadence changes, revisit: charger stability counters, protection sample count, window duration.
+- If ADC cadence changes, revisit: charger stability counters, protection sample count.
 - If register map changes, revisit: Factory Testing ABI, test scripts, and external tools.
 - If snapshot frequency changes, revisit: I2C coherence assumptions and staleness guarantees.
 - If protection logic changes, revisit: power-cut ordering and flash save semantics.

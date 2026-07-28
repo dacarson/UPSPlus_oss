@@ -75,13 +75,11 @@ __IO pFunction JumpToAplication;
 static authoritative_state_t state;
 static system_state_t sys_state;
 static snapshot_buffer_t snapshot;
-static window_manager_state_t window_mgr;
 static charger_physical_state_t charger_physical;
 static protection_state_t prot_state;
 static button_handler_t button_handler;
 static uint8_t button_last_level = 0; /* 1=pressed, 0=released */
 static uint8_t i2c_stuck_addr_sec = 0; /* Seconds ADDR flag has been set; used for stuck-bus recovery */
-static uint32_t cumulative_runtime_sec_at_flash_load = 0u; /* Set when applying flash record; used for persisted true-VBAT age */
 
 /* Double-buffered register image. Snapshot_Update fills reg_image for I2C TX. */
 uint8_t reg_image[2][256];
@@ -223,25 +221,6 @@ uint8_t Charger_IsInfluencingVBAT(const system_state_t *s)
     return (s->charger_state == CHARGER_STATE_PRESENT) ? 1u : 0u;
 }
 
-uint8_t IsTrueVbatSampleFresh(uint32_t now_ticks, uint32_t last_true_vbat_sample_tick)
-{
-    /* Unsigned wrap gives correct age when tick_counter has wrapped */
-    uint32_t age_ticks = now_ticks - last_true_vbat_sample_tick;
-    return (age_ticks <= TRUE_VBAT_MAX_AGE_TICKS) ? 1u : 0u;
-}
-
-/** True if we have a usable true-VBAT value for power/percent: either a fresh tick-based sample or a persisted sample still within age. */
-static uint8_t IsTrueVbatUsableForDecision(void)
-{
-    if (state.last_true_vbat_sample_tick != 0u)
-        return IsTrueVbatSampleFresh(sched_flags.tick_counter, state.last_true_vbat_sample_tick);
-    if (state.persisted_true_vbat_age_sec == 0u)
-        return 0u;
-    uint32_t elapsed = state.cumulative_runtime_sec - cumulative_runtime_sec_at_flash_load;
-    uint32_t effective_age_sec = state.persisted_true_vbat_age_sec + elapsed;
-    return (effective_age_sec <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC) ? 1u : 0u;
-}
-
 static uint16_t ClampU16(uint16_t value, uint16_t min_value, uint16_t max_value)
 {
     if (value < min_value)
@@ -331,7 +310,6 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
     /* Snapshot local copies for debug/diagnostic pages (main-loop owned state). */
     const button_handler_t button_snapshot = button_handler;
     const charger_physical_state_t charger_snapshot = charger_physical;
-    const window_manager_state_t window_snapshot = window_mgr;
     const protection_state_t protection_snapshot = prot_state;
 
     StoreU16LE(buf, REG_MCU_VOLTAGE_L, auth->mcu_voltage_mv);
@@ -385,9 +363,12 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
             buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(button_snapshot.hold_ticks & 0xFFu);
             break;
         case 0x03u:
+            /* Bytes 2-3 (window_active/window_due) are reserved-zero: the measurement window
+             * they described has been removed (IP_EN cannot gate the charge path -- see
+             * UPSPlus_Behavior_Spec.md Section 9). */
             buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(charger_snapshot.charger_physically_present != 0u);
-            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)(window_snapshot.window_active != 0u);
-            buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(window_snapshot.window_due != 0u);
+            buf[REG_FACTORY_TEST_START + 2] = 0x00u;
+            buf[REG_FACTORY_TEST_START + 3] = 0x00u;
             break;
         case 0x04u:
             buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(protection_snapshot.protection_active != 0u);
@@ -423,13 +404,18 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
                                                         auth->battery_current_age_10ms : 255u);
             buf[REG_FACTORY_TEST_START + 3] = 0x00u;
             break;
-        /* 0x08 (guard-open/read-success counts), 0x09 (reset cause), 0x10 (retry effectiveness),
-         * and 0x11 (internal guard-window quiet-time tracking) were removed to reclaim flash
-         * once they'd served their purpose: they traced a chronic STM32 I2C reliability problem
-         * to an external root cause (a NUT driver bug aliasing a reserved core variable name,
-         * busy-looping the driver ~17x faster than its configured poll interval) rather than
-         * anything in this firmware. 0x0F (INA219 failure-reason breakdown) was removed earlier
-         * for the same reason: its question was conclusively answered by testing (consistently
+        /* 0x08 and 0x09 previously held guard-open/read-success counts and reset cause, then
+         * briefly held a charge-disconnect current diagnostic (entry/during-window battery
+         * current around the since-removed FORCED_OFF_WINDOW pulse). Both uses were removed to
+         * reclaim flash once they'd served their purpose and conclusively answered their
+         * question: the first traced a chronic STM32 I2C reliability problem to an external root
+         * cause (a NUT driver bug aliasing a reserved core variable name) rather than anything in
+         * this firmware; the second confirmed via live measurement that IP_EN has no effect on
+         * battery current, i.e. cannot gate the charge path (see UPSPlus_Behavior_Spec.md Section
+         * 9), which is why FORCED_OFF_WINDOW itself was then removed. 0x10 (retry effectiveness)
+         * and 0x11 (internal guard-window quiet-time tracking) were removed for the same original
+         * reason and remain free. 0x0F (INA219 failure-reason breakdown) was removed earlier for
+         * the same reason: its question was conclusively answered by testing (consistently
          * bus_error, never NACK/timeout) before removal, not left unanswered. */
 #if UPS_ADC_FACTORY_DIAG_ENABLED
         case 0x0Au: /* raw ADC code, battery channel (idx 1), pre-scaling */
@@ -782,9 +768,6 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.current_runtime_sec = 0;
     state.version = 28;
     state.snapshot_tick = 0;
-    state.last_true_vbat_sample_tick = 0;
-    state.last_true_vbat_mv = 0;
-    state.persisted_true_vbat_age_sec = 0;
 
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.charger_state = CHARGER_STATE_ABSENT;
@@ -799,10 +782,6 @@ static void InitAuthoritativeStateFromDefaults(void)
     sys_state.boot_attempt_start_ticks = 0;
 
     /* State machine runtime state */
-    window_mgr.window_due = 0;
-    window_mgr.window_active = 0;
-    window_mgr.last_window_end_ticks = 0;
-    window_mgr.window_start_ticks = 0;
     charger_physical.charger_physically_present = 0;
     charger_physical.charger_stability_count = 0;
     charger_physical.charger_last_seen_seq = 0;
@@ -1102,13 +1081,6 @@ int main(void)
             BatteryPlateau_OnAdcSample(state.battery_voltage_mv);
             UpdateBatteryMinMax();
             UpdateBatteryPercentage();
-            /* True-VBAT sample tick when charger not influencing (for percent and staleness gating). */
-            if (!Charger_IsInfluencingVBAT(&sys_state))
-            {
-                state.last_true_vbat_sample_tick = sched_flags.tick_counter;
-                state.last_true_vbat_mv = state.battery_voltage_mv;
-                state.persisted_true_vbat_age_sec = 0u; /* New sample; no longer using persisted age */
-            }
             /* Protection: store last ADC reading; counting is done in Protection_Step with adc_sample_seq gating. */
             prot_state.last_adc_battery_mv = state.battery_voltage_mv;
             Snapshot_UpdateDerived();
@@ -1127,24 +1099,21 @@ int main(void)
 }
 
 /**
- * Check power-on conditions with explicit state transitions and staleness gating.
- * RPI_OFF -> LOAD_ON_DELAY when conditions met (and true-VBAT
- * fresh if charger present). LOAD_ON_DELAY -> RPI_OFF when conditions no longer met.
+ * Check power-on conditions with explicit state transitions.
+ * RPI_OFF -> LOAD_ON_DELAY when conditions met and charger present.
+ * LOAD_ON_DELAY -> RPI_OFF when conditions no longer met.
  */
 void CheckPowerOnConditions(void)
 {
     uint32_t now_ticks = sched_flags.tick_counter;
     uint8_t battery_ok = (state.battery_percent > state.low_battery_percent);
     uint8_t battery_above_protection = (state.battery_voltage_mv > (uint16_t)(state.protection_voltage_mv + PROTECTION_HYSTERESIS_MV));
-    /* Charger physically connected (PRESENT or FORCED_OFF_WINDOW); distinct from Charger_IsInfluencingVBAT */
-    uint8_t charger_present = (sys_state.charger_state == CHARGER_STATE_PRESENT ||
-                              sys_state.charger_state == CHARGER_STATE_FORCED_OFF_WINDOW);
-    uint8_t true_vbat_fresh = IsTrueVbatUsableForDecision();
+    uint8_t charger_present = Charger_IsInfluencingVBAT(&sys_state);
 
     /* Clear PROTECTION_LATCHED when charger present and battery recovered (even if !auto_power_on). */
     if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
     {
-        uint8_t recovered = (charger_present && battery_ok && battery_above_protection && true_vbat_fresh);
+        uint8_t recovered = (charger_present && battery_ok && battery_above_protection);
         sys_state.power_state = (recovered && state.auto_power_on) ? POWER_STATE_LOAD_ON_DELAY : POWER_STATE_RPI_OFF;
         sys_state.power_state_entry_ticks = now_ticks;
         if (sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
@@ -1173,15 +1142,6 @@ void CheckPowerOnConditions(void)
 
     if (sys_state.power_state != POWER_STATE_RPI_OFF)
         return;
-
-    /* Staleness gate: if charger present, require fresh true-VBAT before auto power-on */
-    if (charger_present && !true_vbat_fresh)
-    {
-        /* Plan: force measurement window ASAP so we get fresh true-VBAT */
-        if (!window_mgr.window_active)
-            window_mgr.window_due = 1;
-        return;
-    }
 
     /* Do not auto power-on from battery-only; require charger present */
     if (!charger_present)
@@ -1214,9 +1174,6 @@ void FactoryReset(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.last_true_vbat_sample_tick = 0;
-    state.last_true_vbat_mv = 0;
-    state.persisted_true_vbat_age_sec = 0;
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.factory_test_selector = 0;
 
@@ -1229,10 +1186,6 @@ void FactoryReset(void)
     sys_state.learning_mode = LEARNING_INACTIVE;
     sys_state.boot_backoff_active = 0;
     sys_state.boot_attempt_start_ticks = 0;
-    window_mgr.window_due = 0;
-    window_mgr.window_active = 0;
-    window_mgr.last_window_end_ticks = 0;
-    window_mgr.window_start_ticks = 0;
     charger_physical.charger_physically_present = 0;
     charger_physical.charger_stability_count = 0;
     charger_physical.charger_last_seen_seq = 0;
@@ -1300,11 +1253,10 @@ static void Flash_ApplyRecordToState(const flash_persistent_data_t *rec)
     state.battery_params_self_programmed = (rec->battery_params_self_programmed != 0u) ? 1u : 0u;
     state.low_battery_percent = rec->low_battery_percent;
     state.load_on_delay_config_sec = rec->load_on_delay_config_sec;
-    state.last_true_vbat_mv = rec->last_true_vbat_mv;
-    state.persisted_true_vbat_age_sec = rec->last_true_vbat_age_sec;
+    /* rec->last_true_vbat_mv / last_true_vbat_age_sec intentionally not read: reserved, see
+     * Flash_FillRecordFromState. */
     state.cumulative_runtime_sec = rec->cumulative_runtime_sec;
     state.charging_time_sec = rec->charging_time_sec;
-    cumulative_runtime_sec_at_flash_load = rec->cumulative_runtime_sec;
 
     /* Clamp to valid ranges (same policy as InitAuthoritativeStateFromBuffer) */
     if (!Validate_FullVoltage(state.full_voltage_mv)) state.full_voltage_mv = DEFAULT_VBAT_FULL_MV;
@@ -1336,25 +1288,11 @@ static void Flash_FillRecordFromState(flash_persistent_data_t *rec, uint16_t seq
     rec->battery_params_self_programmed = (state.battery_params_self_programmed != 0u) ? 1u : 0u;
     rec->low_battery_percent = state.low_battery_percent;
     rec->load_on_delay_config_sec = state.load_on_delay_config_sec;
-    /* Store age_sec; use 1 as minimum when valid to avoid collision with sentinel 0 = "no sample". */
-    if (state.last_true_vbat_sample_tick != 0u) {
-        uint32_t age_ticks = sched_flags.tick_counter - state.last_true_vbat_sample_tick;
-        uint32_t age_sec = age_ticks / (uint32_t)TICKS_PER_1S;
-        if (age_sec <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC)
-            rec->last_true_vbat_age_sec = (age_sec == 0u) ? 1u : (uint16_t)age_sec;
-        else
-            rec->last_true_vbat_age_sec = 0u;
-    } else if (state.persisted_true_vbat_age_sec != 0u) {
-        uint32_t elapsed = state.cumulative_runtime_sec - cumulative_runtime_sec_at_flash_load;
-        uint32_t effective_age = state.persisted_true_vbat_age_sec + elapsed;
-        if (effective_age <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC)
-            rec->last_true_vbat_age_sec = (effective_age == 0u) ? 1u : (uint16_t)effective_age;
-        else
-            rec->last_true_vbat_age_sec = 0u;
-    } else {
-        rec->last_true_vbat_age_sec = 0u;
-    }
-    rec->last_true_vbat_mv = state.last_true_vbat_mv;
+    /* last_true_vbat_mv / last_true_vbat_age_sec: reserved, left at the memset-zero above. The
+     * true-VBAT-via-disconnect mechanism these backed has been removed (IP_EN cannot gate the
+     * charge path -- see UPSPlus_Behavior_Spec.md Section 9); the fields are kept in the struct,
+     * unused, to preserve flash layout and the bootloader_ota_flag offset (FLASH_OTA_FLAG_OFFSET
+     * assert) rather than resizing/reordering the record. */
     rec->cumulative_runtime_sec = state.cumulative_runtime_sec;
     rec->charging_time_sec = state.charging_time_sec;
     /* Bootloader OTA byte at 0x08003C64: 0 = run app, 0x7F = enter OTA (set when factory test 0xFC = 0x7F) */
@@ -1674,8 +1612,7 @@ void UpdateBatteryMinMax(void)
             empty_persisted_this_session = 0;
             empty_learn_load_off_start_tick = 0u;
         }
-        /* Only track/commit empty when charger is ABSENT (actual discharge). Exclude FORCED_OFF_WINDOW
-         * because the 1.5s calibration window causes an artificial VBAT dip—that min is not true empty. */
+        /* Only track/commit empty when charger is ABSENT (actual discharge). */
         else if (sys_state.charger_state == CHARGER_STATE_ABSENT)
         {
             /* Track min VBAT when load is on; when INA invalid but RPi on, assume load on (brownout). */
@@ -1718,12 +1655,11 @@ void UpdateBatteryPercentage(void)
     int32_t range = (int32_t)state.full_voltage_mv - (int32_t)state.empty_voltage_mv;
     if (range < MIN_VOLTAGE_DELTA_MV)
         return;
-    uint8_t true_vbat_usable = IsTrueVbatUsableForDecision();
     uint8_t charging = Charger_IsInfluencingVBAT(&sys_state);
-    if (charging && !true_vbat_usable)
-        return;
-    int32_t voltage = charging ? (int32_t)state.last_true_vbat_mv
-                               : (int32_t)state.battery_voltage_mv;
+    /* No true-VBAT-via-disconnect mechanism exists (IP_EN cannot gate the charge path -- see
+     * UPSPlus_Behavior_Spec.md Section 9); use the raw/filtered ADC reading directly whether
+     * charging or not, accepting reduced accuracy while a charger is present. */
+    int32_t voltage = (int32_t)state.battery_voltage_mv;
     int32_t percentage;
     if (voltage <= (int32_t)state.empty_voltage_mv)
         percentage = 0;
@@ -1842,8 +1778,7 @@ static uint8_t I2C1_GuardWindowReady(void)
 
 static void BatteryPlateau_UpdateBatteryFullClear(uint32_t now_ticks)
 {
-    /* Clear FULL only on physical charger removal (ABSENT). FORCED_OFF_WINDOW is a calibration
-     * window -- the charger remains physically connected, so the FULL latch is preserved. */
+    /* Clear FULL only on physical charger removal (ABSENT). */
     if (sys_state.charger_state == CHARGER_STATE_ABSENT)
     {
         battery_full = 0;
@@ -1866,7 +1801,7 @@ static void BatteryPlateau_UpdateBatteryFullClear(uint32_t now_ticks)
 static void BatteryPlateau_Tick1s(void)
 {
     uint32_t now_ticks = sched_flags.tick_counter;
-    /* Only reset when charger physically absent; FORCED_OFF_WINDOW is still "connected" (calibration window). */
+    /* Only reset when charger physically absent. */
     uint8_t charger_connected = (sys_state.charger_state != CHARGER_STATE_ABSENT) ? 1u : 0u;
 
     if (state.battery_params_self_programmed != 0u)
@@ -1887,7 +1822,7 @@ static void BatteryPlateau_Tick1s(void)
         return;
     }
 
-    /* Reset window only when transitioning from unplugged to connected, not on PRESENT <-> FORCED_OFF_WINDOW. */
+    /* Reset window only when transitioning from unplugged to connected. */
     if (plateau_last_charger_state == CHARGER_STATE_ABSENT && sys_state.charger_state != CHARGER_STATE_ABSENT)
         BatteryPlateau_ResetSession();
     plateau_last_charger_state = sys_state.charger_state;
@@ -2013,9 +1948,6 @@ void Scheduler_ISR_Tick10ms(void)
     }
 }
 
-/* Scheduler uses explicit state machine (power, charger, protection). */
-#define SAMPLE_PERIOD_TICKS_PER_MIN  ((uint32_t)(60u * TICKS_PER_1S))
-
 /* MT_EN: restart phase overrides (MT_EN low for 5s); else driven by power_state.
  * Protection cut happens only after flash commit in main loop; see pending_power_cut. */
 static void ApplyGPIOFromState(void)
@@ -2026,11 +1958,19 @@ static void ApplyGPIOFromState(void)
         LL_GPIO_SetOutputPin(GPIOA, MT_EN);
     else
         LL_GPIO_ResetOutputPin(GPIOA, MT_EN);
-    /* IP_EN HIGH only when PRESENT; ABSENT and FORCED_OFF_WINDOW both drive IP_EN low (intentional) */
-    if (sys_state.charger_state == CHARGER_STATE_PRESENT)
-        LL_GPIO_SetOutputPin(GPIOA, IP_EN);
-    else
-        LL_GPIO_ResetOutputPin(GPIOA, IP_EN);
+    /* IP_EN always HIGH. IP_EN physically drives the IP5328's KEY (button-detect) pin, confirmed
+     * against the datasheet and against a live measurement (see UPSPlus_Behavior_Spec.md Section
+     * 9) -- it is NOT a charger-enable gate. KEY only controls the output boost stage
+     * (VOUT1/VOUT2/USB-C), the battery-level LED display, and the WLED flashlight; it has no
+     * charge-gating function at all. An earlier revision pulsed IP_EN LOW for 1.5s periodically
+     * (CHARGER_STATE_FORCED_OFF_WINDOW), intending to disconnect the charger path for true-VBAT
+     * sampling; measured battery current before/during that pulse was unchanged, confirming the
+     * pulse did nothing but risk spurious IP5328 button clicks. That mechanism has been removed
+     * (see Section 6/7 history); IP_EN is simply held HIGH at all times now. An earlier revision
+     * before that held IP_EN LOW for the entire CHARGER_STATE_ABSENT duration, which under the
+     * KEY-pin model would have held a spurious "button pressed" state indefinitely -- also
+     * removed. */
+    LL_GPIO_SetOutputPin(GPIOA, IP_EN);
     LL_GPIO_SetOutputPin(GPIOA, PWR_EN);
 }
 
@@ -2084,92 +2024,57 @@ static void Protection_ForceCutIfTimedOut(void)
     sys_state.pending_power_cut_start_ticks = 0;
 }
 
+/* CHARGER_STATE_FORCED_OFF_WINDOW and LEARNING_ACTIVE are kept as enum constants (their numeric
+ * values are part of the Factory Testing ABI, selector 0x01) but this state machine now never
+ * transitions into them: the measurement window they represented pulsed IP_EN LOW to try to
+ * disconnect the charger path for true-VBAT sampling, which datasheet review and a live current
+ * measurement both confirmed IP_EN cannot do (see UPSPlus_Behavior_Spec.md Section 9). charger_state
+ * is therefore only ever ABSENT or PRESENT now; sys->learning_mode (derived below, unchanged)
+ * consequently always reads LEARNING_INACTIVE. */
 static void ChargerStateMachine_Step(void)
 {
     uint32_t tick = sched_flags.tick_counter;
     uint16_t charger_mv = UpsChargerVoltageMv(&state);
 
-    if (sys_state.charger_state == CHARGER_STATE_FORCED_OFF_WINDOW)
+    if (adc_sample_seq != charger_physical.charger_last_seen_seq)
     {
-        uint32_t elapsed = tick - sys_state.charger_state_entry_ticks;
-        if (elapsed >= MEASUREMENT_WINDOW_TICKS)
+        charger_physical.charger_last_seen_seq = adc_sample_seq;
+        if (charger_mv > CHARGER_PRESENT_ON_MV)
+            charger_physical.charger_physically_present = 1;
+        else if (charger_mv < CHARGER_PRESENT_OFF_MV)
+            charger_physical.charger_physically_present = 0;
+
+        if (sys_state.charger_state == CHARGER_STATE_ABSENT)
         {
-            window_mgr.window_active = 0;
-            window_mgr.last_window_end_ticks = tick;
-            /* Always return to PRESENT at window end. IP_EN is LOW during the window, which
-             * disconnects the charger path, so all ADC charger-voltage readings taken during
-             * the window are invalid (read ~0). Using charger_mv here would always resolve to
-             * ABSENT, permanently latching IP_EN LOW. If the charger was unplugged during the
-             * window, the normal PRESENT→ABSENT stability path detects it within ~1.5s after
-             * IP_EN goes HIGH and valid ADC readings resume. */
-            sys_state.charger_state = CHARGER_STATE_PRESENT;
-            sys_state.charger_state_entry_ticks = tick;
-            /* Charger/window are runtime-only (B9); only flush if something else is dirty. */
-            MustRefreshVDD = 1;
-            if (flash_dirty)
-                RequestFlashSave(0, 0);
-        }
-    }
-    else
-    {
-        if (adc_sample_seq != charger_physical.charger_last_seen_seq)
-        {
-            charger_physical.charger_last_seen_seq = adc_sample_seq;
             if (charger_mv > CHARGER_PRESENT_ON_MV)
-                charger_physical.charger_physically_present = 1;
-            else if (charger_mv < CHARGER_PRESENT_OFF_MV)
-                charger_physical.charger_physically_present = 0;
-
-            if (sys_state.charger_state == CHARGER_STATE_ABSENT)
             {
-                if (charger_mv > CHARGER_PRESENT_ON_MV)
+                charger_physical.charger_stability_count++;
+                if (charger_physical.charger_stability_count >= CHARGER_STABILITY_SAMPLES)
                 {
-                    charger_physical.charger_stability_count++;
-                    if (charger_physical.charger_stability_count >= CHARGER_STABILITY_SAMPLES)
-                    {
-                        sys_state.charger_state = CHARGER_STATE_PRESENT;
-                        sys_state.charger_state_entry_ticks = tick;
-                        charger_physical.charger_stability_count = 0;
-                        charger_physical.charger_physically_present = 1;
-                    }
-                }
-                else
+                    sys_state.charger_state = CHARGER_STATE_PRESENT;
+                    sys_state.charger_state_entry_ticks = tick;
                     charger_physical.charger_stability_count = 0;
+                    charger_physical.charger_physically_present = 1;
+                }
             }
-            else if (sys_state.charger_state == CHARGER_STATE_PRESENT)
+            else
+                charger_physical.charger_stability_count = 0;
+        }
+        else if (sys_state.charger_state == CHARGER_STATE_PRESENT)
+        {
+            if (charger_mv < CHARGER_PRESENT_OFF_MV)
             {
-                if (charger_mv < CHARGER_PRESENT_OFF_MV)
+                charger_physical.charger_stability_count++;
+                if (charger_physical.charger_stability_count >= CHARGER_STABILITY_SAMPLES)
                 {
-                    charger_physical.charger_stability_count++;
-                    if (charger_physical.charger_stability_count >= CHARGER_STABILITY_SAMPLES)
-                    {
-                        sys_state.charger_state = CHARGER_STATE_ABSENT;
-                        sys_state.charger_state_entry_ticks = tick;
-                        charger_physical.charger_stability_count = 0;
-                        charger_physical.charger_physically_present = 0;
-                    }
-                }
-                else
+                    sys_state.charger_state = CHARGER_STATE_ABSENT;
+                    sys_state.charger_state_entry_ticks = tick;
                     charger_physical.charger_stability_count = 0;
+                    charger_physical.charger_physically_present = 0;
+                }
             }
-        }
-
-        if (sys_state.charger_state == CHARGER_STATE_PRESENT && !window_mgr.window_active)
-        {
-            uint32_t elapsed_since = tick - window_mgr.last_window_end_ticks;
-            uint32_t period_ticks = SAMPLE_PERIOD_TICKS_PER_MIN * (uint32_t)state.sample_period_minutes;
-            if (elapsed_since >= period_ticks)
-                window_mgr.window_due = 1;
-        }
-
-        if (sys_state.charger_state == CHARGER_STATE_PRESENT && window_mgr.window_due && !window_mgr.window_active)
-        {
-            sys_state.charger_state = CHARGER_STATE_FORCED_OFF_WINDOW;
-            sys_state.charger_state_entry_ticks = tick;
-            window_mgr.window_due = 0;
-            window_mgr.window_active = 1;
-            window_mgr.window_start_ticks = tick;
-            charger_physical.charger_stability_count = 0;  /* Defensive cleanup on window entry */
+            else
+                charger_physical.charger_stability_count = 0;
         }
     }
 
@@ -2425,8 +2330,6 @@ static void Button_DispatchActions(void)
             sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
         {
             uint8_t allow_power_on = 1;
-            if (Charger_IsInfluencingVBAT(&sys_state) && !IsTrueVbatUsableForDecision())
-                allow_power_on = 0;
             if (state.battery_voltage_mv <= state.protection_voltage_mv)
                 allow_power_on = 0;
             if (allow_power_on)
