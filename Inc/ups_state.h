@@ -831,9 +831,11 @@ extern volatile uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]; /* 
 /* State Machine */
 void StateMachine_Init(void);
 void StateMachine_Update(void);
-/* Register 0x17 derivation: depends on learning_mode (from charger_state) and power_state.
- * Contract: Do not trust state->learning_mode unless it was recomputed during StateMachine_Update();
- * learning_mode is derived-only from charger_state and must be kept in sync when reading power status. */
+/* Register 0x17 derivation: bit0 depends on power_state (RPi power); bit1 reports whether the
+ * Section 9.1 periodic IP5328 reset is currently in progress (main.c's ip_en_owner). Bit1 no
+ * longer depends on learning_mode -- see GetPowerStatusRegisterValue()'s definition in main.c for
+ * why (learning_mode remains declared, permanently LEARNING_INACTIVE, for Factory Testing ABI
+ * stability only -- selector 0x01 byte 3 -- and is not surfaced in this register anymore). */
 uint8_t GetPowerStatusRegisterValue(const authoritative_state_t *auth_state, const system_state_t *state);
 
 /* Snapshot Management */

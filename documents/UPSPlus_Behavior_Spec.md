@@ -46,8 +46,9 @@ It is intended as the source of truth for feature development and future changes
   (datasheet review, then a live current measurement) to be the IP5328's KEY pin, which has no
   charge-gating function at all -- see Section 9 for the full history and Section 7 for how
   battery percent/protection behave without it. This mechanism has been **removed**; there is no
-  scheduled window and `sample_period_minutes` (registers `0x15-0x16`) no longer has any effect
-  on firmware behavior (kept RW/persisted only for I2C ABI compatibility with existing tools).
+  scheduled measurement window. `sample_period_minutes` (registers `0x15-0x16`) is no longer tied
+  to that removed window, but is **not** dead: it now sets the interval for the Section 9.2
+  periodic battery-level LED check (see Section 9.2), an unrelated, later-added mechanism.
 - **IP5328 periodic reset timer: 20 hours**, running only while `charger_state == PRESENT`. This
   is a distinct, newer mechanism from the removed measurement window above -- see Section 9.1 for
   full rationale and behavior. It exists to avoid the IP5328's own charge safety-timer (`TEND`,
@@ -67,8 +68,13 @@ It is intended as the source of truth for feature development and future changes
 - **0x01–0x0C**: Voltages + temperature (RO).
 - **0x0D–0x12**: Battery full/empty/protection thresholds (RW, validated).
 - **0x13–0x14**: Battery percent (LSB=percent, MSB always 0x00).
-- **0x15–0x16**: Sample period minutes (RW).
-- **0x17**: Power status (derived).
+- **0x15–0x16**: Sample period minutes (RW). Interval for the Section 9.2 periodic battery-level
+  LED check (not related to the removed measurement window -- see Section 3).
+- **0x17**: Power status (derived). bit0 = RPi power (`power_state == RPI_ON`, MT_EN effectively
+  asserted); bit1 = Section 9.1 periodic IP5328 reset in progress (repurposed from a legacy
+  "calibration window active" flag that has been permanently unreachable since Section 6/9's
+  removal of true-VBAT-via-disconnect -- see Section 5.3 and Section 9.1 for the current meaning
+  and rationale).
 - **0x18**: Shutdown countdown (RW).
 - **0x19**: Auto power on (RW).
 - **0x1A**: Restart countdown (RW).
@@ -295,6 +301,15 @@ distinct, unrelated mechanism and does not use or revive this state.
 - Derivation is unchanged: `ACTIVE` iff charger state is `FORCED_OFF_WINDOW`, otherwise
   `INACTIVE`. Since that charger state is never entered (Section 5.2), this always reads
   `INACTIVE` in practice.
+- **Register 0x17 bit1 no longer reports this field.** It previously did (as "calibration window
+  active"), but since `learning_mode` is permanently `INACTIVE`, that bit was always 0 in
+  practice. Bit1 has been repurposed to report the unrelated Section 9.1 periodic IP5328 reset
+  instead (see Section 9.1 and Section 4.1) — this is a deliberate ABI change, not a bug: the old
+  meaning was already permanently dead, and the new meaning gives external tools a real,
+  observable signal (correlating a transient `battery_current_mA` swing to an expected cause)
+  where the old one gave none. `learning_mode` itself is still computed as described above and is
+  still readable via Factory Testing selector `0x01` byte 3 (Section 4.4) for anyone who still
+  needs to confirm it reads `INACTIVE`.
 
 ### 5.4 Button FSM
 - Debounced at 50ms.
@@ -601,17 +616,32 @@ interruption it exists to avoid, and `MT_EN` sequencing would need to be revisit
 `MT_EN` regardless, and/or scoping actual RPi 5V-rail continuity during a manually-triggered test
 pulse before relying on this in the field).
 
+**Battery current side effect and external visibility (register `0x17` bit1).** If IP5328's
+internal input-path gating (Q1/Q2, VING/VBUSG) briefly interrupts the charger→battery path as part
+of its own reset sequence, the continuous downstream load on `VREG` (RPi, via TPS61088) has to be
+sourced from somewhere in that instant — plausibly the battery itself, momentarily. This would
+show up as `battery_current_mA` swinging to a discharge (negative) reading for some portion of the
+10.5 s hold, even though the charger remains physically connected and `charger_state` never leaves
+`PRESENT`. This reading is genuinely valid (a real, if transient, physical current), not a fault or
+a stale/invalid sample — `battery_current_valid` is deliberately left unaffected by this mechanism.
+Because this could otherwise look like an anomaly to anything polling `battery_current_mA` (e.g.
+NUT, a monitoring dashboard), register `0x17` bit1 is set for the duration of the reset hold so an
+external observer can attribute the blip to this known, expected cause. See Section 5.3 and
+Section 4.1 for the register-level detail (this bit was repurposed from an already-permanently-dead
+legacy "calibration window active" flag) and Section 12 for the bit's numeric position.
+
 **Guard conditions.** The reset pulse is only initiated when `charger_state == PRESENT` (per
 Timing above). It does not depend on `power_state` and never drives `MT_EN` — it is orthogonal to
 the Power State Machine (Section 5.1). See Section 9.3 for arbitration with the other
 firmware-initiated drivers of `IP_EN`.
 
-### 9.2 Battery-Level LED Check (Short KEY Press While Discharging)
+### 9.2 Battery-Level LED Check (Short KEY Press or Periodic, While Discharging)
 
 **Purpose.** With the L1/L2/L3 battery-level LED bar confirmed populated on this board, a brief
 KEY (`IP_EN`) short press can be used to trigger IP5328's native battery-level LED display on
 demand — reusing datasheet-defined chip behavior instead of building a separate display driver in
-firmware.
+firmware. Two independent triggers request the same pulse: a manual button press, and an automatic
+periodic timer (below).
 
 **Why gated on `charger_state == ABSENT`.** While charging, the LED bar is already lit
 continuously by IP5328's own autonomous charging-mode display logic (solid segments per completed
@@ -621,7 +651,7 @@ force VOUT1's boost stage on for no benefit. This feature therefore only trigger
 `charger_state == ABSENT`, i.e. genuinely running on battery, where the LED bar is otherwise off
 and the datasheet's discharge-mode display table applies instead.
 
-**Trigger.** Case Button (PB1) short press while `power_state == RPI_ON` **and**
+**Manual trigger.** Case Button (PB1) short press while `power_state == RPI_ON` **and**
 `charger_state == ABSENT` — previously an unspecified/no-op case; see Section 5.4 for the full
 Button FSM.
 - Short press while `power_state == RPI_ON` **and** `charger_state == PRESENT`: remains a defined
@@ -630,7 +660,25 @@ Button FSM.
   triggers the manual power-on override in Section 5.1/5.4 (skips the remaining delay), not a
   KEY pulse.
 
-**Mechanism.**
+**Periodic trigger.** In addition to the manual button press, the LED check also fires
+automatically on a timer while `power_state == RPI_ON` **and** `charger_state == ABSENT`, once
+every `sample_period_minutes` (registers `0x15-0x16`; validated 1-1440, floor-clamped to
+`DEFAULT_SAMPLE_PERIOD_MIN` = 2 minutes) -- giving a user a periodic, passive glance at battery
+level without needing to press the button, purely by reusing this otherwise-idle register (see
+Section 3).
+- The interval timer arms (starts counting from a full interval) whenever the
+  `RPI_ON` + `ABSENT` condition is freshly (re-)entered, whether via `power_state` transitioning
+  to `RPI_ON` or `charger_state` transitioning to `ABSENT`. No partial credit carries over from a
+  prior charging or powered-off period, mirroring Section 9.1's baseline-arming semantics.
+- The timer does not advance while the condition does not hold (charging, or RPi off); it neither
+  fires nor loses progress during that time -- it simply pauses, and the next entry into the
+  condition restarts a fresh interval (it does not resume a partially-elapsed one).
+- Both triggers request the same underlying pulse and share the same arbitration (Section 9.3): if
+  the periodic timer's interval elapses while a manual (or the other) request already owns `IP_EN`,
+  the periodic request is dropped for that occurrence (not queued) and simply retried next
+  interval, same as a dropped manual button press.
+
+**Mechanism** (applies to either trigger).
 1. Drive `IP_EN` LOW.
 2. Hold for `KEY_LED_CHECK_HOLD_MS` = 200 ms (comfortably inside the datasheet's 60 ms–2 s
    short-press window, clear of both the 30 ms debounce floor and the 2 s long-press boundary).
@@ -659,7 +707,8 @@ mechanism rather than sharing it).
 
 `IP_EN` has three independent firmware-initiated drivers:
 - Section 9.1: periodic IP5328 reset (~10.5 s LOW, every 20h while charging).
-- Section 9.2: battery-level LED check (~200 ms LOW, on button press while discharging).
+- Section 9.2: battery-level LED check (~200 ms LOW, on button press or the periodic timer while
+  discharging).
 - Section 10: HardFault safe-state handler (~10.5 s LOW hold -- the same full-reset duration as
   Section 9.1, forced directly by the fault handler itself -- immediately followed by MCU reset).
 
@@ -667,8 +716,9 @@ The main-loop drivers (Sections 9.1/9.2) must go through a single shared ownersh
 a main-loop `ip_en_busy` flag or equivalent) so overlapping requests cannot interleave and corrupt
 each other's hold timing — e.g. a button press arriving mid-reset must not shorten, extend, or
 restart the reset pulse's hold time, and vice versa. Recommended arbitration policy:
-- A Section 9.2 request arriving while `IP_EN` is busy is **dropped, not queued** — a missed LED
-  check is harmless and the user can simply press again.
+- A Section 9.2 request (manual or periodic) arriving while `IP_EN` is busy is **dropped, not
+  queued** — a missed LED check is harmless; the user can press again, or the periodic timer will
+  simply try again next interval.
 - A Section 9.1 reset that becomes due while `IP_EN` is busy (e.g. with an in-progress LED check)
   should proceed as soon as the bus frees, not be indefinitely postponed — do not let a nuisance
   button press delay the `TEND`-avoidance reset.
@@ -735,7 +785,10 @@ regardless of how unlikely.
   reset pulse fires at exactly 20h of continuous `PRESENT` and restarts the countdown afterward;
   `IP_EN` hold duration measured at ≥10.5 s; `charger_state` and `MT_EN` are unaffected by the
   pulse; selector 0x08 minutes-remaining counts down correctly and the reset-count byte
-  increments and saturates.
+  increments and saturates; register `0x17` bit1 reads 1 for the duration of the reset hold and 0
+  otherwise (including during a Section 9.2 LED-check pulse, which must **not** set this bit);
+  `battery_current_valid` remains set (unaffected) throughout the reset even if
+  `battery_current_mA` reads a discharge value during the hold.
 - **New tests needed for Section 9.2:** short press while `RPI_ON`+`ABSENT` produces a ~200 ms
   `IP_EN` LOW pulse; short press while `RPI_ON`+`PRESENT` produces no pulse; short press while
   `LOAD_ON_DELAY` produces no `IP_EN` pulse (it instead triggers the Section 5.1/5.4 manual
@@ -744,7 +797,13 @@ regardless of how unlikely.
   within the light-load auto-shutdown window without further firmware action; a press issued
   while IP5328 is in its low-battery locked state produces the `IP_EN` pulse (firmware cannot
   detect chip-internal lock state) but has no visible chip-side effect — document as expected, not
-  a failure.
+  a failure; the periodic timer produces a pulse at exactly `sample_period_minutes` after entering
+  `RPI_ON`+`ABSENT` (and again every `sample_period_minutes` thereafter) with no button involved;
+  the timer does not fire and does not accumulate progress while charging or while the RPi is off;
+  re-entering `RPI_ON`+`ABSENT` after leaving it restarts a full interval rather than resuming a
+  partially-elapsed one; a write to `sample_period_minutes` while an interval is already counting
+  down does not retroactively change that interval (the new value is picked up only the next time
+  the timer re-arms: on the next periodic fire or the next fresh entry into `RPI_ON`+`ABSENT`).
 - **New tests needed for Section 9.3:** a button press arriving while the Section 9.1 reset pulse
   is in progress is dropped, not interleaved, and does not alter the reset pulse's hold time; a
   due Section 9.1 reset proceeds as soon as `IP_EN` frees rather than being postponed indefinitely
@@ -970,7 +1029,9 @@ To boot the application after OTA programming:
   different VBAT source (there is only one VBAT source now).
 - **calibration window active (legacy field `learning_mode_t`)** (historical): previously ACTIVE
   while the charger was forced off for true-VBAT sampling. That mechanism is gone (Section 9), so
-  this always reads INACTIVE; the field is retained only for Factory Testing ABI stability.
+  this always reads INACTIVE; the field is retained only for Factory Testing ABI stability
+  (selector `0x01` byte 3, Section 4.4). Its former I2C-visible signal, register `0x17` bit1, has
+  been repurposed for an unrelated meaning -- see Section 5.3 and Section 9.1.
 - **snapshot**: Coherent, double-buffered register image used for I2C reads.
 - **TEND** (IP5328 datasheet term): the IP5328's charge safety timer, 20/24/27h (min/typ/max). If
   a charge cycle never registers battery-side current below `ISTOP` (~300 mA) before this

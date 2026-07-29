@@ -180,8 +180,18 @@ static uint32_t ip5328_reset_baseline_sec = 0; /* charging_time_sec value at las
 static uint8_t ip5328_reset_pending = 0;       /* Due; consumed by IPEnArbitration_Tick10ms */
 static uint8_t ip5328_reset_pulse_count = 0;   /* Saturating; factory-test selector 0x08 */
 
-/* Section 9.2: battery-level LED check request (set by button dispatch, consumed by arbitration) */
+/* Section 9.2: battery-level LED check request (set by button dispatch or the periodic timer
+ * below, consumed by arbitration) */
 static uint8_t led_check_requested = 0;
+
+/* Section 9.2 periodic auto-trigger: reuses sample_period_minutes (register 0x15-0x16,
+ * otherwise unused -- see UPSPlus_Behavior_Spec.md Section 3) as the interval between automatic
+ * LED checks while genuinely discharging (RPI_ON && charger ABSENT), on top of the existing
+ * manual button trigger. Armed to a fresh interval whenever that condition is (re)entered; no
+ * partial credit carries over from a prior charging/off session (mirrors Section 9.1's baseline
+ * semantics). */
+static uint32_t led_check_periodic_remaining_sec = 0;
+static uint8_t led_check_periodic_active_prev = 0;
 
 static void InitAuthoritativeStateFromDefaults(void);
 static void ProcessI2CPendingWrite(void);
@@ -196,6 +206,7 @@ static void BatteryPlateau_OnAdcSample(uint16_t raw_vbat_mv);
 static void BatteryPlateau_Tick1s(void);
 static void CurrentAge_Tick10ms(void);
 static void IPEnArbitration_Tick10ms(void);
+static void LedCheckPeriodic_OnTick1s(void);
 
 /*===========================================================================*/
 /* Validation functions (register bounds, RO enforcement in apply)           */
@@ -305,8 +316,16 @@ uint8_t GetPowerStatusRegisterValue(const authoritative_state_t *auth_state, con
     /* Bit0 reflects effective MT_EN assertion; restart_phase forces MT_EN LOW. */
     if (state->power_state == POWER_STATE_RPI_ON && restart_phase == 0)
         value |= 0x01u; /* Power to RPi */
-    if (state->learning_mode == LEARNING_ACTIVE)
-        value |= 0x02u; /* Learning/Calibration enabled */
+    /* Bit1: Section 9.1 periodic IP5328 reset in progress. Repurposed -- this bit previously
+     * reported learning_mode's "calibration window active" flag, which has been permanently
+     * unreachable (always LEARNING_INACTIVE) since the true-VBAT-via-disconnect mechanism was
+     * removed (see UPSPlus_Behavior_Spec.md Section 9); learning_mode itself is retained only for
+     * Factory Testing ABI stability (selector 0x01 byte 3) and is no longer surfaced here. This
+     * bit flags the ~10.5s window so an external observer of battery_current_mA can attribute a
+     * transient discharge reading to the expected reset side effect rather than a real event --
+     * the charger remains physically connected and charger_state stays PRESENT throughout. */
+    if (ip_en_owner == IP_EN_OWNER_PERIODIC_RESET)
+        value |= 0x02u;
     return value;
 }
 
@@ -807,7 +826,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.version = 28;
+    state.version = 29;
     state.snapshot_tick = 0;
 
     sys_state.power_state = POWER_STATE_RPI_OFF;
@@ -983,6 +1002,7 @@ int main(void)
                 }
             }
             PowerStateMachine_OnTick1s();
+            LedCheckPeriodic_OnTick1s();
             BatteryPlateau_Tick1s();
             if (flash_dirty &&
                 (state.cumulative_runtime_sec - flash_last_write_sec) >= FLASH_DIRTY_MAX_INTERVAL_SEC)
@@ -1253,6 +1273,8 @@ void FactoryReset(void)
     ip5328_reset_pending = 0;
     ip5328_reset_pulse_count = 0;
     led_check_requested = 0;
+    led_check_periodic_remaining_sec = 0;
+    led_check_periodic_active_prev = 0;
     ip_en_owner = IP_EN_OWNER_NONE;
     ip_en_release_tick = 0;
     BatteryPlateau_Init();
@@ -2264,6 +2286,38 @@ static void CurrentAge_Tick10ms(void)
     if (state.output_current_valid != prev_output_valid ||
         state.battery_current_valid != prev_battery_valid)
         Snapshot_UpdateDerived();
+}
+
+/**
+ * Section 9.2 periodic auto-trigger: while genuinely discharging (RPI_ON && charger ABSENT),
+ * automatically request a battery-level LED check every sample_period_minutes, in addition to
+ * the manual button trigger in Button_DispatchActions(). Both routes funnel into the same
+ * led_check_requested flag and share the same arbitration/hold mechanism, so an automatic and a
+ * manual request can never interleave.
+ */
+static void LedCheckPeriodic_OnTick1s(void)
+{
+    uint8_t active = (sys_state.power_state == POWER_STATE_RPI_ON &&
+                       sys_state.charger_state == CHARGER_STATE_ABSENT);
+
+    if (active && !led_check_periodic_active_prev)
+    {
+        /* Just started discharging on battery: begin a fresh interval (no partial credit from
+         * a prior charging/off session, mirroring Section 9.1's baseline semantics). */
+        led_check_periodic_remaining_sec = (uint32_t)state.sample_period_minutes * 60u;
+    }
+    led_check_periodic_active_prev = active;
+
+    if (!active)
+        return;
+
+    if (led_check_periodic_remaining_sec > 0u)
+        led_check_periodic_remaining_sec--;
+    if (led_check_periodic_remaining_sec == 0u)
+    {
+        led_check_requested = 1u;
+        led_check_periodic_remaining_sec = (uint32_t)state.sample_period_minutes * 60u;
+    }
 }
 
 /**
