@@ -24,7 +24,7 @@ uint8_t I2C1_GetSlaveTxnActive(void);
 uint8_t I2C1_IsAddrFlagSet(void);
 uint16_t I2C1_GetLastAddrUs(void);
 uint16_t I2C1_GetLastStopUs(void);
-uint8_t I2C1_ReadIna219Shunt(uint8_t is_output, int16_t *shunt_raw);
+uint8_t I2C1_ReadIna219Current(uint8_t is_output, int16_t *current_mA);
 
 /* Scheduler-tick-resolution (10 ms, 32-bit, wraparound-safe) mirrors of the last ADDR/STOP
  * events matched to the STM32's own slave address. Pushed in from main.c's tick ISR

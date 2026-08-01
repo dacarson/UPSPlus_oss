@@ -1032,20 +1032,20 @@ int main(void)
             if ((uint32_t)(now_ticks - ina_probe_due_ticks) < 0x80000000u &&
                 I2C1_GuardWindowReady())
             {
-                int16_t shunt_raw = 0;
+                int16_t current_mA = 0;
                 ina_probe_requested = 0;
-                if (I2C1_ReadIna219Shunt(ina_probe_is_output, &shunt_raw))
+                if (I2C1_ReadIna219Current(ina_probe_is_output, &current_mA))
                 {
                     ina_probe_retry_count = 0u;
                     if (ina_probe_is_output)
                     {
-                        state.output_current_mA = shunt_raw;
+                        state.output_current_mA = current_mA;
                         state.output_current_age_10ms = 0u;
                         state.output_current_valid = 1u;
                     }
                     else
                     {
-                        state.battery_current_mA = shunt_raw;
+                        state.battery_current_mA = current_mA;
                         state.battery_current_age_10ms = 0u;
                         state.battery_current_valid = 1u;
                     }

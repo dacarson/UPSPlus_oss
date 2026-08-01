@@ -25,8 +25,16 @@ static volatile uint8_t latched_reg_image = 0;  /* Latched at ADDR+READ; TX uses
 #define INA219_ADDR_OUTPUT      0x40u
 #define INA219_ADDR_BATTERY     0x45u
 #define INA219_REG_CONFIG       0x00u
-#define INA219_REG_SHUNT        0x01u
+#define INA219_REG_CURRENT       0x04u
+#define INA219_REG_CALIBRATION   0x05u
 #define INA219_CONFIG_VALUE     0x0B9Du
+/* Matches the NUT driver's calibration (upsplus.c INA219_CALIBRATION_VALUE_MAGIC), which
+ * was derived for this hardware's actual shunt resistors (7.25 mOhm output, 5 mOhm
+ * battery rail). Current register mA = raw * NUM / DEN, per rail. */
+#define INA219_CALIBRATION_VALUE      0x8388u
+#define INA219_OUTPUT_CURRENT_MA_NUM  1682
+#define INA219_BATTERY_CURRENT_MA_NUM 2439
+#define INA219_CURRENT_MA_DEN         10000
 #define I2C_BOOT_TIMEOUT_CYCLES 100000u
 #define I2C1_MASTER_WINDOW_TIMEOUT_US 2000u
 /* I2C1 kernel clock source is HSI (8 MHz) per SystemClock_Config().
@@ -563,12 +571,50 @@ static uint8_t I2C1_MasterReadReg16_Window(uint8_t addr_7bit, uint8_t reg, uint1
     return 1u;
 }
 
+static uint8_t I2C1_ProbeConfigureIna219(uint8_t addr)
+{
+    uint16_t readback = 0u;
+    uint8_t ok = 0u;
+    uint8_t attempt;
+
+    for (attempt = 0u; attempt < I2C_PROBE_RETRIES && ok == 0u; attempt++)
+    {
+        I2C1_BootEnsureEnabled();
+        if (!I2C1_WaitForBusIdle(I2C_PROBE_IDLE_CYCLES))
+        {
+            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
+            continue;
+        }
+        ok = I2C1_MasterWriteReg16(addr, INA219_REG_CONFIG, INA219_CONFIG_VALUE);
+        if (ok)
+        {
+            ok = I2C1_MasterReadReg16(addr, INA219_REG_CONFIG, &readback);
+        }
+        if (ok && readback != INA219_CONFIG_VALUE)
+        {
+            ok = 0u;
+        }
+        if (ok)
+        {
+            ok = I2C1_MasterWriteReg16(addr, INA219_REG_CALIBRATION, INA219_CALIBRATION_VALUE);
+        }
+        if (ok)
+        {
+            ok = I2C1_MasterReadReg16(addr, INA219_REG_CALIBRATION, &readback);
+        }
+        if (ok && readback != INA219_CALIBRATION_VALUE)
+        {
+            ok = 0u;
+        }
+        if (ok == 0u)
+            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
+    }
+    return ok;
+}
+
 void MX_I2C1_ProbeMasterSetup(void)
 {
     uint32_t timing_100k;
-    uint16_t readback = 0u;
-    uint8_t ok = 0u;
-    uint8_t attempt = 0u;
 
     /* GPIOA + I2C1 clocks */
     LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
@@ -607,51 +653,8 @@ void MX_I2C1_ProbeMasterSetup(void)
     LL_mDelay(I2C_PROBE_INITIAL_DELAY_MS);
 
     /* Configure INA219s and verify with a readback for probe presence. */
-    ok = 0u;
-    for (attempt = 0u; attempt < I2C_PROBE_RETRIES && ok == 0u; attempt++)
-    {
-        I2C1_BootEnsureEnabled();
-        if (!I2C1_WaitForBusIdle(I2C_PROBE_IDLE_CYCLES))
-        {
-            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
-            continue;
-        }
-        ok = I2C1_MasterWriteReg16(INA219_ADDR_OUTPUT, INA219_REG_CONFIG, INA219_CONFIG_VALUE);
-        if (ok)
-        {
-            ok = I2C1_MasterReadReg16(INA219_ADDR_OUTPUT, INA219_REG_CONFIG, &readback);
-        }
-        if (ok && readback != INA219_CONFIG_VALUE)
-        {
-            ok = 0u;
-        }
-        if (ok == 0u)
-            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
-    }
-    ina_probe_present_output = ok;
-
-    ok = 0u;
-    for (attempt = 0u; attempt < I2C_PROBE_RETRIES && ok == 0u; attempt++)
-    {
-        I2C1_BootEnsureEnabled();
-        if (!I2C1_WaitForBusIdle(I2C_PROBE_IDLE_CYCLES))
-        {
-            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
-            continue;
-        }
-        ok = I2C1_MasterWriteReg16(INA219_ADDR_BATTERY, INA219_REG_CONFIG, INA219_CONFIG_VALUE);
-        if (ok)
-        {
-            ok = I2C1_MasterReadReg16(INA219_ADDR_BATTERY, INA219_REG_CONFIG, &readback);
-        }
-        if (ok && readback != INA219_CONFIG_VALUE)
-        {
-            ok = 0u;
-        }
-        if (ok == 0u)
-            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
-    }
-    ina_probe_present_battery = ok;
+    ina_probe_present_output = I2C1_ProbeConfigureIna219(INA219_ADDR_OUTPUT);
+    ina_probe_present_battery = I2C1_ProbeConfigureIna219(INA219_ADDR_BATTERY);
 
     LL_I2C_Disable(I2C1);
 }
@@ -898,7 +901,7 @@ void I2C1_IRQHandler(void)
     }
 }
 
-uint8_t I2C1_ReadIna219Shunt(uint8_t is_output, int16_t *shunt_raw)
+uint8_t I2C1_ReadIna219Current(uint8_t is_output, int16_t *current_mA)
 {
     uint16_t start_us = (uint16_t)LL_TIM_GetCounter(TIM3);
     uint16_t raw = 0u;
@@ -906,7 +909,7 @@ uint8_t I2C1_ReadIna219Shunt(uint8_t is_output, int16_t *shunt_raw)
     uint8_t addr = is_output ? INA219_ADDR_OUTPUT : INA219_ADDR_BATTERY;
 
     I2C1_EnterMasterWindow();
-    ok = I2C1_MasterReadReg16_Window(addr, INA219_REG_SHUNT, &raw, start_us);
+    ok = I2C1_MasterReadReg16_Window(addr, INA219_REG_CURRENT, &raw, start_us);
     if (ok && I2C1_WindowExpired(start_us))
         ok = 0u;
     if (!ok)
@@ -917,8 +920,11 @@ uint8_t I2C1_ReadIna219Shunt(uint8_t is_output, int16_t *shunt_raw)
     }
     I2C1_ExitMasterWindow();
 
-    if (ok && shunt_raw != NULL)
-        *shunt_raw = (int16_t)raw;
+    if (ok && current_mA != NULL)
+    {
+        int32_t scale_num = is_output ? INA219_OUTPUT_CURRENT_MA_NUM : INA219_BATTERY_CURRENT_MA_NUM;
+        *current_mA = (int16_t)(((int32_t)(int16_t)raw * scale_num) / INA219_CURRENT_MA_DEN);
+    }
     return ok;
 }
 
