@@ -31,11 +31,19 @@ void UpdateBatteryMinMax(void);
 void FactoryReset(void);
 void CheckPowerOnConditions(void);
 
+/* Set to 1 to re-enable factory-test selectors 0x0A-0x0E (raw per-channel ADC
+ * codes + TS_CAL1/TS_CAL2 readback; read with tools/upsplus_adc_diag.py).
+ * Left at 0 normally: this part's flash is nearly full, and these registers
+ * are only needed when re-investigating this class of ADC/temperature bug. */
+#ifndef UPS_ADC_FACTORY_DIAG_ENABLED
+#define UPS_ADC_FACTORY_DIAG_ENABLED 0
+#endif
+
 /* Everything below needs to be mapped to registers */
 
-#define ADC_CONVERTED_DATA_BUFFER_SIZE 6
-
-/* Raw ADC buffer; DMA fills, main loop processes into state */
+/* Raw ADC buffer; DMA fills, main loop processes into state. DMA runs
+ * one-shot (see MX_DMA_Init/tick_500ms re-arm), so this is stable and idle
+ * between bursts -- safe to read directly. */
 __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
 
 /* Timing/button helpers (canonical 10 ms tick/EXTI). Authoritative state is state/sys_state only;
@@ -51,8 +59,10 @@ __IO uint8_t MustRefreshVDD = 1;
 #define IWDG_PR_256   6u
 #define IWDG_RLR_VAL  1748u
 
-/* I2C stuck-bus recovery: if ADDR flag set for this many seconds, re-init slave (clock-stretch watchdog). */
-#define I2C_STUCK_ADDR_RECOVERY_SEC  5u
+/* I2C stuck-bus recovery: if ADDR flag set for this many seconds, re-init slave (clock-stretch watchdog).
+ * Keep this at 1s so the master (RPi bcm2835) gets a bus error promptly rather than waiting
+ * through its own kernel-level timeout (~15-20s), which causes sustained I2C stall storms. */
+#define I2C_STUCK_ADDR_RECOVERY_SEC  1u
 
 typedef void (*pFunction)(void);
 __IO pFunction JumpToAplication;
@@ -65,13 +75,11 @@ __IO pFunction JumpToAplication;
 static authoritative_state_t state;
 static system_state_t sys_state;
 static snapshot_buffer_t snapshot;
-static window_manager_state_t window_mgr;
 static charger_physical_state_t charger_physical;
 static protection_state_t prot_state;
 static button_handler_t button_handler;
 static uint8_t button_last_level = 0; /* 1=pressed, 0=released */
 static uint8_t i2c_stuck_addr_sec = 0; /* Seconds ADDR flag has been set; used for stuck-bus recovery */
-static uint32_t cumulative_runtime_sec_at_flash_load = 0u; /* Set when applying flash record; used for persisted true-VBAT age */
 
 /* Double-buffered register image. Snapshot_Update fills reg_image for I2C TX. */
 uint8_t reg_image[2][256];
@@ -113,6 +121,17 @@ static volatile uint8_t ina_probe_requested = 0;
 static uint32_t ina_probe_due_ticks = 0;
 static uint8_t ina_probe_is_output = 1u;
 static uint8_t ina_next_is_output = 1u;
+/* A failed master-mode INA219 read (measured: consistently BERR/ARLO/OVR, i.e. a genuine
+ * collision with another master) is normal, recoverable multi-master I2C behavior, not
+ * evidence the channel is stuck. The guard's pre-check can reduce collision odds but can't
+ * eliminate them, since NUT's poll timer runs independently and doesn't coordinate with the
+ * STM32 in real time. Retry the
+ * SAME channel shortly after a failure instead of waiting for the next full alternation (up to
+ * 500ms later, and only after the other channel's turn) -- bounded so a persistently
+ * unresponsive device still falls back to normal alternation rather than retrying forever. */
+#define INA_PROBE_MAX_RETRIES        3u
+#define INA_PROBE_RETRY_DELAY_TICKS  5u  /* ~50ms: long enough for a colliding transaction to finish */
+static uint8_t ina_probe_retry_count = 0u;
 
 static void MX_TIM3_Init(void);
 static uint8_t I2C1_GuardWindowReady(void);
@@ -133,10 +152,6 @@ static uint16_t min_vbat_while_load_on_mv = 0xFFFF;
 static uint8_t empty_persisted_this_session = 0;
 /* Debounce: only commit empty on load_off after sustained load_off (0 = not in load_off, else tick when load_off started) */
 static uint32_t empty_learn_load_off_start_tick = 0u;
-/* Condition (3) debounce: 0 = not pending; else tick when output validity loss was first detected.
- * Commit fires after EMPTY_LEARN_BROWNOUT_HOLD_TICKS of sustained validity loss (genuine brownout).
- * Cancelled if validity is restored before the hold expires (polling gap, not a real brownout). */
-static uint32_t empty_learn_brownout_tick = 0u;
 static uint8_t battery_full = 0;
 static uint32_t battery_full_clear_start_ticks = 0;
 static uint32_t taper_hold_ticks = 0;   /* Seconds (in ticks) battery current <= I_TAPER_MA with valid; for taper gate */
@@ -145,6 +160,38 @@ static uint32_t taper_hold_ticks = 0;   /* Seconds (in ticks) battery current <=
 #define RESTART_POWER_OFF_TICKS  (5u * TICKS_PER_1S)  /* 5 seconds in 10ms ticks */
 static uint8_t restart_phase = 0;       /* 0=idle, 1=MT_EN low, counting down */
 static uint16_t restart_remaining_ticks = 0;
+
+/* Section 9.3: IP_EN arbitration -- single shared ownership so the Section 9.1 periodic reset
+ * and Section 9.2 battery-level LED check pulses cannot interleave or corrupt each other's hold
+ * timing. Section 10's HardFault handler deliberately bypasses this (see stm32f0xx_it.c): it
+ * runs in a dedicated fault context and resets the MCU immediately afterward, so it can never
+ * meaningfully overlap with either driver here. */
+typedef enum {
+    IP_EN_OWNER_NONE = 0,
+    IP_EN_OWNER_PERIODIC_RESET,
+    IP_EN_OWNER_LED_CHECK
+} ip_en_owner_t;
+static ip_en_owner_t ip_en_owner = IP_EN_OWNER_NONE;
+static uint32_t ip_en_release_tick = 0;        /* tick_counter value at which to release IP_EN HIGH */
+
+/* Section 9.1: periodic IP5328 reset. See ups_state.h for why only a baseline snapshot of
+ * charging_time_sec is needed instead of a dedicated countdown. */
+static uint32_t ip5328_reset_baseline_sec = 0; /* charging_time_sec value at last arm/rearm */
+static uint8_t ip5328_reset_pending = 0;       /* Due; consumed by IPEnArbitration_Tick10ms */
+static uint8_t ip5328_reset_pulse_count = 0;   /* Saturating; factory-test selector 0x08 */
+
+/* Section 9.2: battery-level LED check request (set by button dispatch or the periodic timer
+ * below, consumed by arbitration) */
+static uint8_t led_check_requested = 0;
+
+/* Section 9.2 periodic auto-trigger: reuses sample_period_minutes (register 0x15-0x16,
+ * otherwise unused -- see UPSPlus_Behavior_Spec.md Section 3) as the interval between automatic
+ * LED checks while genuinely discharging (RPI_ON && charger ABSENT), on top of the existing
+ * manual button trigger. Armed to a fresh interval whenever that condition is (re)entered; no
+ * partial credit carries over from a prior charging/off session (mirrors Section 9.1's baseline
+ * semantics). */
+static uint32_t led_check_periodic_remaining_sec = 0;
+static uint8_t led_check_periodic_active_prev = 0;
 
 static void InitAuthoritativeStateFromDefaults(void);
 static void ProcessI2CPendingWrite(void);
@@ -158,6 +205,8 @@ static void BatteryPlateau_Init(void);
 static void BatteryPlateau_OnAdcSample(uint16_t raw_vbat_mv);
 static void BatteryPlateau_Tick1s(void);
 static void CurrentAge_Tick10ms(void);
+static void IPEnArbitration_Tick10ms(void);
+static void LedCheckPeriodic_OnTick1s(void);
 
 /*===========================================================================*/
 /* Validation functions (register bounds, RO enforcement in apply)           */
@@ -204,25 +253,6 @@ uint8_t Validate_LoadOnDelay(uint16_t value)
 uint8_t Charger_IsInfluencingVBAT(const system_state_t *s)
 {
     return (s->charger_state == CHARGER_STATE_PRESENT) ? 1u : 0u;
-}
-
-uint8_t IsTrueVbatSampleFresh(uint32_t now_ticks, uint32_t last_true_vbat_sample_tick)
-{
-    /* Unsigned wrap gives correct age when tick_counter has wrapped */
-    uint32_t age_ticks = now_ticks - last_true_vbat_sample_tick;
-    return (age_ticks <= TRUE_VBAT_MAX_AGE_TICKS) ? 1u : 0u;
-}
-
-/** True if we have a usable true-VBAT value for power/percent: either a fresh tick-based sample or a persisted sample still within age. */
-static uint8_t IsTrueVbatUsableForDecision(void)
-{
-    if (state.last_true_vbat_sample_tick != 0u)
-        return IsTrueVbatSampleFresh(sched_flags.tick_counter, state.last_true_vbat_sample_tick);
-    if (state.persisted_true_vbat_age_sec == 0u)
-        return 0u;
-    uint32_t elapsed = state.cumulative_runtime_sec - cumulative_runtime_sec_at_flash_load;
-    uint32_t effective_age_sec = state.persisted_true_vbat_age_sec + elapsed;
-    return (effective_age_sec <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC) ? 1u : 0u;
 }
 
 static uint16_t ClampU16(uint16_t value, uint16_t min_value, uint16_t max_value)
@@ -286,8 +316,16 @@ uint8_t GetPowerStatusRegisterValue(const authoritative_state_t *auth_state, con
     /* Bit0 reflects effective MT_EN assertion; restart_phase forces MT_EN LOW. */
     if (state->power_state == POWER_STATE_RPI_ON && restart_phase == 0)
         value |= 0x01u; /* Power to RPi */
-    if (state->learning_mode == LEARNING_ACTIVE)
-        value |= 0x02u; /* Learning/Calibration enabled */
+    /* Bit1: Section 9.1 periodic IP5328 reset in progress. Repurposed -- this bit previously
+     * reported learning_mode's "calibration window active" flag, which has been permanently
+     * unreachable (always LEARNING_INACTIVE) since the true-VBAT-via-disconnect mechanism was
+     * removed (see UPSPlus_Behavior_Spec.md Section 9); learning_mode itself is retained only for
+     * Factory Testing ABI stability (selector 0x01 byte 3) and is no longer surfaced here. This
+     * bit flags the ~10.5s window so an external observer of battery_current_mA can attribute a
+     * transient discharge reading to the expected reset side effect rather than a real event --
+     * the charger remains physically connected and charger_state stays PRESENT throughout. */
+    if (ip_en_owner == IP_EN_OWNER_PERIODIC_RESET)
+        value |= 0x02u;
     return value;
 }
 
@@ -314,7 +352,6 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
     /* Snapshot local copies for debug/diagnostic pages (main-loop owned state). */
     const button_handler_t button_snapshot = button_handler;
     const charger_physical_state_t charger_snapshot = charger_physical;
-    const window_manager_state_t window_snapshot = window_mgr;
     const protection_state_t protection_snapshot = prot_state;
 
     StoreU16LE(buf, REG_MCU_VOLTAGE_L, auth->mcu_voltage_mv);
@@ -368,9 +405,12 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
             buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(button_snapshot.hold_ticks & 0xFFu);
             break;
         case 0x03u:
+            /* Bytes 2-3 (window_active/window_due) are reserved-zero: the measurement window
+             * they described has been removed (IP_EN cannot gate the charge path -- see
+             * UPSPlus_Behavior_Spec.md Section 9). */
             buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(charger_snapshot.charger_physically_present != 0u);
-            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)(window_snapshot.window_active != 0u);
-            buf[REG_FACTORY_TEST_START + 3] = (uint8_t)(window_snapshot.window_due != 0u);
+            buf[REG_FACTORY_TEST_START + 2] = 0x00u;
+            buf[REG_FACTORY_TEST_START + 3] = 0x00u;
             break;
         case 0x04u:
             buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(protection_snapshot.protection_active != 0u);
@@ -406,7 +446,65 @@ static void StateToRegisterBuffer(const authoritative_state_t *auth, const syste
                                                         auth->battery_current_age_10ms : 255u);
             buf[REG_FACTORY_TEST_START + 3] = 0x00u;
             break;
-        /* 0x08/0x09 (reset cause) removed: bootloader clears RCC_CSR before app runs, so values were always 0. */
+        case 0x08u:
+        {
+            /* Section 9.1 periodic-reset diagnostics. Minutes remaining is derived from the
+             * charging_time_sec elapsed-basis (see ups_state.h) rather than a stored countdown;
+             * 0 whenever charger_state != PRESENT (timer not running, per behavior spec). */
+            uint16_t minutes_remaining = 0u;
+            if (sys->charger_state == CHARGER_STATE_PRESENT)
+            {
+                uint32_t elapsed_sec = auth->charging_time_sec - ip5328_reset_baseline_sec;
+                uint32_t remaining_sec = (elapsed_sec < IP5328_RESET_PERIOD_SEC) ?
+                    (IP5328_RESET_PERIOD_SEC - elapsed_sec) : 0u;
+                minutes_remaining = (uint16_t)(remaining_sec / 60u);
+            }
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(minutes_remaining & 0xFFu);
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)(minutes_remaining >> 8);
+            buf[REG_FACTORY_TEST_START + 3] = ip5328_reset_pulse_count;
+            break;
+        }
+        /* 0x09 previously held guard-open/read-success counts and reset cause, then briefly held
+         * a charge-disconnect current diagnostic (entry/during-window battery current around the
+         * since-removed FORCED_OFF_WINDOW pulse). Both uses were removed to reclaim flash once
+         * they'd served their purpose and conclusively answered their question: the first traced
+         * a chronic STM32 I2C reliability problem to an external root cause (a NUT driver bug
+         * aliasing a reserved core variable name) rather than anything in this firmware; the
+         * second confirmed via live measurement that IP_EN has no effect on battery current, i.e.
+         * cannot gate the charge path (see UPSPlus_Behavior_Spec.md Section 9), which is why
+         * FORCED_OFF_WINDOW itself was then removed. 0x10 (retry effectiveness) and 0x11
+         * (internal guard-window quiet-time tracking) were removed for the same original reason
+         * and remain free. 0x0F (INA219 failure-reason breakdown) was removed earlier for the
+         * same reason: its question was conclusively answered by testing (consistently
+         * bus_error, never NACK/timeout) before removal, not left unanswered. */
+#if UPS_ADC_FACTORY_DIAG_ENABLED
+        case 0x0Au: /* raw ADC code, battery channel (idx 1), pre-scaling */
+        case 0x0Bu: /* raw ADC code, USB-C/VBUS channel (idx 2), pre-scaling */
+        case 0x0Cu: /* raw ADC code, TEMPSENSOR channel (idx 4), pre-formula */
+        {
+            /* Shared body: selector 0x0A/B/C map to aADCxConvertedData[1]/[2]/[4]
+             * (indices are 1<<offset, avoids a lookup table). Compare against
+             * registers 0x05/0x07/0x0B to recompute the corresponding
+             * __LL_ADC_CALC_* formula by hand. */
+            uint16_t raw = aADCxConvertedData[1u << (selector - 0x0Au)];
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(raw & 0xFFu);
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)(raw >> 8);
+            buf[REG_FACTORY_TEST_START + 3] = 0x00u;
+            break;
+        }
+        case 0x0Du: /* factory TS_CAL1, raw ADC code at 30 DegC, Vref=3.3V */
+        case 0x0Eu: /* factory TS_CAL2, raw ADC code at 110 DegC, Vref=3.3V */
+        {
+            /* If either looks unprogrammed (0x0000/0xFFFF) or CAL2<=CAL1, the
+             * temperature formula's calibration inputs are bad on this part,
+             * independent of anything ADC/DMA related. */
+            uint16_t cal = (selector == 0x0Du) ? *TEMPSENSOR_CAL1_ADDR : *TEMPSENSOR_CAL2_ADDR;
+            buf[REG_FACTORY_TEST_START + 1] = (uint8_t)(cal & 0xFFu);
+            buf[REG_FACTORY_TEST_START + 2] = (uint8_t)(cal >> 8);
+            buf[REG_FACTORY_TEST_START + 3] = 0x00u;
+            break;
+        }
+#endif /* UPS_ADC_FACTORY_DIAG_ENABLED */
         default:
             break;
         }
@@ -728,11 +826,8 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.version = 25;
+    state.version = 29;
     state.snapshot_tick = 0;
-    state.last_true_vbat_sample_tick = 0;
-    state.last_true_vbat_mv = 0;
-    state.persisted_true_vbat_age_sec = 0;
 
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.charger_state = CHARGER_STATE_ABSENT;
@@ -747,10 +842,6 @@ static void InitAuthoritativeStateFromDefaults(void)
     sys_state.boot_attempt_start_ticks = 0;
 
     /* State machine runtime state */
-    window_mgr.window_due = 0;
-    window_mgr.window_active = 0;
-    window_mgr.last_window_end_ticks = 0;
-    window_mgr.window_start_ticks = 0;
     charger_physical.charger_physically_present = 0;
     charger_physical.charger_stability_count = 0;
     charger_physical.charger_last_seen_seq = 0;
@@ -859,7 +950,30 @@ int main(void)
         if (sched_flags.tick_500ms)
         {
             if (!adc_ready)
-                LL_ADC_REG_StartConversion(ADC1);
+            {
+                /* DMA runs NORMAL (one-shot): each burst's completion leaves
+                 * NDTR at 0, so it must be explicitly re-armed before the next
+                 * trigger, every cycle (not just after a deadlock). */
+                LL_DMA_DisableChannel(DMA1, LL_DMA_CHANNEL_1);
+                LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_1, ADC_CONVERTED_DATA_BUFFER_SIZE);
+                LL_DMA_EnableChannel(DMA1, LL_DMA_CHANNEL_1);
+
+                if (!LL_ADC_IsEnabled(ADC1))
+                {
+                    /* ADEN=0 with ADSTART=1 is a deadlock: RS bits prevent clearing
+                     * ADSTART by writing 0. Use APB peripheral reset to restore all
+                     * ADC registers to reset state, then re-initialise (which also
+                     * re-triggers conversion). Should be rare now that DMA no longer
+                     * runs the CIRC+LIMITED combination suspected to cause this. */
+                    LL_APB1_GRP2_ForceReset(LL_APB1_GRP2_PERIPH_ADC1);
+                    LL_APB1_GRP2_ReleaseReset(LL_APB1_GRP2_PERIPH_ADC1);
+                    MX_ADC_Init();
+                }
+                else
+                {
+                    LL_ADC_REG_StartConversion(ADC1);
+                }
+            }
             if (!ina_probe_requested)
             {
                 ina_probe_requested = 1;
@@ -877,8 +991,18 @@ int main(void)
             else
                 state.current_runtime_sec = 0;
             if (Charger_IsInfluencingVBAT(&sys_state))
+            {
                 state.charging_time_sec++;
+                /* Section 9.1: elapsed-charging basis for the periodic IP5328 reset (see
+                 * ups_state.h) -- reuses this counter instead of a separate countdown. */
+                if ((state.charging_time_sec - ip5328_reset_baseline_sec) >= IP5328_RESET_PERIOD_SEC)
+                {
+                    ip5328_reset_pending = 1u;
+                    ip5328_reset_baseline_sec = state.charging_time_sec;
+                }
+            }
             PowerStateMachine_OnTick1s();
+            LedCheckPeriodic_OnTick1s();
             BatteryPlateau_Tick1s();
             if (flash_dirty &&
                 (state.cumulative_runtime_sec - flash_last_write_sec) >= FLASH_DIRTY_MAX_INTERVAL_SEC)
@@ -908,23 +1032,38 @@ int main(void)
             if ((uint32_t)(now_ticks - ina_probe_due_ticks) < 0x80000000u &&
                 I2C1_GuardWindowReady())
             {
-                int16_t shunt_raw = 0;
+                int16_t current_mA = 0;
                 ina_probe_requested = 0;
-                if (I2C1_ReadIna219Shunt(ina_probe_is_output, &shunt_raw))
+                if (I2C1_ReadIna219Current(ina_probe_is_output, &current_mA))
                 {
+                    ina_probe_retry_count = 0u;
                     if (ina_probe_is_output)
                     {
-                        state.output_current_mA = shunt_raw;
+                        state.output_current_mA = current_mA;
                         state.output_current_age_10ms = 0u;
                         state.output_current_valid = 1u;
                     }
                     else
                     {
-                        state.battery_current_mA = shunt_raw;
+                        state.battery_current_mA = current_mA;
                         state.battery_current_age_10ms = 0u;
                         state.battery_current_valid = 1u;
                     }
                     Snapshot_UpdateDerived();
+                }
+                else if (ina_probe_retry_count < INA_PROBE_MAX_RETRIES)
+                {
+                    /* Likely transient collision (BERR/ARLO/OVR) -- retry the same channel
+                     * shortly rather than waiting for the next full alternation. */
+                    ina_probe_retry_count++;
+                    ina_probe_requested = 1u;
+                    ina_probe_due_ticks = sched_flags.tick_counter + INA_PROBE_RETRY_DELAY_TICKS;
+                }
+                else
+                {
+                    /* Exhausted retries -- give up on this channel for now and fall back to
+                     * normal alternation (next tick_500ms picks up the other channel). */
+                    ina_probe_retry_count = 0u;
                 }
             }
         }
@@ -1012,13 +1151,6 @@ int main(void)
             BatteryPlateau_OnAdcSample(state.battery_voltage_mv);
             UpdateBatteryMinMax();
             UpdateBatteryPercentage();
-            /* True-VBAT sample tick when charger not influencing (for percent and staleness gating). */
-            if (!Charger_IsInfluencingVBAT(&sys_state))
-            {
-                state.last_true_vbat_sample_tick = sched_flags.tick_counter;
-                state.last_true_vbat_mv = state.battery_voltage_mv;
-                state.persisted_true_vbat_age_sec = 0u; /* New sample; no longer using persisted age */
-            }
             /* Protection: store last ADC reading; counting is done in Protection_Step with adc_sample_seq gating. */
             prot_state.last_adc_battery_mv = state.battery_voltage_mv;
             Snapshot_UpdateDerived();
@@ -1037,24 +1169,21 @@ int main(void)
 }
 
 /**
- * Check power-on conditions with explicit state transitions and staleness gating.
- * RPI_OFF -> LOAD_ON_DELAY when conditions met (and true-VBAT
- * fresh if charger present). LOAD_ON_DELAY -> RPI_OFF when conditions no longer met.
+ * Check power-on conditions with explicit state transitions.
+ * RPI_OFF -> LOAD_ON_DELAY when conditions met and charger present.
+ * LOAD_ON_DELAY -> RPI_OFF when conditions no longer met.
  */
 void CheckPowerOnConditions(void)
 {
     uint32_t now_ticks = sched_flags.tick_counter;
     uint8_t battery_ok = (state.battery_percent > state.low_battery_percent);
     uint8_t battery_above_protection = (state.battery_voltage_mv > (uint16_t)(state.protection_voltage_mv + PROTECTION_HYSTERESIS_MV));
-    /* Charger physically connected (PRESENT or FORCED_OFF_WINDOW); distinct from Charger_IsInfluencingVBAT */
-    uint8_t charger_present = (sys_state.charger_state == CHARGER_STATE_PRESENT ||
-                              sys_state.charger_state == CHARGER_STATE_FORCED_OFF_WINDOW);
-    uint8_t true_vbat_fresh = IsTrueVbatUsableForDecision();
+    uint8_t charger_present = Charger_IsInfluencingVBAT(&sys_state);
 
     /* Clear PROTECTION_LATCHED when charger present and battery recovered (even if !auto_power_on). */
     if (sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
     {
-        uint8_t recovered = (charger_present && battery_ok && battery_above_protection && true_vbat_fresh);
+        uint8_t recovered = (charger_present && battery_ok && battery_above_protection);
         sys_state.power_state = (recovered && state.auto_power_on) ? POWER_STATE_LOAD_ON_DELAY : POWER_STATE_RPI_OFF;
         sys_state.power_state_entry_ticks = now_ticks;
         if (sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
@@ -1083,15 +1212,6 @@ void CheckPowerOnConditions(void)
 
     if (sys_state.power_state != POWER_STATE_RPI_OFF)
         return;
-
-    /* Staleness gate: if charger present, require fresh true-VBAT before auto power-on */
-    if (charger_present && !true_vbat_fresh)
-    {
-        /* Plan: force measurement window ASAP so we get fresh true-VBAT */
-        if (!window_mgr.window_active)
-            window_mgr.window_due = 1;
-        return;
-    }
 
     /* Do not auto power-on from battery-only; require charger present */
     if (!charger_present)
@@ -1124,9 +1244,6 @@ void FactoryReset(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.last_true_vbat_sample_tick = 0;
-    state.last_true_vbat_mv = 0;
-    state.persisted_true_vbat_age_sec = 0;
     sys_state.power_state = POWER_STATE_RPI_OFF;
     sys_state.factory_test_selector = 0;
 
@@ -1139,10 +1256,6 @@ void FactoryReset(void)
     sys_state.learning_mode = LEARNING_INACTIVE;
     sys_state.boot_backoff_active = 0;
     sys_state.boot_attempt_start_ticks = 0;
-    window_mgr.window_due = 0;
-    window_mgr.window_active = 0;
-    window_mgr.last_window_end_ticks = 0;
-    window_mgr.window_start_ticks = 0;
     charger_physical.charger_physically_present = 0;
     charger_physical.charger_stability_count = 0;
     charger_physical.charger_last_seen_seq = 0;
@@ -1152,10 +1265,21 @@ void FactoryReset(void)
     prot_state.last_seen_seq = 0;
     restart_phase = 0;
     restart_remaining_ticks = 0;
+    /* Section 9.1/9.2/9.3 runtime state: fresh slate. charger_state was just reset to ABSENT
+     * above, so the next ABSENT->PRESENT transition will re-arm the baseline regardless, but
+     * resetting explicitly here avoids relying on that ordering and matches the rest of this
+     * function's treatment of runtime/session state. */
+    ip5328_reset_baseline_sec = 0;
+    ip5328_reset_pending = 0;
+    ip5328_reset_pulse_count = 0;
+    led_check_requested = 0;
+    led_check_periodic_remaining_sec = 0;
+    led_check_periodic_active_prev = 0;
+    ip_en_owner = IP_EN_OWNER_NONE;
+    ip_en_release_tick = 0;
     BatteryPlateau_Init();
     min_vbat_while_load_on_mv = 0xFFFFu;
     empty_persisted_this_session = 0;
-    empty_learn_brownout_tick = 0u;
 }
 
 extern const uint8_t __flash_storage_start__[];
@@ -1211,11 +1335,10 @@ static void Flash_ApplyRecordToState(const flash_persistent_data_t *rec)
     state.battery_params_self_programmed = (rec->battery_params_self_programmed != 0u) ? 1u : 0u;
     state.low_battery_percent = rec->low_battery_percent;
     state.load_on_delay_config_sec = rec->load_on_delay_config_sec;
-    state.last_true_vbat_mv = rec->last_true_vbat_mv;
-    state.persisted_true_vbat_age_sec = rec->last_true_vbat_age_sec;
+    /* rec->last_true_vbat_mv / last_true_vbat_age_sec intentionally not read: reserved, see
+     * Flash_FillRecordFromState. */
     state.cumulative_runtime_sec = rec->cumulative_runtime_sec;
     state.charging_time_sec = rec->charging_time_sec;
-    cumulative_runtime_sec_at_flash_load = rec->cumulative_runtime_sec;
 
     /* Clamp to valid ranges (same policy as InitAuthoritativeStateFromBuffer) */
     if (!Validate_FullVoltage(state.full_voltage_mv)) state.full_voltage_mv = DEFAULT_VBAT_FULL_MV;
@@ -1247,25 +1370,11 @@ static void Flash_FillRecordFromState(flash_persistent_data_t *rec, uint16_t seq
     rec->battery_params_self_programmed = (state.battery_params_self_programmed != 0u) ? 1u : 0u;
     rec->low_battery_percent = state.low_battery_percent;
     rec->load_on_delay_config_sec = state.load_on_delay_config_sec;
-    /* Store age_sec; use 1 as minimum when valid to avoid collision with sentinel 0 = "no sample". */
-    if (state.last_true_vbat_sample_tick != 0u) {
-        uint32_t age_ticks = sched_flags.tick_counter - state.last_true_vbat_sample_tick;
-        uint32_t age_sec = age_ticks / (uint32_t)TICKS_PER_1S;
-        if (age_sec <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC)
-            rec->last_true_vbat_age_sec = (age_sec == 0u) ? 1u : (uint16_t)age_sec;
-        else
-            rec->last_true_vbat_age_sec = 0u;
-    } else if (state.persisted_true_vbat_age_sec != 0u) {
-        uint32_t elapsed = state.cumulative_runtime_sec - cumulative_runtime_sec_at_flash_load;
-        uint32_t effective_age = state.persisted_true_vbat_age_sec + elapsed;
-        if (effective_age <= (uint32_t)TRUE_VBAT_MAX_AGE_SEC)
-            rec->last_true_vbat_age_sec = (effective_age == 0u) ? 1u : (uint16_t)effective_age;
-        else
-            rec->last_true_vbat_age_sec = 0u;
-    } else {
-        rec->last_true_vbat_age_sec = 0u;
-    }
-    rec->last_true_vbat_mv = state.last_true_vbat_mv;
+    /* last_true_vbat_mv / last_true_vbat_age_sec: reserved, left at the memset-zero above. The
+     * true-VBAT-via-disconnect mechanism these backed has been removed (IP_EN cannot gate the
+     * charge path -- see UPSPlus_Behavior_Spec.md Section 9); the fields are kept in the struct,
+     * unused, to preserve flash layout and the bootloader_ota_flag offset (FLASH_OTA_FLAG_OFFSET
+     * assert) rather than resizing/reordering the record. */
     rec->cumulative_runtime_sec = state.cumulative_runtime_sec;
     rec->charging_time_sec = state.charging_time_sec;
     /* Bootloader OTA byte at 0x08003C64: 0 = run app, 0x7F = enter OTA (set when factory test 0xFC = 0x7F) */
@@ -1322,10 +1431,18 @@ static uint8_t Flash_ProgramBuffer(uint32_t address, const uint8_t *data, uint32
         return 0;
 
     /* Stride-2 format: each struct byte occupies one 16-bit halfword (LSByte = data,
-     * MSByte = 0xFF). Matches the bootloader's read/write format so settings survive OTA. */
+     * MSByte = 0xFF). Matches the bootloader's read/write format so settings survive OTA.
+     *
+     * IRQs are disabled only for the atomic write+BSY-poll per halfword (~40µs each).
+     * Re-enabling between halfwords lets the I2C ISR fire in the gaps, preventing
+     * sustained I2C unresponsiveness during the program phase. */
     while (i < len)
     {
+        uint32_t primask;
         halfword = (uint16_t)data[i] | 0xFF00u;
+
+        primask = __get_PRIMASK();
+        __disable_irq();
 
         FLASH->SR = FLASH_SR_EOP | FLASH_SR_PGERR | FLASH_SR_WRPRTERR;
         SET_BIT(FLASH->CR, FLASH_CR_PG);
@@ -1338,10 +1455,16 @@ static uint8_t Flash_ProgramBuffer(uint32_t address, const uint8_t *data, uint32
             {
                 CLEAR_BIT(FLASH->CR, FLASH_CR_PG);
                 SET_BIT(FLASH->CR, FLASH_CR_LOCK);
+                if (!primask)
+                    __enable_irq();
                 return 0;
             }
         }
         CLEAR_BIT(FLASH->CR, FLASH_CR_PG);
+
+        if (!primask)
+            __enable_irq();
+
         if (FLASH->SR & (FLASH_SR_PGERR | FLASH_SR_WRPRTERR))
         {
             SET_BIT(FLASH->CR, FLASH_CR_LOCK);
@@ -1410,7 +1533,6 @@ uint8_t Flash_Save(uint8_t bypass)
     flash_persistent_data_t verify;
     uint16_t next_seq = (uint16_t)(flash_sequence + 1u);
     uint32_t target_addr = (uint32_t)(uintptr_t)FlashStorageStartPtr();
-    uint32_t primask;
     uint8_t ok;
     size_t storage_size = (size_t)(FlashStorageEndPtr() - FlashStorageStartPtr());
 
@@ -1427,13 +1549,12 @@ uint8_t Flash_Save(uint8_t bypass)
 
     Flash_FillRecordFromState(&rec, next_seq);
 
-    primask = __get_PRIMASK();
-    __disable_irq();
+    /* No global IRQ disable here. Flash_ErasePage stalls flash reads for ~20ms (hardware
+     * constraint on STM32F0 — unavoidable), but Flash_ProgramBuffer re-enables IRQs between
+     * each halfword write so the I2C ISR can fire in the ~40µs gaps between writes. */
     ok = Flash_ErasePage(target_addr);
     if (ok)
         ok = Flash_ProgramBuffer(target_addr, (const uint8_t *)&rec, sizeof(rec));
-    if (!primask)
-        __enable_irq();
     if (!ok)
         return 0u;
 
@@ -1572,10 +1693,8 @@ void UpdateBatteryMinMax(void)
             min_vbat_while_load_on_mv = 0xFFFFu;
             empty_persisted_this_session = 0;
             empty_learn_load_off_start_tick = 0u;
-            empty_learn_brownout_tick = 0u;
         }
-        /* Only track/commit empty when charger is ABSENT (actual discharge). Exclude FORCED_OFF_WINDOW
-         * because the 1.5s calibration window causes an artificial VBAT dip—that min is not true empty. */
+        /* Only track/commit empty when charger is ABSENT (actual discharge). */
         else if (sys_state.charger_state == CHARGER_STATE_ABSENT)
         {
             /* Track min VBAT when load is on; when INA invalid but RPi on, assume load on (brownout). */
@@ -1618,12 +1737,11 @@ void UpdateBatteryPercentage(void)
     int32_t range = (int32_t)state.full_voltage_mv - (int32_t)state.empty_voltage_mv;
     if (range < MIN_VOLTAGE_DELTA_MV)
         return;
-    uint8_t true_vbat_usable = IsTrueVbatUsableForDecision();
     uint8_t charging = Charger_IsInfluencingVBAT(&sys_state);
-    if (charging && !true_vbat_usable)
-        return;
-    int32_t voltage = charging ? (int32_t)state.last_true_vbat_mv
-                               : (int32_t)state.battery_voltage_mv;
+    /* No true-VBAT-via-disconnect mechanism exists (IP_EN cannot gate the charge path -- see
+     * UPSPlus_Behavior_Spec.md Section 9); use the raw/filtered ADC reading directly whether
+     * charging or not, accepting reduced accuracy while a charger is present. */
+    int32_t voltage = (int32_t)state.battery_voltage_mv;
     int32_t percentage;
     if (voltage <= (int32_t)state.empty_voltage_mv)
         percentage = 0;
@@ -1682,55 +1800,53 @@ static uint8_t I2C1_BusIdleStable500us(void)
     return 1u;
 }
 
-/* If no I2C master activity for this long (ticks), allow INA219 reads unconditionally. */
+/* Minimum ticks since the last STM32-addressed STOP before the fine-grained (TIM3,
+ * microsecond) proximity check is no longer needed and live bus-idle sensing alone is
+ * trusted, with no upper bound. Tick-resolution tracking (I2C1_GetLastStopTick(),
+ * I2C1_GetLastAddrTick() — 32-bit, 10 ms resolution) has no wraparound ceiling, unlike TIM3's
+ * 16-bit/~65.536 ms range, so this closes the starvation gap a steadily-polling master (e.g.
+ * NUT's ~2 s critical_update_interval) used to hit between the old ~50 ms window and an idle
+ * bypass: NUT's traffic clusters at one point per poll, leaving the bus genuinely quiet for
+ * most of each cycle — this lets that quiet time be used, not just a sliver right after the
+ * last transaction. Below this threshold, true elapsed time is guaranteed well under TIM3's
+ * wrap range, so the microsecond check remains valid there. */
+#define I2C_STOP_SETTLE_TICKS  1u
+
+/* If no STM32-addressed I2C activity has EVER been observed (true standalone operation, or
+ * shortly after boot with no RPi present), allow INA219 reads once idle this long. Kept at
+ * the original, conservative value: I2C_STOP_SETTLE_TICKS above now closes the steady-polling
+ * starvation gap directly, so this branch is only a defense-in-depth fallback for the
+ * "no master ever" case, not the primary mechanism. */
 #define I2C_MASTER_IDLE_ALLOW_READ_TICKS  (5u * TICKS_PER_1S)
 
 static uint8_t I2C1_GuardWindowReady(void)
 {
     uint16_t now_us = (uint16_t)LL_TIM_GetCounter(TIM3);
     uint16_t last_stop_us = I2C1_GetLastStopUs();
-    uint16_t last_addr_us = I2C1_GetLastAddrUs();
     uint8_t txn_active = I2C1_GetSlaveTxnActive();
 
     if (txn_active)
         return 0u;
 
-    /* Track last I2C master activity in tick resolution so we can allow reads when master has been idle > 5 s. */
+    uint32_t now_ticks = sched_flags.tick_counter;
+    uint32_t last_stop_tick = I2C1_GetLastStopTick();
+    uint32_t last_addr_tick = I2C1_GetLastAddrTick();
+
+    if (last_stop_tick == 0u && last_addr_tick == 0u)
     {
-        static uint16_t last_seen_stop_us = 0u;
-        static uint16_t last_seen_addr_us = 0u;
-        static uint32_t last_i2c_activity_tick = 0u;
-        uint32_t now_ticks = sched_flags.tick_counter;
-
-        if (last_stop_us != last_seen_stop_us || last_addr_us != last_seen_addr_us)
-        {
-            last_i2c_activity_tick = now_ticks;
-            last_seen_stop_us = last_stop_us;
-            last_seen_addr_us = last_addr_us;
-        }
-
-        /* No master activity observed yet, or master idle long enough: no collision risk, allow after bus checks. */
-        if (last_i2c_activity_tick == 0u ||
-            (now_ticks - last_i2c_activity_tick) > I2C_MASTER_IDLE_ALLOW_READ_TICKS)
-        {
-            if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
-                !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
-                return 0u;
-            if (!I2C1_BusIdleStable500us())
-                return 0u;
-            return 1u;
-        }
+        /* No STM32-addressed activity observed since boot. */
+        if (now_ticks <= I2C_MASTER_IDLE_ALLOW_READ_TICKS)
+            return 0u;
     }
-
-    /* Master recently active: apply 50 ms guard window to avoid collision. */
-    if ((uint16_t)(now_us - last_stop_us) > 50000u)
-        return 0u;
-
-    if ((uint16_t)(now_us - last_addr_us) > 50000u)
-        return 0u;
-
-    if ((uint16_t)(now_us - last_stop_us) < 500u)
-        return 0u;
+    else if ((now_ticks - last_stop_tick) < I2C_STOP_SETTLE_TICKS)
+    {
+        /* Within the same (or immediately preceding) 10 ms tick as the last STM32-addressed
+         * STOP: true elapsed time is necessarily well under TIM3's 65.536 ms wrap range, so
+         * fall back to the fine microsecond check for the mandatory 500 us settle time
+         * (design plan Sec 5.1.3) that tick resolution alone can't guarantee. */
+        if ((uint16_t)(now_us - last_stop_us) < 500u)
+            return 0u;
+    }
 
     if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
         !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
@@ -1744,8 +1860,7 @@ static uint8_t I2C1_GuardWindowReady(void)
 
 static void BatteryPlateau_UpdateBatteryFullClear(uint32_t now_ticks)
 {
-    /* Clear FULL only on physical charger removal (ABSENT). FORCED_OFF_WINDOW is a calibration
-     * window -- the charger remains physically connected, so the FULL latch is preserved. */
+    /* Clear FULL only on physical charger removal (ABSENT). */
     if (sys_state.charger_state == CHARGER_STATE_ABSENT)
     {
         battery_full = 0;
@@ -1768,7 +1883,7 @@ static void BatteryPlateau_UpdateBatteryFullClear(uint32_t now_ticks)
 static void BatteryPlateau_Tick1s(void)
 {
     uint32_t now_ticks = sched_flags.tick_counter;
-    /* Only reset when charger physically absent; FORCED_OFF_WINDOW is still "connected" (calibration window). */
+    /* Only reset when charger physically absent. */
     uint8_t charger_connected = (sys_state.charger_state != CHARGER_STATE_ABSENT) ? 1u : 0u;
 
     if (state.battery_params_self_programmed != 0u)
@@ -1789,7 +1904,7 @@ static void BatteryPlateau_Tick1s(void)
         return;
     }
 
-    /* Reset window only when transitioning from unplugged to connected, not on PRESENT <-> FORCED_OFF_WINDOW. */
+    /* Reset window only when transitioning from unplugged to connected. */
     if (plateau_last_charger_state == CHARGER_STATE_ABSENT && sys_state.charger_state != CHARGER_STATE_ABSENT)
         BatteryPlateau_ResetSession();
     plateau_last_charger_state = sys_state.charger_state;
@@ -1895,25 +2010,13 @@ static void BatteryPlateau_Tick1s(void)
         plateau_suppressed = 1;
 }
 
-/* DMA only sets adc_ready; main loop processes ADC and updates state */
-void DMA1_CH1_IRQHandler(void)
-{
-    if (LL_DMA_IsActiveFlag_TC1(DMA1))
-    {
-        LL_DMA_ClearFlag_TC1(DMA1);
-        adc_ready = 1;
-    }
-    if (LL_DMA_IsActiveFlag_TE1(DMA1) == 1)
-    {
-        LL_DMA_ClearFlag_TE1(DMA1);
-    }
-}
 
 /* Scheduler 10 ms tick: flag-only work, called from SysTick every 10th tick.
  * On Cortex-M0, aligned 32-bit write to tick_counter is atomic; main reads it for deltas. */
 void Scheduler_ISR_Tick10ms(void)
 {
     sched_flags.tick_counter++;
+    I2C1_SetTickCounter(sched_flags.tick_counter);
     sched_flags.tick_10ms = 1;
     if (--ticks_until_100ms == 0u)
     {
@@ -1927,9 +2030,6 @@ void Scheduler_ISR_Tick10ms(void)
     }
 }
 
-/* Scheduler uses explicit state machine (power, charger, protection). */
-#define SAMPLE_PERIOD_TICKS_PER_MIN  ((uint32_t)(60u * TICKS_PER_1S))
-
 /* MT_EN: restart phase overrides (MT_EN low for 5s); else driven by power_state.
  * Protection cut happens only after flash commit in main loop; see pending_power_cut. */
 static void ApplyGPIOFromState(void)
@@ -1940,11 +2040,22 @@ static void ApplyGPIOFromState(void)
         LL_GPIO_SetOutputPin(GPIOA, MT_EN);
     else
         LL_GPIO_ResetOutputPin(GPIOA, MT_EN);
-    /* IP_EN HIGH only when PRESENT; ABSENT and FORCED_OFF_WINDOW both drive IP_EN low (intentional) */
-    if (sys_state.charger_state == CHARGER_STATE_PRESENT)
-        LL_GPIO_SetOutputPin(GPIOA, IP_EN);
-    else
+    /* IP_EN: HIGH except during a brief, deliberate KEY pulse owned by Section 9.1 (periodic
+     * IP5328 reset) or Section 9.2 (battery-level LED check) -- see ip_en_owner, arbitrated in
+     * IPEnArbitration_Tick10ms(). IP_EN physically drives the IP5328's KEY (button-detect) pin,
+     * confirmed against the datasheet and a live measurement (UPSPlus_Behavior_Spec.md Section
+     * 9) -- it is NOT a charger-enable gate; KEY only controls the output boost stage
+     * (VOUT1/VOUT2/USB-C), the battery-level LED display, and the WLED flashlight. An earlier
+     * revision pulsed IP_EN LOW for 1.5s periodically (CHARGER_STATE_FORCED_OFF_WINDOW), intending
+     * to disconnect the charger path for true-VBAT sampling; measured battery current
+     * before/during that pulse was unchanged, confirming the pulse did nothing but risk spurious
+     * IP5328 button clicks. That mechanism was removed (see Section 6/7 history) in favor of
+     * holding IP_EN HIGH unconditionally; the two deliberate KEY-press mechanisms above were
+     * added later, reusing the confirmed KEY behavior on purpose instead of trying to avoid it. */
+    if (ip_en_owner != IP_EN_OWNER_NONE)
         LL_GPIO_ResetOutputPin(GPIOA, IP_EN);
+    else
+        LL_GPIO_SetOutputPin(GPIOA, IP_EN);
     LL_GPIO_SetOutputPin(GPIOA, PWR_EN);
 }
 
@@ -1998,91 +2109,63 @@ static void Protection_ForceCutIfTimedOut(void)
     sys_state.pending_power_cut_start_ticks = 0;
 }
 
+/* CHARGER_STATE_FORCED_OFF_WINDOW and LEARNING_ACTIVE are kept as enum constants (their numeric
+ * values are part of the Factory Testing ABI, selector 0x01) but this state machine now never
+ * transitions into them: the measurement window they represented pulsed IP_EN LOW to try to
+ * disconnect the charger path for true-VBAT sampling, which datasheet review and a live current
+ * measurement both confirmed IP_EN cannot do (see UPSPlus_Behavior_Spec.md Section 9). charger_state
+ * is therefore only ever ABSENT or PRESENT now; sys->learning_mode (derived below, unchanged)
+ * consequently always reads LEARNING_INACTIVE. */
 static void ChargerStateMachine_Step(void)
 {
     uint32_t tick = sched_flags.tick_counter;
     uint16_t charger_mv = UpsChargerVoltageMv(&state);
 
-    if (sys_state.charger_state == CHARGER_STATE_FORCED_OFF_WINDOW)
+    if (adc_sample_seq != charger_physical.charger_last_seen_seq)
     {
-        uint32_t elapsed = tick - sys_state.charger_state_entry_ticks;
-        if (elapsed >= MEASUREMENT_WINDOW_TICKS)
+        charger_physical.charger_last_seen_seq = adc_sample_seq;
+        if (charger_mv > CHARGER_PRESENT_ON_MV)
+            charger_physical.charger_physically_present = 1;
+        else if (charger_mv < CHARGER_PRESENT_OFF_MV)
+            charger_physical.charger_physically_present = 0;
+
+        if (sys_state.charger_state == CHARGER_STATE_ABSENT)
         {
-            window_mgr.window_active = 0;
-            window_mgr.last_window_end_ticks = tick;
-            /* Unplug mid-window: decide PRESENT vs ABSENT from current voltage at window end.
-             * Hysteresis: ABSENT uses > ON_MV for detection; here >= OFF_MV = still present (no 1mV gap). */
-            if (charger_mv >= CHARGER_PRESENT_OFF_MV)
-                sys_state.charger_state = CHARGER_STATE_PRESENT;
-            else
-                sys_state.charger_state = CHARGER_STATE_ABSENT;
-            sys_state.charger_state_entry_ticks = tick;
-            /* Charger/window are runtime-only (B9); only flush if something else is dirty. */
-            MustRefreshVDD = 1;
-            if (flash_dirty)
-                RequestFlashSave(0, 0);
-        }
-    }
-    else
-    {
-        if (adc_sample_seq != charger_physical.charger_last_seen_seq)
-        {
-            charger_physical.charger_last_seen_seq = adc_sample_seq;
             if (charger_mv > CHARGER_PRESENT_ON_MV)
-                charger_physical.charger_physically_present = 1;
-            else if (charger_mv < CHARGER_PRESENT_OFF_MV)
-                charger_physical.charger_physically_present = 0;
-
-            if (sys_state.charger_state == CHARGER_STATE_ABSENT)
             {
-                if (charger_mv > CHARGER_PRESENT_ON_MV)
+                charger_physical.charger_stability_count++;
+                if (charger_physical.charger_stability_count >= CHARGER_STABILITY_SAMPLES)
                 {
-                    charger_physical.charger_stability_count++;
-                    if (charger_physical.charger_stability_count >= CHARGER_STABILITY_SAMPLES)
-                    {
-                        sys_state.charger_state = CHARGER_STATE_PRESENT;
-                        sys_state.charger_state_entry_ticks = tick;
-                        charger_physical.charger_stability_count = 0;
-                        charger_physical.charger_physically_present = 1;
-                    }
-                }
-                else
+                    sys_state.charger_state = CHARGER_STATE_PRESENT;
+                    sys_state.charger_state_entry_ticks = tick;
                     charger_physical.charger_stability_count = 0;
+                    charger_physical.charger_physically_present = 1;
+                    /* Section 9.1: (re)arm the periodic-reset elapsed-charging baseline. */
+                    ip5328_reset_baseline_sec = state.charging_time_sec;
+                }
             }
-            else if (sys_state.charger_state == CHARGER_STATE_PRESENT)
+            else
+                charger_physical.charger_stability_count = 0;
+        }
+        else if (sys_state.charger_state == CHARGER_STATE_PRESENT)
+        {
+            if (charger_mv < CHARGER_PRESENT_OFF_MV)
             {
-                if (charger_mv < CHARGER_PRESENT_OFF_MV)
+                charger_physical.charger_stability_count++;
+                if (charger_physical.charger_stability_count >= CHARGER_STABILITY_SAMPLES)
                 {
-                    charger_physical.charger_stability_count++;
-                    if (charger_physical.charger_stability_count >= CHARGER_STABILITY_SAMPLES)
-                    {
-                        sys_state.charger_state = CHARGER_STATE_ABSENT;
-                        sys_state.charger_state_entry_ticks = tick;
-                        charger_physical.charger_stability_count = 0;
-                        charger_physical.charger_physically_present = 0;
-                    }
-                }
-                else
+                    sys_state.charger_state = CHARGER_STATE_ABSENT;
+                    sys_state.charger_state_entry_ticks = tick;
                     charger_physical.charger_stability_count = 0;
+                    charger_physical.charger_physically_present = 0;
+                    /* Section 9.1: cancel countdown, no partial credit into the next session.
+                     * A reset that became due but hadn't yet fired through arbitration is
+                     * dropped too -- it can only be initiated while charger_state == PRESENT. */
+                    ip5328_reset_pending = 0;
+                }
             }
-        }
-
-        if (sys_state.charger_state == CHARGER_STATE_PRESENT && !window_mgr.window_active)
-        {
-            uint32_t elapsed_since = tick - window_mgr.last_window_end_ticks;
-            uint32_t period_ticks = SAMPLE_PERIOD_TICKS_PER_MIN * (uint32_t)state.sample_period_minutes;
-            if (elapsed_since >= period_ticks)
-                window_mgr.window_due = 1;
-        }
-
-        if (sys_state.charger_state == CHARGER_STATE_PRESENT && window_mgr.window_due && !window_mgr.window_active)
-        {
-            sys_state.charger_state = CHARGER_STATE_FORCED_OFF_WINDOW;
-            sys_state.charger_state_entry_ticks = tick;
-            window_mgr.window_due = 0;
-            window_mgr.window_active = 1;
-            window_mgr.window_start_ticks = tick;
-            charger_physical.charger_stability_count = 0;  /* Defensive cleanup on window entry */
+            else
+                charger_physical.charger_stability_count = 0;
         }
     }
 
@@ -2188,55 +2271,97 @@ static void CurrentAge_Tick10ms(void)
     state.battery_current_valid =
         (((uint32_t)state.battery_current_age_10ms) <= CURRENT_VALID_AGE_TICKS) ? 1u : 0u;
 
-    /* Empty learning condition (3): output-current validity loss while RPi is on.
-     * Intended to catch abrupt brownouts where the Pi dies before current drops to ~0.
-     * Problem: validity also expires ~2s after any I2C polling gap (no master activity
-     * → INA guard blocks reads → age exceeds CURRENT_VALID_AGE_SEC). An immediate commit
-     * on each validity-loss transition would fire on every script run, committing a
-     * non-minimum value from a short fresh-session window.
-     * Fix: debounce — start a timer on validity loss; commit only after
-     * EMPTY_LEARN_BROWNOUT_HOLD_TICKS of sustained validity loss. Cancel if validity
-     * is restored before the hold expires (polling gap case). A genuine brownout results
-     * in no further I2C activity, so the hold fires and commits correctly.
-     * reset_min=0: preserve tracking across validity gaps so the accumulated minimum
-     * is not discarded on transient gaps. Conditions (1)/(2) use reset_min=1. */
-    if (state.battery_params_self_programmed == 0 &&
-        sys_state.power_state == POWER_STATE_RPI_ON)
-    {
-        if (prev_output_valid && !state.output_current_valid &&
-            min_vbat_while_load_on_mv != 0xFFFFu)
-        {
-            /* Validity just dropped — start brownout debounce */
-            empty_learn_brownout_tick = sched_flags.tick_counter;
-        }
-        else if (state.output_current_valid)
-        {
-            /* Validity restored — cancel debounce (was a polling gap, not a brownout) */
-            empty_learn_brownout_tick = 0u;
-        }
-        else if (empty_learn_brownout_tick != 0u &&
-                 (sched_flags.tick_counter - empty_learn_brownout_tick) >= EMPTY_LEARN_BROWNOUT_HOLD_TICKS)
-        {
-            /* Sustained validity loss — likely a real brownout; commit and clear */
-            EmptyLearn_CommitTrackedMin(1, 0);
-            empty_learn_brownout_tick = 0u;
-        }
-    }
-    else
-    {
-        empty_learn_brownout_tick = 0u;
-    }
+    /* Empty-learning brownout detection (formerly "condition (3)") was removed: it inferred a
+     * dead Pi from output-current validity loss and/or I2C master silence, but neither signal
+     * actually indicates that. Validity loss usually means the bus is busy (a live master is
+     * actively transacting). I2C silence alone is also unsafe: it's indistinguishable from
+     * "NUT isn't running" while the Pi is otherwise perfectly healthy. The one signal that
+     * actually reflects whether the Pi has lost power is the measured output current itself,
+     * which condition (1) (`load_off`, below) already uses directly — and now that
+     * I2C_STOP_SETTLE_TICKS lets the INA219 probe get prompt, valid readings regardless of
+     * whether NUT is polling, condition (1) alone is sufficient: a live-but-NUT-less Pi reads
+     * back normal current (no false trigger); a genuinely dead Pi reads back near-zero current
+     * (correctly triggers). */
 
     if (state.output_current_valid != prev_output_valid ||
         state.battery_current_valid != prev_battery_valid)
         Snapshot_UpdateDerived();
 }
 
+/**
+ * Section 9.2 periodic auto-trigger: while genuinely discharging (RPI_ON && charger ABSENT),
+ * automatically request a battery-level LED check every sample_period_minutes, in addition to
+ * the manual button trigger in Button_DispatchActions(). Both routes funnel into the same
+ * led_check_requested flag and share the same arbitration/hold mechanism, so an automatic and a
+ * manual request can never interleave.
+ */
+static void LedCheckPeriodic_OnTick1s(void)
+{
+    uint8_t active = (sys_state.power_state == POWER_STATE_RPI_ON &&
+                       sys_state.charger_state == CHARGER_STATE_ABSENT);
+
+    if (active && !led_check_periodic_active_prev)
+    {
+        /* Just started discharging on battery: begin a fresh interval (no partial credit from
+         * a prior charging/off session, mirroring Section 9.1's baseline semantics). */
+        led_check_periodic_remaining_sec = (uint32_t)state.sample_period_minutes * 60u;
+    }
+    led_check_periodic_active_prev = active;
+
+    if (!active)
+        return;
+
+    if (led_check_periodic_remaining_sec > 0u)
+        led_check_periodic_remaining_sec--;
+    if (led_check_periodic_remaining_sec == 0u)
+    {
+        led_check_requested = 1u;
+        led_check_periodic_remaining_sec = (uint32_t)state.sample_period_minutes * 60u;
+    }
+}
+
+/**
+ * Section 9.3 IP_EN arbitration: single shared ownership so the Section 9.1 periodic reset and
+ * Section 9.2 battery-level LED check pulses cannot interleave or corrupt each other's hold
+ * timing. A due periodic reset always proceeds as soon as IP_EN frees (never postponed by a
+ * nuisance button press); a concurrent LED-check request is dropped, not queued, if IP_EN is
+ * already busy -- a missed LED check is harmless and the user can just press again.
+ */
+static void IPEnArbitration_Tick10ms(void)
+{
+    uint32_t now = sched_flags.tick_counter;
+
+    if (ip_en_owner != IP_EN_OWNER_NONE && (int32_t)(now - ip_en_release_tick) >= 0)
+        ip_en_owner = IP_EN_OWNER_NONE;
+
+    if (ip5328_reset_pending && ip_en_owner == IP_EN_OWNER_NONE &&
+        sys_state.charger_state == CHARGER_STATE_PRESENT)
+    {
+        ip_en_owner = IP_EN_OWNER_PERIODIC_RESET;
+        ip_en_release_tick = now + IP5328_RESET_HOLD_TICKS;
+        ip5328_reset_pending = 0;
+        if (ip5328_reset_pulse_count < 255u)
+            ip5328_reset_pulse_count++;
+    }
+
+    if (led_check_requested)
+    {
+        led_check_requested = 0;  /* Consumed either way; dropped (not queued) if IP_EN is busy */
+        if (ip_en_owner == IP_EN_OWNER_NONE)
+        {
+            ip_en_owner = IP_EN_OWNER_LED_CHECK;
+            ip_en_release_tick = now + KEY_LED_CHECK_HOLD_TICKS;
+        }
+    }
+}
+
 static void Scheduler_Tick10ms(void)
 {
     PowerStateMachine_Step();
     ChargerStateMachine_Step();
-    /* Single place for GPIO: reflects power state and charger state after both FSM steps */
+    IPEnArbitration_Tick10ms();
+    /* Single place for GPIO: reflects power state, charger state, and IP_EN ownership after
+     * all three of the above */
     ApplyGPIOFromState();
 
     /* Button handling (tick_10ms) */
@@ -2361,11 +2486,10 @@ static void Button_DispatchActions(void)
     if (button_handler.pending_click == BUTTON_CLICK_SHORT)
     {
         if (sys_state.power_state == POWER_STATE_RPI_OFF ||
-            sys_state.power_state == POWER_STATE_PROTECTION_LATCHED)
+            sys_state.power_state == POWER_STATE_PROTECTION_LATCHED ||
+            sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
         {
             uint8_t allow_power_on = 1;
-            if (Charger_IsInfluencingVBAT(&sys_state) && !IsTrueVbatUsableForDecision())
-                allow_power_on = 0;
             if (state.battery_voltage_mv <= state.protection_voltage_mv)
                 allow_power_on = 0;
             if (allow_power_on)
@@ -2379,6 +2503,15 @@ static void Button_DispatchActions(void)
                 BootBackoff_OnPowerOn();
                 Snapshot_UpdateDerived();
             }
+        }
+        else if (sys_state.power_state == POWER_STATE_RPI_ON &&
+                 sys_state.charger_state == CHARGER_STATE_ABSENT)
+        {
+            /* Section 9.2: battery-level LED check. No-op while charger PRESENT (LEDs already
+             * visible via IP5328's own charging-mode display) -- that case simply isn't matched
+             * here. Arbitrated (may be dropped if IP_EN is already busy) in
+             * IPEnArbitration_Tick10ms(). */
+            led_check_requested = 1u;
         }
     }
     else if (button_handler.pending_click == BUTTON_CLICK_LONG)
@@ -2488,7 +2621,12 @@ static void MX_ADC_Init(void)
 
     LL_DMA_SetDataTransferDirection(DMA1, LL_DMA_CHANNEL_1, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
     LL_DMA_SetChannelPriorityLevel(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PRIORITY_LOW);
-    LL_DMA_SetMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MODE_CIRCULAR);
+    /* NORMAL (one-shot), not CIRCULAR: pairs with the ADC's DMATransfer=LIMITED
+     * per the reference manual (CIRC=1 with DMACFG=0 is a documented-prohibited
+     * combination, and is suspected to be the root cause of the ADEN/ADSTART
+     * deadlock this part has hit). Re-armed explicitly each cycle in the
+     * tick_500ms handler alongside LL_ADC_REG_StartConversion(). */
+    LL_DMA_SetMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MODE_NORMAL);
     LL_DMA_SetPeriphIncMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PERIPH_NOINCREMENT);
     LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MEMORY_INCREMENT);
     LL_DMA_SetPeriphSize(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PDATAALIGN_HALFWORD);

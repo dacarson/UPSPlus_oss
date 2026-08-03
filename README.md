@@ -1,4 +1,7 @@
 # UPSPlus Open Source Firmware
+[![License: MIT](https://img.shields.io/github/license/dacarson/UPSPlus_oss)](LICENSE)
+[![Version](https://img.shields.io/github/v/release/dacarson/UPSPlus_oss)](https://github.com/dacarson/UPSPlus_oss/releases)
+[![Downloads](https://img.shields.io/github/downloads/dacarson/UPSPlus_oss/total)](https://github.com/dacarson/UPSPlus_oss/releases)
 
 Open-source firmware for the UPSPlus uninterruptible power supply (UPS) module (EP-0136) designed for Raspberry Pi. [The device has been declared as EOL](https://github.com/geeekpi/upsplus/blob/main/firmware/README.md).
 
@@ -17,12 +20,15 @@ Open-source firmware for the UPSPlus uninterruptible power supply (UPS) module (
 - Output current reporting via I2C (no separate bus reads required).
 - Factory testing pages for diagnostics.
 - OTA firmware update support (see [Firmware Update](#firmware-update-ota---legacy-bootloader)).
+- Periodic IP5328 reset while charging, to avoid a rare charger-stall condition (see [IP5328 Periodic Reset](#ip5328-periodic-reset)).
+- On-demand and periodic battery-level LED indication while running on battery (see [Battery-Level LED Check](#battery-level-led-check)).
 
 ## Button Behavior
 
 - The Func Key button is debounced at 50 ms.
-- If the load is off, a short press powers on the load when conditions are safe (sufficient battery charge).
-- If the load is on, a short press has no action.
+- If the load is off (or waiting on the load-on delay), a short press powers on the load when conditions are safe (sufficient battery charge), skipping the remaining delay if one is in progress.
+- If the load is on and running from the charger, a short press has no action (the charger's own LED display is already showing).
+- If the load is on and running from the battery (charger unplugged), a short press lights the battery-level LEDs for a while — see [Battery-Level LED Check](#battery-level-led-check).
 - Long press (>= 10 s) when the load is on: powers off.
 - Long press (>= 10 s) when the load is off: triggers a factory reset.
 
@@ -42,6 +48,21 @@ The firmware learns your battery's actual full and empty voltages from real use,
 **Note:** 18650 batteries can safely discharge to ~2.75 V, but at that level they can no longer supply enough power for the Raspberry Pi's 5 V rail. Empty is typically learned around 3 V.
 
 Learned values are used for battery percentage and protection. You can read or override them via registers `0x0D–0x0E` (full) and `0x0F–0x10` (empty). Write `1` to register `0x2A` to disable self-programming and keep manual values.
+
+## Battery-Level LED Check
+
+The UPSPlus's onboard battery-level LED bar is driven natively by the IP5328 power chip. While a charger is connected, IP5328 lights the bar automatically to show charge progress. While running on battery alone, the bar is normally off — the firmware can ask the chip to light it briefly in two ways:
+
+- **On demand:** a short press of the Func Key button while the load is on and the charger is unplugged.
+- **Periodically:** automatically, once every `sample_period_minutes` (register `0x15–0x16`, default and minimum 2 minutes, maximum 1440 minutes/24 hours) — so a glance at the unit shows a recent battery level without needing to press anything.
+
+Either trigger lights the LED bar for roughly 16–32 seconds, after which it turns off on its own (no button sequence needed to clear it). Both triggers are no-ops while a charger is connected, since the LED bar is already showing charge status in that case. The periodic timer only runs while genuinely on battery power with the load on; it pauses (without losing its place) whenever the charger is connected or the load is off, and restarts a fresh interval the next time both conditions are met again.
+
+## IP5328 Periodic Reset
+
+The IP5328 chip has an internal charge safety timer that, on rare occasions with this board's wiring, can fail to reset itself once a charge cycle finishes — leaving the charger connected but silently no longer charging. To guard against this, the firmware resets the IP5328 chip every 20 hours while a charger has been continuously connected. The reset is quick (about 10 seconds) and does not power-cycle the Raspberry Pi; you may briefly see the battery-level LEDs glitch or blink during the reset — this is expected and stops as soon as the reset completes.
+
+While the reset is in progress, register `0x17` bit1 reads `1` (it reads `0` the rest of the time, including during a battery-level LED check). You may also see `battery_current` (register `0x30–0x31`) briefly read as a discharge value during the reset, even though the charger is still connected — the reset can momentarily interrupt the chip's internal charge path, so the Raspberry Pi's power draw is briefly sourced from the battery instead. This reading is real, not a fault or a stale sample, and bit1 lets anything monitoring battery current attribute the blip to the reset rather than an actual loss of charging.
 
 ## Firmware Update (OTA - Legacy Bootloader)
 
@@ -82,8 +103,8 @@ I2C address: `0x17` on bus `1` (Raspberry Pi default). Multi-byte registers are 
 | `0x0F–0x10` | Empty voltage (mV) | RW | 3000 |
 | `0x11–0x12` | Protection voltage (mV) | RW | 2800 |
 | `0x13–0x14` | Battery percent (LSB=percent, MSB=0x00) | RO | - |
-| `0x15–0x16` | Sample period minutes | RW | 2 |
-| `0x17` | Power status (bit0=power, bit1=calibration window active) | RO | - |
+| `0x15–0x16` | Battery-level LED check interval, minutes (see [Battery-Level LED Check](#battery-level-led-check)) | RW | 2 |
+| `0x17` | Power status (bit0=power; bit1=IP5328 reset in progress, see [IP5328 Periodic Reset](#ip5328-periodic-reset)) | RO | - |
 | `0x18` | Shutdown countdown seconds | RW | 0 |
 | `0x19` | Auto power on (0/1) | RW | 0 |
 | `0x1A` | Restart countdown seconds | RW | 0 |
@@ -112,7 +133,7 @@ I2C address: `0x17` on bus `1` (Raspberry Pi default). Multi-byte registers are 
 ## NUT Driver
 
 A pre-built Linux NUT driver for UPSPlus is available here:
-https://github.com/dacarson/nut/releases/tag/v2.8.2-upsplus
+[https://github.com/dacarson/nut/releases/tag/v2.8.5-upsplus](https://github.com/dacarson/nut/releases/tag/v2.8.5-upsplus)
 
 ## License
 

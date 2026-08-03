@@ -68,7 +68,15 @@ extern "C" {
 /* Voltage Limits */
 /* Note: VBAT_MIN_VALID_MV applied in ADC_ProcessSample() before updating authoritative_state.battery_voltage_mv */
 #define VBAT_MIN_VALID_MV             1000    /* Minimum valid battery voltage reading (ADC sanity filter) */
-#define VBAT_PROTECT_MIN_MV           2800    /* Minimum allowed protection voltage */
+/* VBAT_PROTECT_MIN_MV is grounded in a live measurement (UPSPlus_Hardware_Chips.md "Known
+ * Issues"): during a real low-battery event, the IP5328 cuts power to the STM32 itself (and
+ * therefore the I2C bus/telemetry) at ~2.51V, *before* it cuts power to the RPi. Protection must
+ * trip and finish executing (3-sample ADC debounce, ~1.5s at the 500ms cadence, then a flash
+ * write) while the STM32 still has power, so this floor must stay above that collapse point with
+ * enough margin to cover that reaction time; 2.6V provides ~90mV of headroom above the measured
+ * 2.51V floor. This only lowers how low a user can *configure* protection_voltage_mv --
+ * DEFAULT_VBAT_PROTECT_MV (2800mV) is unchanged and still provides the wider out-of-box margin. */
+#define VBAT_PROTECT_MIN_MV           2600    /* Minimum allowed protection voltage; see rationale above */
 #define VBAT_PROTECT_MAX_MV           4500    /* Maximum allowed protection voltage */
 #define VBAT_FULL_MAX_MV              4500    /* Maximum allowed full voltage */
 #define VBAT_EMPTY_MAX_MV             4500    /* Maximum allowed empty voltage */
@@ -76,10 +84,6 @@ extern "C" {
 #define EMPTY_LEARN_OUTPUT_CURRENT_THRESHOLD_MA  25   /* |output_current_mA| <= this => load off (mA) */
 /* Empty learning: require load_off sustained this long (10ms ticks) before committing on load-off; avoids committing on single-sample current glitches */
 #define EMPTY_LEARN_LOAD_OFF_HOLD_TICKS          ((uint32_t)(3u * TICKS_PER_1S))   /* 3 seconds */
-/* Empty learning (condition 3): validity must remain lost this long before committing.
- * Filters polling gaps (validity expires ~2s after last I2C activity) from genuine brownouts.
- * If I2C resumes before this expires, the debounce is cancelled. */
-#define EMPTY_LEARN_BROWNOUT_HOLD_TICKS          ((uint32_t)(30u * TICKS_PER_1S))  /* 30 seconds */
 /* Empty learning: do not commit if min is this close to full (avoids corrupting empty after I2C failure while battery near full) */
 #define EMPTY_LEARN_MIN_MEANINGFUL_DISCHARGE_MV 300u
 /* Empty learning: persist only if change >= this and at most once per discharge session */
@@ -150,7 +154,6 @@ extern "C" {
 #define TICKS_PER_100MS               (100 / TICK_PERIOD_MS)      /* Ticks per 100ms */
 #define TICKS_PER_500MS               (500 / TICK_PERIOD_MS)      /* Ticks per 500ms (ADC trigger) */
 #define TICKS_PER_1S                  (1000 / TICK_PERIOD_MS)    /* Ticks per second */
-#define MEASUREMENT_WINDOW_TICKS      (1500 / TICK_PERIOD_MS)    /* 1.5 seconds measurement window */
 #define BUTTON_DEBOUNCE_TICKS         (50 / TICK_PERIOD_MS)      /* 50ms debounce */
 /* Note: >= BUTTON_LONG_PRESS_TICKS (exactly 10s) counts as long press per plan boundary */
 #define BUTTON_LONG_PRESS_TICKS       (10000 / TICK_PERIOD_MS)   /* 10 seconds for long press */
@@ -160,6 +163,22 @@ extern "C" {
 #define BOOT_BROWNOUT_WINDOW_TICKS    (BOOT_BROWNOUT_WINDOW_MINUTES * 60u * TICKS_PER_1S)
 #define BOOT_BACKOFF_INCREMENT_SEC    60u
 #define BOOT_BACKOFF_MAX_SEC          3600u
+
+/* Section 9.1 (behavior spec): periodic IP5328 reset, avoids the chip's own TEND charge
+ * safety-timer fault. The 20h elapsed-time basis reuses the existing cumulative
+ * "seconds spent charging" counter (charging_time_sec, register 0x20-0x23) rather than a
+ * separate countdown: both only advance while charger_state == PRESENT (see
+ * Charger_IsInfluencingVBAT), so a baseline snapshot of charging_time_sec taken at each
+ * ABSENT->PRESENT transition, compared against its current value, is equivalent to a dedicated
+ * per-session countdown without duplicating the increment logic. */
+#define IP5328_RESET_PERIOD_SEC       (20u * 3600u)   /* 20 hours; TEND datasheet minimum */
+#define IP5328_RESET_HOLD_MS          10500u          /* 10s datasheet min for full reset + 500ms margin */
+#define IP5328_RESET_HOLD_TICKS       ((uint32_t)(IP5328_RESET_HOLD_MS / TICK_PERIOD_MS))
+
+/* Section 9.2 (behavior spec): battery-level LED check, a short KEY (IP_EN) press while
+ * discharging that reuses IP5328's own native discharge-mode LED display. */
+#define KEY_LED_CHECK_HOLD_MS         200u    /* Inside datasheet's 60ms-2s short-press window */
+#define KEY_LED_CHECK_HOLD_TICKS      ((uint32_t)(KEY_LED_CHECK_HOLD_MS / TICK_PERIOD_MS))
 
 /* Compile-time guards: TICK_PERIOD_MS must divide 100/500/1000 cleanly for derived tick constants */
 STATIC_ASSERT((100 % TICK_PERIOD_MS) == 0, "TICK_PERIOD_MS must divide 100");
@@ -184,11 +203,6 @@ STATIC_ASSERT((PLATEAU_WINDOW_SEC % PLATEAU_EVAL_PERIOD_SEC) == 0,
 
 /* Flash Page Size - STM32F030F4Px uses 1KB pages */
 #define FLASH_PAGE_SIZE               1024
-
-/* True-VBAT Staleness (timing uses canonical 10ms tick - see TICK_PERIOD_MS block) */
-#define TRUE_VBAT_MAX_AGE_SEC         600     /* 10 minutes max staleness */
-/* Explicit uint32_t for overflow safety; use UINT32_C for literal if needed in expressions */
-#define TRUE_VBAT_MAX_AGE_TICKS       ((uint32_t)((uint32_t)(TRUE_VBAT_MAX_AGE_SEC) * (uint32_t)(TICKS_PER_1S)))
 
 /* INA219 current validity */
 #define CURRENT_VALID_AGE_SEC         2u
@@ -218,21 +232,23 @@ typedef enum {
 } power_state_t;
 
 /**
- * @brief Charger State - Controls charger input (IP_EN pin)
- * 
+ * @brief Charger State - reflects charger presence detected from ADC voltage
+ *
  * Transitions:
  * - ABSENT -> PRESENT: Charger voltage > present_on threshold (with stability)
- * - PRESENT -> FORCED_OFF_WINDOW: Sample period elapsed
- * - FORCED_OFF_WINDOW -> PRESENT: 1.5s window elapsed
  * - PRESENT -> ABSENT: Charger voltage < present_off threshold (with stability)
- * 
- * Note: FORCED_OFF_WINDOW is the only state where charger may be physically
- * connected (VBUS high) while IP_EN is LOW, enabling true VBAT measurement.
+ *
+ * CHARGER_STATE_FORCED_OFF_WINDOW is never entered by the current state machine. It
+ * represented a periodic 1.5s pulse of IP_EN LOW, intended to disconnect the charger path for
+ * true-VBAT sampling; datasheet review and a live current measurement both confirmed IP_EN
+ * cannot gate the charge path (it is the IP5328's KEY pin -- see UPSPlus_Behavior_Spec.md
+ * Section 9), so that mechanism was removed. The enum value is kept, unreachable, because it
+ * is part of the Factory Testing ABI (selector 0x01, Section 12) alongside LEARNING_ACTIVE.
  */
 typedef enum {
-    CHARGER_STATE_ABSENT = 0,          /* Charger not connected (IP_EN = LOW) */
-    CHARGER_STATE_PRESENT,             /* Charger connected and enabled (IP_EN = HIGH) */
-    CHARGER_STATE_FORCED_OFF_WINDOW    /* Measurement window active (IP_EN = LOW for 1.5s) */
+    CHARGER_STATE_ABSENT = 0,          /* Charger not connected (IP_EN = HIGH; nothing to gate) */
+    CHARGER_STATE_PRESENT,             /* Charger connected (IP_EN = HIGH) */
+    CHARGER_STATE_FORCED_OFF_WINDOW    /* Unreachable; kept for ABI stability only, see above */
 } charger_state_t;
 
 /**
@@ -276,11 +292,10 @@ typedef enum {
 
 /**
  * @brief Charger Physical Detection State
- * 
- * Tracks physical charger presence (VBUS/USBIN voltage) separately from
- * charger_state_t (which includes path control). This enables "unplug mid-window
- * completes window" behavior - physical presence is tracked independently.
- * 
+ *
+ * Tracks physical charger presence (VBUS/USBIN voltage) separately from charger_state_t,
+ * which just reflects debounced ABSENT/PRESENT.
+ *
  * Detection Algorithm (must be implemented per these rules):
  * 1. Use MAX(usbc_voltage_mv, microusb_voltage_mv) as charger voltage
  * 2. Stability counting MUST gate on adc_sample_seq: only increment charger_stability_count
@@ -289,12 +304,11 @@ typedef enum {
  * 4. Require CHARGER_STABILITY_SAMPLES consecutive qualified samples before state change
  * 5. Reset semantics: If sample does not qualify for the current transition direction,
  *    stability_count resets to 0 (e.g., voltage below threshold when detecting, above when removing)
- * 
+ *
  * This is the ONLY module that owns charger stability counting. The charger FSM
  * (charger_state_t) consumes this physical detection result, not the stability counters.
- * Future risk: Charger FSM must consume only charger_physically_present and window
- * manager due/active timing. Do not add another stability counter or raw VBUS/USBIN
- * threshold checks in the charger FSM.
+ * Future risk: Charger FSM must consume only charger_physically_present. Do not add another
+ * stability counter or raw VBUS/USBIN threshold checks in the charger FSM.
  */
 typedef struct {
     /* Diagnostic only: not used for FSM decisions (stability + current charger_mv at window end drive state). */
@@ -304,44 +318,21 @@ typedef struct {
 } charger_physical_state_t;
 
 /**
- * @brief Measurement Window Manager State
- * 
- * Manages measurement window scheduling and timing, separate from charger_state_t
- * to maintain orthogonal state dimensions and prevent accidental coupling.
- * 
- * Atomic Window Contract:
- * - Windows are NEVER interruptible, NEVER nested, NEVER restarted early
- * - window_active explicitly indicates active window (avoids tick 0 ambiguity at boot)
- * - window_due MUST be cleared ONLY when transitioning into CHARGER_STATE_FORCED_OFF_WINDOW
- *   (prevents "window storm" - constantly reasserting "due" every 10ms)
- * - If charger unplugged mid-window, window completes full 1.5s timing
- * 
- * Invariant: window_active == 1 iff charger_state == CHARGER_STATE_FORCED_OFF_WINDOW
- * Ownership: Charger FSM owns setting both window_active and charger_state atomically
- * (single function must update both to maintain invariant).
- * Future risk: Enforce the invariant in exactly one place—the single function that
- * transitions into/out of FORCED_OFF_WINDOW. Do not set window_active or charger_state
- * separately elsewhere, or you will drift (e.g. window_active=1 but charger_state=PRESENT).
- */
-typedef struct {
-    uint8_t window_due;                 /* Set when sample period elapsed, cleared on window entry */
-    uint8_t window_active;               /* 1 = window currently active, 0 = inactive (invariant: matches charger_state) */
-    uint32_t last_window_end_ticks;    /* When last measurement window ended */
-    uint32_t window_start_ticks;        /* When current window started (only valid if window_active == 1) */
-} window_manager_state_t;
-
-/**
  * @brief Combined System State Machine Structure
- * 
+ *
  * Contains the three orthogonal state dimensions (power, charger, calibration flag)
- * plus their entry timing. Window management and physical charger detection
- * are separate structures to maintain clear separation of concerns.
- * 
+ * plus their entry timing. Physical charger detection is a separate structure to
+ * maintain clear separation of concerns.
+ *
  * Calibration Window Flag Contract:
  * - learning_mode is DERIVED-ONLY and must be recomputed from charger_state during state update
  * - learning_mode must NEVER be directly set from I2C writes
  * - Canonical source: charger_state == CHARGER_STATE_FORCED_OFF_WINDOW
  * - learning_mode == LEARNING_ACTIVE iff charger_state == CHARGER_STATE_FORCED_OFF_WINDOW
+ * - CHARGER_STATE_FORCED_OFF_WINDOW is never entered by the current state machine (the
+ *   measurement window it represented was removed -- IP_EN cannot gate the charge path, see
+ *   UPSPlus_Behavior_Spec.md Section 9), so learning_mode is always LEARNING_INACTIVE in
+ *   practice. Both enum constants are kept for Factory Testing ABI stability (Section 12).
  */
 typedef struct {
     /* State dimensions */
@@ -441,9 +432,7 @@ typedef struct {
      * This maintains single source of truth for semantics while matching register width.
      * Writer/compute logic MUST enforce 0-100 range. Snapshot/register mapping emits [percent, 0x00]. */
     uint8_t battery_percent;           /* 0x13-0x14: Published percentage (0-100), expanded to 16-bit in register */
-    /* Battery percent staleness: battery_percent is assumed fresh iff last_true_vbat_sample_tick is fresh.
-     * Power-on gating uses last_true_vbat_sample_tick exclusively (see IsTrueVbatSampleFresh()). */
-    
+
     /* Configuration (RW via I2C, persisted to flash) */
     uint16_t sample_period_minutes;    /* 0x15-0x16: Sample period (1-1440 min) */
     uint8_t shutdown_countdown_sec;    /* 0x18: Current countdown (0=inactive, 10-255) */
@@ -476,10 +465,6 @@ typedef struct {
     
     /* Snapshot timing */
     uint32_t snapshot_tick;            /* canonical 10 ms tick when snapshot was taken */
-    uint32_t last_true_vbat_sample_tick; /* Tick when last true-VBAT was captured.
-                                           * Must remain uint32_t; do not reintroduce 8-bit tick fields for staleness. */
-    uint16_t last_true_vbat_mv;        /* Cached true-VBAT (charger not influencing) for percent calc. */
-    uint16_t persisted_true_vbat_age_sec; /* Age at save time when loaded from flash; 0 = none. Used for freshness after reset. */
 } authoritative_state_t;
 
 /* Charger Voltage Helper - Locks MAX(VBUS, USBIN) rule in code.
@@ -548,8 +533,13 @@ typedef struct {
     uint8_t low_battery_percent;
     uint8_t reserved_padding0;         /* Alignment + deterministic CRC - MUST be zeroed */
     uint16_t load_on_delay_config_sec;
-    uint16_t last_true_vbat_mv;         /* True-VBAT at last sample (for crash recovery / auto power-on) */
-    uint16_t last_true_vbat_age_sec;    /* Age in seconds of sample at save time; 0 = no valid sample */
+    /* Reserved (unused): formerly true-VBAT-at-last-sample / its age. The true-VBAT-via-disconnect
+     * mechanism these backed has been removed (IP_EN cannot gate the charge path -- see
+     * UPSPlus_Behavior_Spec.md Section 9). Kept in place, always written 0, to preserve the flash
+     * record layout and the bootloader_ota_flag offset (FLASH_OTA_FLAG_OFFSET assert below) rather
+     * than resizing/reordering the struct. */
+    uint16_t reserved_last_true_vbat_mv;
+    uint16_t reserved_last_true_vbat_age_sec;
     uint8_t reserved_padding2[2];      /* Alignment + deterministic CRC - MUST be zeroed */
     /* Note: Provide FlashPersistentData_InitZero(&rec) helper to ensure
      * all reserved/padding fields are zeroed before CRC calculation. */
@@ -675,8 +665,6 @@ typedef struct {
  * multiple times per sample or on non-sample cycles. Every sample-qualified consumer
  * keeps its own last_seen_seq and gates on (adc_sample_seq != last_seen_seq).
  */
-/* ADC buffer size - must match ADC_CONVERTED_DATA_BUFFER_SIZE in main.c */
-/* Use guard to prevent redefinition if already defined elsewhere (e.g., CubeMX) */
 /* ADC Channel Ordering (verified from MX_ADC_Init sequence):
  * aADCxConvertedData[0] = Channel 0 (PIVCC)
  * aADCxConvertedData[1] = Channel 1 (VBAT)
@@ -685,8 +673,16 @@ typedef struct {
  * aADCxConvertedData[4] = TEMPSENSOR (Temperature)
  * aADCxConvertedData[5] = VREFINT (for VDD calibration)
  * Channel ordering must match existing MX_ADC_Init sequence; do not reorder. */
+/* Use guards to prevent redefinition if already defined elsewhere (e.g., CubeMX) */
+#ifndef ADC_CHANNEL_COUNT
+#define ADC_CHANNEL_COUNT 6
+#endif
+/* DMA runs one-shot (NORMAL mode, re-armed each cycle in the main loop) rather
+ * than circular/continuous: the ADC is only ever active for one 6-channel
+ * burst every 500ms, then idle, so the buffer is stable for the main loop to
+ * read directly the rest of that window -- no ping-pong/snapshot needed. */
 #ifndef ADC_CONVERTED_DATA_BUFFER_SIZE
-#define ADC_CONVERTED_DATA_BUFFER_SIZE 6
+#define ADC_CONVERTED_DATA_BUFFER_SIZE ADC_CHANNEL_COUNT
 #endif
 
 /* ADC flags and data - declared extern here, defined in main.c */
@@ -786,14 +782,22 @@ extern volatile uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]; /* 
  * Pin Characterization Truth Table
  * ================================
  * 
- * IP_EN (PA5) - Input Power Enable (Charger Gate)
+ * IP_EN (PA5) - physically the IP5328 KEY (button-detect) pin, confirmed against the
+ * datasheet AND a live current measurement -- see UPSPlus_Behavior_Spec.md Section 9 for
+ * the pin's click/hold timing table and the measurement. KEY has NO charge-gating function:
+ * per the datasheet it only controls the output boost stage (VOUT1/VOUT2/USB-C), the LED
+ * display, and WLED. A prior revision pulsed IP_EN LOW for 1.5s periodically
+ * (CHARGER_STATE_FORCED_OFF_WINDOW) trying to disconnect the charger path for true-VBAT
+ * sampling; a live measurement confirmed battery current was unaffected by the pulse, so
+ * that mechanism has been removed. IP_EN is now held HIGH unconditionally, regardless of
+ * charger_state.
  * -----------------------------------------------
  * | Charger State          | IP_EN | Description                    |
  * |------------------------|-------|--------------------------------|
- * | CHARGER_STATE_ABSENT   | LOW   | No charger, path disabled      |
- * | CHARGER_STATE_PRESENT  | HIGH  | Charger connected and enabled  |
- * | CHARGER_STATE_FORCED_OFF_WINDOW | LOW | Measurement window active |
- * 
+ * | CHARGER_STATE_ABSENT   | HIGH  | No charger; nothing to gate    |
+ * | CHARGER_STATE_PRESENT  | HIGH  | Charger connected             |
+ * | CHARGER_STATE_FORCED_OFF_WINDOW | (unreachable; kept for ABI, see enum comment) |
+ *
  * MT_EN (PA6) - RPi Power Enable
  * ------------------------------
  * | Power State                    | MT_EN | Description             |
@@ -827,9 +831,11 @@ extern volatile uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]; /* 
 /* State Machine */
 void StateMachine_Init(void);
 void StateMachine_Update(void);
-/* Register 0x17 derivation: depends on learning_mode (from charger_state) and power_state.
- * Contract: Do not trust state->learning_mode unless it was recomputed during StateMachine_Update();
- * learning_mode is derived-only from charger_state and must be kept in sync when reading power status. */
+/* Register 0x17 derivation: bit0 depends on power_state (RPi power); bit1 reports whether the
+ * Section 9.1 periodic IP5328 reset is currently in progress (main.c's ip_en_owner). Bit1 no
+ * longer depends on learning_mode -- see GetPowerStatusRegisterValue()'s definition in main.c for
+ * why (learning_mode remains declared, permanently LEARNING_INACTIVE, for Factory Testing ABI
+ * stability only -- selector 0x01 byte 3 -- and is not surfaced in this register anymore). */
 uint8_t GetPowerStatusRegisterValue(const authoritative_state_t *auth_state, const system_state_t *state);
 
 /* Snapshot Management */
@@ -871,20 +877,13 @@ void Charger_UpdatePhysicalPresence(const authoritative_state_t *state,
                                      charger_physical_state_t *physical_state);
 /* Updates physical_state->charger_physically_present, stability_count, last_seen_seq */
 
-/* Charger_IsInfluencingVBAT: Canonical true-VBAT gate.
- * Returns 1 if charger_state == CHARGER_STATE_PRESENT (charger path enabled, influencing VBAT).
- * Returns 0 if charger_state != PRESENT (true-VBAT can be measured).
- * This is the canonical true-VBAT gate: true-VBAT iff returns 0. */
+/* Charger_IsInfluencingVBAT: returns 1 if charger_state == CHARGER_STATE_PRESENT (charger path
+ * enabled, actively influencing the raw VBAT ADC reading), 0 otherwise. Used to gate percent
+ * update direction, empty-voltage learning, and Protection_Step's charging skip. There is no
+ * true-VBAT-via-disconnect mechanism (IP_EN cannot gate the charge path -- see
+ * UPSPlus_Behavior_Spec.md Section 9); consumers use the raw battery_voltage_mv directly in both
+ * the PRESENT and ABSENT cases. */
 uint8_t Charger_IsInfluencingVBAT(const system_state_t *state);
-/* Returns 1 if charger_state == CHARGER_STATE_PRESENT, 0 otherwise */
-
-/* True-VBAT freshness check - uses canonical 10 ms tick (10ms resolution) */
-/* Contract: Compares now_ticks against last_true_vbat_sample_tick and TRUE_VBAT_MAX_AGE_TICKS.
- * MUST use canonical 10 ms tick for freshness; MUST NOT use SysTick milliseconds.
- * Wraparound: (now_ticks - last_true_vbat_sample_tick) MUST be computed as unsigned (uint32_t)
- * so that modulo-2^32 subtraction yields correct age when tick_counter has wrapped. */
-uint8_t IsTrueVbatSampleFresh(uint32_t now_ticks, uint32_t last_true_vbat_sample_tick);
-/* Returns 1 if fresh, 0 if stale */
 
 #ifdef __cplusplus
 }

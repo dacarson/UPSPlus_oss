@@ -5,6 +5,23 @@
  * Reconstructed by disassembly of bootloader.bin (2048 bytes,
  * loaded at 0x08000000–0x080007FF).
  *
+ * This revision expresses the reconstruction in terms of the official
+ * ST CMSIS device header and HAL/LL drivers instead of hand-rolled
+ * peripheral register structs:
+ *   stm32f0xx.h                 – CMSIS GPIO/I2C/FLASH/RCC/NVIC definitions
+ *   stm32f0xx_ll_gpio.h          – pin mode/speed/pull/AF configuration
+ *   stm32f0xx_ll_i2c.h           – register-level slave I2C access
+ *   stm32f0xx_hal_flash.h/_ex.h  – unlock/lock/program/erase
+ *   stm32f0xx_hal_cortex.h       – NVIC priority/enable
+ *   stm32f0xx_hal_rcc.h          – __HAL_RCC_*_CLK_ENABLE() peripheral clocks
+ *
+ * Doing this against the real headers turned up one confirmed bug in the
+ * earlier hand-rolled reconstruction: I2C_ISR_DIR is bit 16 in the real
+ * ISR register, not bit 24. See the note in I2C1_IRQHandler() below.
+ *
+ * This file is a reference reconstruction, not a build target: it lives
+ * under documents/ and is not compiled as part of the CubeIDE project.
+ *
  * Confidence levels:
  *   HIGH  – logic verified directly from disassembly trace
  *   MED   – structure inferred; details may differ
@@ -27,6 +44,13 @@
  */
 
 #include <stdint.h>
+#include "stm32f0xx.h"
+#include "stm32f0xx_ll_gpio.h"
+#include "stm32f0xx_ll_i2c.h"
+#include "stm32f0xx_hal_flash.h"
+#include "stm32f0xx_hal_flash_ex.h"
+#include "stm32f0xx_hal_cortex.h"
+#include "stm32f0xx_hal_rcc.h"
 #include "stm32f030_periph.h"
 
 /* ------------------------------------------------------------------ */
@@ -68,131 +92,43 @@ static volatile uint8_t  *const i2c_reg_map =
 /* ------------------------------------------------------------------ */
 /*  Forward declarations                                               */
 /* ------------------------------------------------------------------ */
-static void     gpio_set_mode(GPIO_TypeDef *gpio, uint32_t pin_mask, uint32_t mode);
-static void     gpio_set_ospeedr(GPIO_TypeDef *gpio, uint32_t pin_mask, uint32_t speed);
-static void     gpio_set_pupdr(GPIO_TypeDef *gpio, uint32_t pin_mask, uint32_t pupd);
-static void     gpio_set_afr(GPIO_TypeDef *gpio, uint32_t pin_mask, uint32_t af);
-static void     rcc_enable_clock(uint32_t ahbenr_bit);
 static void     i2c1_gpio_init(void);
 static void     i2c1_peripheral_init(void);
 static void     i2c1_full_init(void);
 static void     load_settings_from_flash(void);
 static void     save_settings_to_flash(void);
-static void     flash_unlock(void);
 static void     flash_erase_app(void);
 static void     bootloader_main(void);
 void            I2C1_IRQHandler(void);
 int             main(void);
 
 /* ------------------------------------------------------------------ */
-/*  GPIO helpers  (0x0800031C / 0x08000300 / 0x08000330 / 0x08000344) */
-/*                                                                     */
-/*  All four helpers share the same "squared pin mask" trick:          */
-/*    pin_mask (single-bit) squared gives bit-0 of the 2-bit field.   */
-/*  Example: pin 6 → mask=0x40, mask²=0x1000 (bit 12 of MODER).      */
-/*                                                                     */
-/*  Confidence: HIGH – directly traced from disassembly.              */
-/* ------------------------------------------------------------------ */
-
-/** Set 2-bit MODER field for the pin described by pin_mask.         */
-static void gpio_set_mode(GPIO_TypeDef *gpio, uint32_t pin_mask, uint32_t mode)
-{
-    /* mask²   = bit-0 of 2-bit MODER field for this pin             */
-    /* 3×mask² = both bits of the 2-bit field (clear mask)           */
-    uint32_t sq   = pin_mask * pin_mask;
-    uint32_t bits = sq + 2U * sq;       /* = 3 * sq                  */
-    uint32_t val  = gpio->MODER;
-    val &= ~bits;
-    val |= sq * mode;
-    gpio->MODER = val;
-}
-
-/** Set 2-bit OSPEEDR field for the pin described by pin_mask.       */
-static void gpio_set_ospeedr(GPIO_TypeDef *gpio, uint32_t pin_mask, uint32_t speed)
-{
-    /* Note: disassembly at 0x8000300 first right-shifts pin_mask by 8
-     * before squaring, suggesting pin_mask here is the raw IDR bit
-     * shifted so its square falls in the correct OSPEEDR field.
-     * For pins 0–7 this matches; the GPIO_configure_pin wrapper
-     * accounts for the field width. (MED confidence on exact encoding) */
-    uint32_t p    = pin_mask >> 8U;
-    uint32_t sq   = p * p * p * p;      /* p^4 lands in OSPEEDR field */
-    uint32_t bits = sq + 2U * sq;
-    uint32_t val  = gpio->OSPEEDR;
-    val &= ~bits;
-    val |= sq * speed;
-    gpio->OSPEEDR = val;
-}
-
-/** Set 2-bit PUPDR field for the pin described by pin_mask.         */
-static void gpio_set_pupdr(GPIO_TypeDef *gpio, uint32_t pin_mask, uint32_t pupd)
-{
-    uint32_t sq   = pin_mask * pin_mask;
-    uint32_t bits = sq + 2U * sq;
-    uint32_t val  = gpio->PUPDR;
-    val &= ~bits;
-    val |= sq * pupd;
-    gpio->PUPDR = val;
-}
-
-/** Set 4-bit AFR field for the pin described by pin_mask.           */
-static void gpio_set_afr(GPIO_TypeDef *gpio, uint32_t pin_mask, uint32_t af)
-{
-    /* 4-bit AFR field: mask = 15 × sq, val = sq × af (MED) */
-    uint32_t sq   = pin_mask * pin_mask;
-    uint32_t bits = sq + 2U * sq;
-    /* Select AFRL vs AFRH based on whether pin is 0-7 or 8-15 */
-    volatile uint32_t *afr;
-    if (pin_mask <= (1U << 7)) {
-        afr = &gpio->AFR[0];
-    } else {
-        afr = &gpio->AFR[1];
-        sq >>= 16;              /* shift into AFRH field position    */
-        bits >>= 16;
-    }
-    uint32_t val = *afr;
-    val &= ~bits;
-    val |= sq * af;
-    *afr = val;
-}
-
-/* ------------------------------------------------------------------ */
-/*  RCC clock enable  (0x0800023C)                                    */
-/*                                                                     */
-/*  Writes bit to RCC->AHBENR and reads back.                          */
-/*  (Confidence: HIGH)                                                 */
-/* ------------------------------------------------------------------ */
-static void rcc_enable_clock(uint32_t ahbenr_bit)
-{
-    RCC->AHBENR |= ahbenr_bit;
-    (void)RCC->AHBENR;          /* read-back to ensure write completes */
-}
-
-/* ------------------------------------------------------------------ */
 /*  I2C1 GPIO init  (0x080003EC)                                       */
 /*                                                                     */
-/*  Configures PA9 (SCL) and PA10 (SDA) as AF open-drain.             */
-/*  Alternate function 1 (I2C1) on STM32F030F4P6.                     */
+/*  Configures PA9 (SCL) and PA10 (SDA) as AF open-drain, AF1 (I2C1).  */
+/*  The hand-rolled bit-twiddling helpers this reconstruction used to  */
+/*  have (gpio_set_mode/ospeedr/pupdr/afr) computed exactly the same   */
+/*  "pin-squared" MODER/OSPEEDR/PUPDR field math as LL_GPIO_SetPinMode /*
+/*  SetPinSpeed / SetPinPull, and the same pin^4 AFR math as           */
+/*  LL_GPIO_SetAFPin_8_15 — strong evidence the original firmware was  */
+/*  built against these LL_GPIO_* calls rather than raw MODIFY_REG.    */
 /*  (Confidence: HIGH for structure, MED for exact AF number)          */
 /* ------------------------------------------------------------------ */
 static void i2c1_gpio_init(void)
 {
-    const uint32_t scl_mask = (1U << GPIO_PIN_SCL);   /* PA9  = 0x200 */
-    const uint32_t sda_mask = (1U << GPIO_PIN_SDA);   /* PA10 = 0x400 */
+    /* SCL: AF mode, high speed, open-drain, no pull, AF1 (I2C1) */
+    LL_GPIO_SetPinMode(GPIOA, GPIO_PIN_SCL, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetPinSpeed(GPIOA, GPIO_PIN_SCL, LL_GPIO_SPEED_FREQ_HIGH);
+    LL_GPIO_SetAFPin_8_15(GPIOA, GPIO_PIN_SCL, LL_GPIO_AF_1);
+    LL_GPIO_SetPinOutputType(GPIOA, GPIO_PIN_SCL, LL_GPIO_OUTPUT_OPENDRAIN);
+    LL_GPIO_SetPinPull(GPIOA, GPIO_PIN_SCL, LL_GPIO_PULL_NO);
 
-    /* SCL: AF mode, high speed, no pull, open-drain, AF1 */
-    gpio_set_mode(GPIOA, scl_mask, GPIO_MODE_AF);
-    gpio_set_ospeedr(GPIOA, scl_mask, GPIO_SPEED_HIGH);
-    gpio_set_afr(GPIOA, scl_mask, GPIO_AF_I2C1);
-    GPIOA->OTYPER |=  scl_mask;        /* open-drain                  */
-    gpio_set_pupdr(GPIOA, scl_mask, GPIO_PUPD_NONE);
-
-    /* SDA: AF mode, high speed, no pull, open-drain, AF1 */
-    gpio_set_mode(GPIOA, sda_mask, GPIO_MODE_AF);
-    gpio_set_ospeedr(GPIOA, sda_mask, GPIO_SPEED_HIGH);
-    gpio_set_afr(GPIOA, sda_mask, GPIO_AF_I2C1);
-    GPIOA->OTYPER |=  sda_mask;
-    gpio_set_pupdr(GPIOA, sda_mask, GPIO_PUPD_NONE);
+    /* SDA: AF mode, high speed, open-drain, no pull, AF1 (I2C1) */
+    LL_GPIO_SetPinMode(GPIOA, GPIO_PIN_SDA, LL_GPIO_MODE_ALTERNATE);
+    LL_GPIO_SetPinSpeed(GPIOA, GPIO_PIN_SDA, LL_GPIO_SPEED_FREQ_HIGH);
+    LL_GPIO_SetAFPin_8_15(GPIOA, GPIO_PIN_SDA, LL_GPIO_AF_1);
+    LL_GPIO_SetPinOutputType(GPIOA, GPIO_PIN_SDA, LL_GPIO_OUTPUT_OPENDRAIN);
+    LL_GPIO_SetPinPull(GPIOA, GPIO_PIN_SDA, LL_GPIO_PULL_NO);
 }
 
 /* ------------------------------------------------------------------ */
@@ -206,36 +142,35 @@ static void i2c1_gpio_init(void)
 static void i2c1_peripheral_init(void)
 {
     /* Enable I2C1 clock on APB1 */
-    RCC->APB1ENR |= RCC_APB1ENR_I2C1EN;
-    (void)RCC->APB1ENR;
+    __HAL_RCC_I2C1_CLK_ENABLE();
 
     /* Select HSI as I2C1 clock source (clear I2C1SW in CFGR3) */
-    RCC->CFGR3 &= ~RCC_CFGR3_I2C1SW;
+    __HAL_RCC_I2C1_CONFIG(RCC_I2C1CLKSOURCE_HSI);
 
     /* Disable I2C1 to configure it */
-    I2C1->CR1 &= ~I2C_CR1_PE;
-
-    /* Wait for PE to clear */
-    while (I2C1->CR1 & I2C_CR1_PE) {}
+    LL_I2C_Disable(I2C1);
+    while (LL_I2C_IsEnabled(I2C1)) {}
 
     /* Apply timing: 100 kHz at 48 MHz */
-    I2C1->TIMINGR = I2C_TIMINGR_100KHZ;
+    LL_I2C_SetTiming(I2C1, I2C_TIMINGR_100KHZ);
 
     /* Configure own address 1: 7-bit, address = 0x18, enable */
-    I2C1->OAR1 = (BOOTLOADER_I2C_ADDR << 1) | I2C_OAR1_OA1EN;
+    LL_I2C_SetOwnAddress1(I2C1, (BOOTLOADER_I2C_ADDR << 1), LL_I2C_OWNADDRESS1_7BIT);
+    LL_I2C_EnableOwnAddress1(I2C1);
 
     /* Enable interrupts: ADDRIE, RXIE, TXIE, STOPIE */
-    I2C1->CR1 |= I2C_CR1_ADDRIE | I2C_CR1_RXIE | I2C_CR1_TXIE | I2C_CR1_STOPIE;
+    LL_I2C_EnableIT_ADDR(I2C1);
+    LL_I2C_EnableIT_RX(I2C1);
+    LL_I2C_EnableIT_TX(I2C1);
+    LL_I2C_EnableIT_STOP(I2C1);
 
     /* Enable I2C1 */
-    I2C1->CR1 |= I2C_CR1_PE;
+    LL_I2C_Enable(I2C1);
 
-    /* Configure NVIC: enable IRQ23 (I2C1) */
-    *NVIC_ISER0 = NVIC_ISER_I2C1;
-
-    /* Set I2C1 interrupt priority in NVIC_IPR5
-     * (IPR5 covers IRQs 20-23; I2C1=IRQ23 is in bits[31:24]) */
-    *NVIC_IPR5 |= (0x80U << 24);   /* medium priority (MED confidence) */
+    /* NVIC: enable IRQ23 (I2C1) at medium priority (0x80 in the original
+     * 8-bit NVIC_IPR5 field == priority level 2 of 0-3 on Cortex-M0). */
+    HAL_NVIC_SetPriority(I2C1_IRQn, 2U, 0U);
+    HAL_NVIC_EnableIRQ(I2C1_IRQn);
 }
 
 /* ------------------------------------------------------------------ */
@@ -248,24 +183,24 @@ static void i2c1_peripheral_init(void)
 static void i2c1_full_init(void)
 {
     /* Enable GPIO clocks */
-    rcc_enable_clock(RCC_AHBENR_IOPAEN);
-    rcc_enable_clock(RCC_AHBENR_IOPBEN);
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
 
     /* PA6 (MT_EN): drive LOW initially (RPi power off during boot)   */
-    GPIOA->BRR = (1U << GPIO_PIN_MT_EN);
+    LL_GPIO_ResetOutputPin(GPIOA, GPIO_PIN_MT_EN);
 
     /* PA7 (PWR_EN): drive HIGH immediately (keep MCU powered)        */
-    GPIOA->BSRR = (1U << GPIO_PIN_PWR_EN);
+    LL_GPIO_SetOutputPin(GPIOA, GPIO_PIN_PWR_EN);
 
     /* PB1 (force-boot button): input, no pull                        */
-    gpio_set_mode(GPIOB, (1U << GPIO_PIN_BOOT_BTN), GPIO_MODE_INPUT);
-    gpio_set_pupdr(GPIOB, (1U << GPIO_PIN_BOOT_BTN), GPIO_PUPD_NONE);
+    LL_GPIO_SetPinMode(GPIOB, GPIO_PIN_BOOT_BTN, LL_GPIO_MODE_INPUT);
+    LL_GPIO_SetPinPull(GPIOB, GPIO_PIN_BOOT_BTN, LL_GPIO_PULL_NO);
 
     /* PA6 (MT_EN): output push-pull                                  */
-    gpio_set_mode(GPIOA, (1U << GPIO_PIN_MT_EN), GPIO_MODE_OUTPUT);
+    LL_GPIO_SetPinMode(GPIOA, GPIO_PIN_MT_EN, LL_GPIO_MODE_OUTPUT);
 
     /* PA7 (PWR_EN): output push-pull                                 */
-    gpio_set_mode(GPIOA, (1U << GPIO_PIN_PWR_EN), GPIO_MODE_OUTPUT);
+    LL_GPIO_SetPinMode(GPIOA, GPIO_PIN_PWR_EN, LL_GPIO_MODE_OUTPUT);
 
     /* Configure I2C GPIO pins */
     i2c1_gpio_init();
@@ -284,6 +219,9 @@ static void i2c1_full_init(void)
 /*                                                                     */
 /*  Stops early if the first byte reads 0xFF (erased flash).           */
 /*  After copying, clears byte at reg_map[0x32] (rx status) to 0.      */
+/*                                                                     */
+/*  This is a plain memory read, not a FLASH-controller operation, so  */
+/*  it has no HAL/LL equivalent — direct pointer access is idiomatic.  */
 /*                                                                     */
 /*  Confidence: HIGH                                                   */
 /* ------------------------------------------------------------------ */
@@ -311,27 +249,12 @@ done:
 }
 
 /* ------------------------------------------------------------------ */
-/*  flash_unlock  (helper, inlined from call at 0x08000614)            */
-/*                                                                     */
-/*  Unlocks flash programming if LOCK bit is set.                      */
-/*  Confidence: HIGH                                                   */
-/* ------------------------------------------------------------------ */
-static void flash_unlock(void)
-{
-    if (FLASH->CR & FLASH_CR_LOCK) {
-        FLASH->KEYR = FLASH_KEY1;
-        FLASH->KEYR = FLASH_KEY2;
-    }
-}
-
-/* ------------------------------------------------------------------ */
 /*  save_settings_to_flash  (0x080004EC)                               */
 /*                                                                     */
 /*  Erases the settings page (0x08003C00) and reprograms it from the   */
 /*  RAM buffer (0x20000010), writing each byte as a 16-bit halfword.   */
 /*  This preserves the MCU UID copy (serial number) across OTA.        */
 /*                                                                     */
-/*  The binary uses 0x08003C00 as the page address for FLASH->AR.      */
 /*  Confidence: HIGH                                                   */
 /* ------------------------------------------------------------------ */
 static void save_settings_to_flash(void)
@@ -341,46 +264,46 @@ static void save_settings_to_flash(void)
     uint8_t  i = 0;
 
     /* Erase the settings page */
-    FLASH->CR |= FLASH_CR_PER;
-    FLASH->AR  = FLASH_SETTINGS_BASE;
-    FLASH->CR |= FLASH_CR_STRT;
-    while (FLASH->SR & FLASH_SR_BSY) {}
-    FLASH->CR &= ~FLASH_CR_PER;
+    FLASH_EraseInitTypeDef erase_init = {
+        .TypeErase   = FLASH_TYPEERASE_PAGES,
+        .PageAddress = FLASH_SETTINGS_BASE,
+        .NbPages     = 1U,
+    };
+    uint32_t page_error = 0U;
+    (void)HAL_FLASHEx_Erase(&erase_init, &page_error);
 
     /* Program 255 bytes from RAM as 16-bit halfwords */
     do {
-        FLASH->CR |= FLASH_CR_PG;
-        flash_dst[i] = (uint16_t)ram_src[i];  /* each byte → halfword */
-        while (FLASH->SR & FLASH_SR_BSY) {}
-        FLASH->CR &= ~FLASH_CR_PG;
+        (void)HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD,
+                                 (uint32_t)&flash_dst[i],
+                                 (uint16_t)ram_src[i]);
         i++;
     } while (i < 0xFFU);
 
     /* Lock flash */
-    FLASH->CR |= FLASH_CR_LOCK;
+    (void)HAL_FLASH_Lock();
 }
 
 /* ------------------------------------------------------------------ */
 /*  flash_erase_app  (inlined in bootloader_main at 0x08000624)        */
 /*                                                                     */
-/*  Erases all 14 × 1 KB pages from 0x08000800 to 0x08003FFF.         */
-/*  The binary uses the aliased address space 0x00800800..0x00804000   */
-/*  for FLASH->AR; the step is 0x400 (page size).                      */
+/*  Erases all 14 x 1 KB pages covering 0x08000800..0x08003FFF.       */
+/*  The binary itself uses the aliased address space 0x00800800..     */
+/*  0x00804000 for FLASH->AR; HAL_FLASHEx_Erase requires the canonical */
+/*  0x08xxxxxx range, which addresses the same physical pages.         */
 /*                                                                     */
 /*  Confidence: HIGH (addresses confirmed from binary)                 */
 /* ------------------------------------------------------------------ */
 static void flash_erase_app(void)
 {
-    uint32_t page_addr = FLASH_ERASE_START;  /* 0x00800800 (aliased)  */
+    FLASH_EraseInitTypeDef erase_init = {
+        .TypeErase   = FLASH_TYPEERASE_PAGES,
+        .PageAddress = FLASH_APP_START,
+        .NbPages     = FLASH_APP_NB_PAGES,
+    };
+    uint32_t page_error = 0U;
 
-    while (page_addr < FLASH_ERASE_END) {    /* 0x00804000 (aliased)  */
-        FLASH->CR |= FLASH_CR_PER;
-        FLASH->AR  = page_addr;
-        FLASH->CR |= FLASH_CR_STRT;
-        while (FLASH->SR & FLASH_SR_BSY) {}
-        FLASH->CR &= ~FLASH_CR_PER;
-        page_addr += FLASH_PAGE_SIZE;        /* advance by 1 KB       */
-    }
+    (void)HAL_FLASHEx_Erase(&erase_init, &page_error);
 }
 
 /* ------------------------------------------------------------------ */
@@ -402,12 +325,21 @@ static void flash_erase_app(void)
 /*  (status drops from 0xC8 down to 0 as bytes arrive), then programs  */
 /*  the 16-byte block to flash as 8 halfwords.                         */
 /*                                                                     */
+/*  NOTE (HIGH confidence, preserved from disassembly): save_settings_ */
+/*  to_flash() re-locks FLASH->CR at its end, and nothing in the OTA   */
+/*  receive loop below calls HAL_FLASH_Unlock() again before           */
+/*  programming blocks. On real silicon a locked FLASH_CR ignores      */
+/*  writes to PG, so as reconstructed here OTA data would not actually */
+/*  land in flash. This is called out as a MED-confidence detail in    */
+/*  the original disassembly notes; it is reproduced as observed       */
+/*  rather than "fixed", since this file documents the shipped binary. */
+/*                                                                     */
 /*  Confidence: HIGH for structure; MED for exact timeout loop         */
 /* ------------------------------------------------------------------ */
 static void bootloader_main(void)
 {
     /* Keep RPi power on during OTA (PA6 = MT_EN HIGH) */
-    GPIOA->BSRR = (1U << GPIO_PIN_MT_EN);
+    LL_GPIO_SetOutputPin(GPIOA, GPIO_PIN_MT_EN);
 
     /* Initialise: set rx-status byte to 0xC8 (waiting for data) */
     i2c_reg_map[REGMAP_RXSTATUS_OFF] = 0xC8U;
@@ -416,12 +348,12 @@ static void bootloader_main(void)
     load_settings_from_flash();
 
     /* Unlock flash for programming */
-    flash_unlock();
+    (void)HAL_FLASH_Unlock();
 
     /* Erase all application flash pages */
     flash_erase_app();
 
-    /* Save settings (UID etc.) back to settings page */
+    /* Save settings (UID etc.) back to settings page; re-locks flash */
     save_settings_to_flash();
 
     /* Flash write pointer in RAM at 0x20000000                       */
@@ -439,10 +371,7 @@ static void bootloader_main(void)
 
         if (status == OTA_BLOCK_MARKER) {
             /* Complete block received: program 8 halfwords to flash  */
-            FLASH->CR |= FLASH_CR_PG;
-
             uint32_t flash_write_addr = *flash_ptr_ram;
-            volatile uint16_t *flash_hw = (volatile uint16_t *)flash_write_addr;
 
             /* OTA buffer: [0x20] = 0xFA, [0x21]=lo0,[0x22]=hi0, ... */
             const uint8_t *buf = (const uint8_t *)
@@ -451,13 +380,10 @@ static void bootloader_main(void)
             for (uint8_t hw = 0; hw < OTA_BLOCK_DATA_BYTES; hw += 2) {
                 uint16_t halfword = (uint16_t)buf[hw + 1] |
                                     ((uint16_t)buf[hw + 2] << 8);
-                *flash_hw++ = halfword;
-                while (FLASH->SR & FLASH_SR_BSY) {}
-                FLASH->CR &= ~FLASH_CR_PG;
-                FLASH->CR |= FLASH_CR_PG;
+                (void)HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD,
+                                         flash_write_addr + hw,
+                                         halfword);
             }
-
-            FLASH->CR &= ~FLASH_CR_PG;
 
             /* Advance flash write pointer by 16 bytes */
             *flash_ptr_ram = flash_write_addr + OTA_BLOCK_DATA_BYTES;
@@ -512,64 +438,73 @@ static void bootloader_main(void)
 /*    – ISR stores in reg_map[REGMAP_OTA_BUF_OFF..].                  */
 /*    – When 0xFA is detected, rx-status is set to trigger programming.*/
 /*                                                                     */
+/*  BUG FIX vs. the earlier hand-rolled reconstruction: I2C_ISR_DIR is */
+/*  bit 16 of I2C->ISR on the real STM32F0 (confirmed against          */
+/*  stm32f030x6.h / LL_I2C_GetTransferDirection()), not bit 24 as the  */
+/*  previous stm32f030_periph.h defined it. The ADDCODE extraction     */
+/*  below was already correct (it never used the DIR macro, just a    */
+/*  shift+mask), so this only affects the addcode==0x30 dir_bit check, */
+/*  now expressed via LL_I2C_GetTransferDirection().                   */
+/*                                                                     */
+/*  A raw-register slave ISR like this doesn't map cleanly onto the    */
+/*  callback-based stm32f0xx_hal_i2c.h slave API (HAL_I2C_EnableListen_*/
+/*  IT / AddrCallback / Slave_Seq_*), which is built around HAL's      */
+/*  I2C_HandleTypeDef state machine rather than a custom byte-oriented */
+/*  register map; stm32f0xx_ll_i2c.h's thin register wrappers are the  */
+/*  correct fit here and were used throughout.                         */
+/*                                                                     */
 /*  Confidence: HIGH for the overall structure and conditions;         */
 /*              MED for exact TXDR/RXDR access patterns and rx_index.  */
 /* ------------------------------------------------------------------ */
 void I2C1_IRQHandler(void)
 {
-    uint32_t isr = I2C1->ISR;
-
-    /* ---- Address match (ADDR, bit 3) ---- */
-    if (isr & I2C_ISR_ADDR) {
-        uint32_t isr2 = I2C1->ISR;     /* fresh read                  */
-
-        /* ADDCODE[6:0] in ISR[23:17]: after >>16, occupies bits[7:1].
-         * Address 0x18 → bits[7:1] = 0x18 → byte value = 0x30.
-         * Masked with 0xFE to ignore the LSB.                        */
-        uint32_t addcode = (isr2 >> 16) & 0xFEU;
+    /* ---- Address match ---- */
+    if (LL_I2C_IsActiveFlag_ADDR(I2C1)) {
+        /* ADDCODE[6:0] in ISR[23:17]: LL_I2C_GetAddressMatchCode() shifts
+         * and left-shifts by 1, giving the byte-form address (0x18 -> 0x30),
+         * matching how the disassembly compared against 0x30 directly.     */
+        uint32_t addcode = LL_I2C_GetAddressMatchCode(I2C1);
 
         if (addcode == 0x30U) {
             /* Our address 0x18 matched */
-            uint32_t dir_bit = isr2 & I2C_ISR_DIR;  /* bit 24 = DIR  */
-
-            if (dir_bit) {
+            if (LL_I2C_GetTransferDirection(I2C1) == LL_I2C_DIRECTION_READ) {
                 /* Master wants to READ → slave must TRANSMIT          */
                 /* Load first byte from register map into TXDR         */
-                uint8_t reg_val = i2c_reg_map[*rx_index_ptr];
-                I2C1->TXDR = reg_val;
+                LL_I2C_TransmitData8(I2C1, i2c_reg_map[*rx_index_ptr]);
 
                 /* Clear ADDR flag and enable TXIS */
-                I2C1->ICR = I2C_ICR_ADDRCF;
-                I2C1->CR1 |= I2C_CR1_TXIE;
-                I2C1->CR1 &= ~I2C_CR1_RXIE;
+                LL_I2C_ClearFlag_ADDR(I2C1);
+                LL_I2C_EnableIT_TX(I2C1);
+                LL_I2C_DisableIT_RX(I2C1);
             } else {
                 /* Master wants to WRITE → slave receives              */
                 /* Reset rx index */
                 *rx_index_ptr = 0U;
 
                 /* Clear ADDR flag */
-                I2C1->ICR = I2C_ICR_ADDRCF;
+                LL_I2C_ClearFlag_ADDR(I2C1);
             }
         } else {
             /* Address does not match 0x18 – NACK it                  */
-            I2C1->ICR = I2C_ICR_NACKCF | I2C_ICR_ADDRCF;
+            LL_I2C_ClearFlag_NACK(I2C1);
+            LL_I2C_ClearFlag_ADDR(I2C1);
         }
         return;
     }
 
-    /* ---- Transmit interrupt (TXIS, bit 1) ---- */
+    /* ---- Transmit interrupt (TXIS) ---- */
     /* Master is reading; provide next byte from register map          */
-    if (isr & I2C_ISR_TXIS) {
+    if (LL_I2C_IsActiveFlag_TXIS(I2C1)) {
         uint8_t idx = *rx_index_ptr;
         *rx_index_ptr = idx + 1U;
-        I2C1->TXDR = i2c_reg_map[idx];
+        LL_I2C_TransmitData8(I2C1, i2c_reg_map[idx]);
         return;
     }
 
-    /* ---- Receive not empty (RXNE, bit 2) ---- */
-    if (isr & I2C_ISR_RXNE) {
+    /* ---- Receive not empty (RXNE) ---- */
+    if (LL_I2C_IsActiveFlag_RXNE(I2C1)) {
         uint8_t idx   = *rx_index_ptr;
-        uint8_t byte  = (uint8_t)I2C1->RXDR;
+        uint8_t byte  = LL_I2C_ReceiveData8(I2C1);
 
         if (idx == 0U) {
             /* First byte = register pointer                           */
@@ -586,19 +521,19 @@ void I2C1_IRQHandler(void)
             }
         } else {
             /* Buffer full – load current reg value for TX if needed   */
-            I2C1->TXDR = i2c_reg_map[idx];
+            LL_I2C_TransmitData8(I2C1, i2c_reg_map[idx]);
         }
         return;
     }
 
-    /* ---- Stop condition (STOPF, bit 5) ---- */
-    if (isr & I2C_ISR_STOPF) {
+    /* ---- Stop condition (STOPF) ---- */
+    if (LL_I2C_IsActiveFlag_STOP(I2C1)) {
         /* Clear STOP flag */
-        I2C1->ICR = I2C_ICR_STOPCF;
+        LL_I2C_ClearFlag_STOP(I2C1);
 
         /* Disable TX, re-enable RX for next transaction               */
-        I2C1->CR1 &= ~(I2C_CR1_TXIE);
-        I2C1->CR1 |=   I2C_CR1_RXIE;
+        LL_I2C_DisableIT_TX(I2C1);
+        LL_I2C_EnableIT_RX(I2C1);
     }
 }
 
@@ -609,16 +544,15 @@ void I2C1_IRQHandler(void)
 /*                                                                     */
 /*  Sequence:                                                          */
 /*    1. Enable SYSCFG and power clocks (APB2/APB1).                  */
-/*    2. Initialise I2C flash-unlock helper.                           */
-/*    3. Initialise I2C1 GPIO, peripheral, and NVIC.                   */
-/*    4. Copy MCU UID (96 bits, 3×32-bit words) into I2C reg map       */
+/*    2. Initialise I2C1 GPIO, peripheral, and NVIC.                   */
+/*    3. Copy MCU UID (96 bits, 3×32-bit words) into I2C reg map       */
 /*       at registers 0xF0–0xFB.                                       */
-/*    5. Read OTA flag byte at 0x08003C64.                             */
-/*    6. Check PB1 (force-boot button, active-low).                   */
-/*    7. If OTA flag == 0x7F OR button pressed → enter OTA mode.       */
-/*    8. Validate app MSP: must satisfy (MSP & 0x2FFE0000)==0x20000000 */
-/*    9. If valid: set MSP from app vector table, BLX to app reset.    */
-/*   10. If invalid: enter OTA mode.                                   */
+/*    4. Read OTA flag byte at 0x08003C64.                             */
+/*    5. Check PB1 (force-boot button, active-low).                   */
+/*    6. If OTA flag == 0x7F OR button pressed → enter OTA mode.       */
+/*    7. Validate app MSP: must satisfy (MSP & 0x2FFE0000)==0x20000000 */
+/*    8. If valid: set MSP from app vector table, jump to app reset.   */
+/*    9. If invalid: enter OTA mode.                                   */
 /*                                                                     */
 /*  Confidence: HIGH for all decisions; MED for exact clock enables    */
 /* ------------------------------------------------------------------ */
@@ -626,20 +560,16 @@ int main(void)
 {
     /* ---- Clock enables ---- */
     /* Enable SYSCFG (APB2 bit 0) */
-    RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
-    (void)RCC->APB2ENR;
+    __HAL_RCC_SYSCFG_CLK_ENABLE();
 
     /* Enable power interface (APB1 bit 28) */
-    RCC->APB1ENR |= RCC_APB1ENR_PWREN;
-    (void)RCC->APB1ENR;
+    __HAL_RCC_PWR_CLK_ENABLE();
 
     /* ---- Peripheral init ---- */
-    /* (The binary calls two init functions here; the first is likely  */
-    /*  the flash access timing setup; the second is i2c1_full_init.)  */
     i2c1_full_init();
 
     /* ---- Copy MCU UID to I2C register map at 0xF0–0xFB ---- */
-    /* UID base 0x1FFFF780; UID words at offsets +0x2C, +0x30, +0x34  */
+    /* UID base 0x1FFFF7AC (CMSIS UID_BASE); UID words at +0x00/+0x04/+0x08 */
     {
         /* reg_map[0xF0..0xFB] = UID bytes 0..11 (3 × little-endian words) */
         volatile uint8_t *serial = (volatile uint8_t *)(RAM_SERIAL_OUT + 16U);
@@ -675,12 +605,8 @@ int main(void)
     }
 
     /* Case 2: Force-boot button PB1 pressed (active-low)             */
-    {
-        uint32_t idr = GPIOB->IDR;
-        if (!(idr & (1U << GPIO_PIN_BOOT_BTN))) {
-            /* Button pressed (IDR bit 1 = 0) */
-            bootloader_main();
-        }
+    if (!LL_GPIO_IsInputPinSet(GPIOB, GPIO_PIN_BOOT_BTN)) {
+        bootloader_main();
     }
 
     /* ---- Validate app vector table ---- */
@@ -697,11 +623,8 @@ int main(void)
         volatile uint32_t *scratch = (volatile uint32_t *)0x20000000UL;
         scratch[1] = app_rst;
 
-        /* Set MSP to app's initial stack pointer */
-        __asm volatile (
-            "MSR MSP, %0 \n"
-            : : "r" (app_msp) : "memory"
-        );
+        /* Set MSP to app's initial stack pointer (CMSIS intrinsic) */
+        __set_MSP(app_msp);
 
         /* Jump to app reset handler (no return) */
         typedef void (*app_entry_t)(void);
