@@ -905,11 +905,24 @@ uint8_t I2C1_ReadIna219Current(uint8_t is_output, int16_t *current_mA)
 {
     uint16_t start_us = (uint16_t)LL_TIM_GetCounter(TIM3);
     uint16_t raw = 0u;
+    uint16_t cal = 0u;
     uint8_t ok;
     uint8_t addr = is_output ? INA219_ADDR_OUTPUT : INA219_ADDR_BATTERY;
 
     I2C1_EnterMasterWindow();
-    ok = I2C1_MasterReadReg16_Window(addr, INA219_REG_CURRENT, &raw, start_us);
+    ok = I2C1_MasterReadReg16_Window(addr, INA219_REG_CALIBRATION, &cal, start_us);
+    if (ok && cal != INA219_CALIBRATION_VALUE)
+    {
+        /* Calibration was silently zeroed at runtime (e.g. an INA219 rail POR independent of
+         * the MCU) -- Current reads 0 with cal=0, and MX_I2C1_ProbeMasterSetup() only ever
+         * runs once, at boot. Repair now and skip publishing this sample; next poll re-checks. */
+        (void)I2C1_MasterWriteReg16(addr, INA219_REG_CALIBRATION, INA219_CALIBRATION_VALUE);
+        ok = 0u;
+    }
+    else if (ok)
+    {
+        ok = I2C1_MasterReadReg16_Window(addr, INA219_REG_CURRENT, &raw, start_us);
+    }
     if (ok && I2C1_WindowExpired(start_us))
         ok = 0u;
     if (!ok)
