@@ -98,6 +98,33 @@ confirmed.
     shuts off that individual port after ~16 s. Only relevant to loads on
     VOUT1/VOUT2/VBUS — **not** VREG, which is documented as exempt from
     this port-switching logic.
+  - **Thermal protections (two distinct mechanisms, don't confuse them):**
+    - **IC over-temperature (`TOTP`, protects the die):** rising-temperature shutdown at
+      130/140/150 °C (min/typ/max) with 40 °C hysteresis. Backstopped by the Absolute Maximum
+      Ratings junction-temperature range (`TJ`, −40–150 °C) and thermal resistance (`θJA`,
+      26 °C/W), useful for estimating temperature rise from measured power dissipation on this
+      board. Datasheet also documents a *gradual* foldback ahead of the hard shutdown: boost-side output
+      current is automatically derated with rising temperature to keep IC temp under the set
+      limit, and charge current is likewise moderated by an internal control loop that takes IC
+      temperature as one of its inputs (alongside battery temperature and input voltage) — so a
+      hard `TOTP` trip should be a last resort, not the first response to heat.
+    - **Battery temperature (NTC, protects the cell):** external NTC-sensed, three-level
+      comparator (LT/MT/HT). Charge-side: stops below 0 °C, halves current at 45 °C, stops above
+      50 °C. Discharge-side: stops below −15 °C, stops above 55 °C.
+    - **Neither is documented as latching.** Unlike `TEND` (Charge-termination bullet below),
+      which the datasheet explicitly leaves with no auto-recovery path, NTC has no stated
+      hysteresis/dead-band — it's a live comparator on a continuously-sampled voltage, so a
+      charge-side NTC trip is inferred (not explicitly stated) to clear itself as soon as battery
+      temperature returns to range. `TOTP`'s 40 °C hysteresis is explicit and likewise implies
+      auto-recovery once the die cools.
+    - **Given this board's topology, only the charge-side NTC thresholds matter.** The RPi's power
+      path (VREG → TPS61088, independent load switch) never runs through IP5328's VOUT1/VOUT2/VBUS
+      discharge stage, so neither `TOTP`'s boost-current foldback nor the discharge-side NTC
+      thresholds can affect the RPi directly. The only way either thermal protection reaches the
+      RPi is indirectly: if it pauses/reduces *charging*, the battery isn't being replenished while
+      the RPi keeps drawing from VREG regardless — the same underlying failure shape as the `TEND`
+      stall below, just (probably) self-clearing instead of latching. See "Known Issues" for an
+      open question about whether these can compound.
   - **KEY** pin (IP5328 pin 26) is the button-detect input; also multiplexed
     with the WLED flashlight driver.
 
@@ -186,6 +213,15 @@ confirmed against register-level fault status or a schematic.
   voltage) — but this hasn't been ruled out for other, non-low-battery
   dropout events and should be considered separately if the STM32 rail is
   ever found to be fed from a switched VOUT port.
+- **Possible NTC/`TEND` compounding (open question, unconfirmed).** It is not documented whether
+  an NTC-triggered charge-side pause (battery too hot/cold, see Power/Charging above) suspends the
+  `TEND` charge safety-timer countdown or lets it keep running. If NTC halts/reduces charge current
+  but IP5328 still considers itself mid-charge-cycle for `TEND` purposes, a long thermal-driven
+  pause (e.g. a warm enclosure) could itself exhaust `TEND` and trigger the charging-stops-despite-
+  charger-present failure mode above sooner than the ~20–27 h normally expected — i.e. the two
+  documented mechanisms could stack rather than being independent. No data yet either way; worth
+  watching for whether `TEND`-pattern drains correlate with elevated ambient/enclosure temperature
+  or cluster sooner after a charge-side NTC event than the 20 h periodic reset should allow.
 
 ## Notes
 
