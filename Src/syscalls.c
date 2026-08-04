@@ -23,7 +23,6 @@
 /* Includes */
 #include <sys/stat.h>
 #include <stdlib.h>
-#include <errno.h>
 #include <signal.h>
 #include <time.h>
 #include <sys/time.h>
@@ -53,7 +52,6 @@ int _kill(int pid, int sig)
 {
   (void)pid;
   (void)sig;
-  errno = EINVAL;
   return -1;
 }
 
@@ -127,14 +125,12 @@ int _open(char *path, int flags, ...)
 int _wait(int *status)
 {
   (void)status;
-  errno = ECHILD;
   return -1;
 }
 
 int _unlink(char *name)
 {
   (void)name;
-  errno = ENOENT;
   return -1;
 }
 
@@ -155,13 +151,11 @@ int _link(char *old, char *new)
 {
   (void)old;
   (void)new;
-  errno = EMLINK;
   return -1;
 }
 
 int _fork(void)
 {
-  errno = EAGAIN;
   return -1;
 }
 
@@ -170,6 +164,5 @@ int _execve(char *name, char **argv, char **env)
   (void)name;
   (void)argv;
   (void)env;
-  errno = ENOMEM;
   return -1;
 }
