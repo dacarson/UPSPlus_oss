@@ -171,6 +171,26 @@ In `stm32f0xx_it.c`, remove the 0..9 divider. Call `Scheduler_ISR_Tick10ms()` ev
 
 ---
 
+## 4. Deeper Sleep When RPi Power Is Off and Running on Battery (Future Enhancement)
+
+### Concept
+
+The idle path in Section 1 still wakes on every scheduler tick (10 ms, or whatever SysTick becomes after Phase 5) so it can stay responsive to an active I2C host. But when `power_state` is `RPI_OFF` or `PROTECTION_LATCHED` **and** `charger_state == ABSENT` (i.e. running on battery with the RPi powered off), there is no RPi and therefore nothing reading I2C registers. In that condition there is no host to stay responsive for, so the firmware can drop into a much deeper, longer sleep than Section 1's per-tick WFE.
+
+### Behavior
+
+- **Entry condition:** `power_state ∈ {RPI_OFF, PROTECTION_LATCHED}` **and** `charger_state == ABSENT`.
+- While this holds, sleep as deeply as possible and wake only to periodically check whether a charger has been connected, or on button press. No I2C, ADC, or flash servicing is needed in this state — there's no host to talk to and nothing new worth persisting until one of those two things changes.
+- **Periodic wake (charger check):**
+  - If the charger is still absent, go back to sleep immediately — there is nothing else to do.
+  - If a charger is now present, resume normal main-loop operation so the existing `RPI_OFF → LOAD_ON_DELAY` auto-power-on logic (Behavior Spec Section 5.1) runs as usual.
+  - Runtime counters expected to keep advancing (e.g. `cumulative_runtime_sec`) may need to be caught up based on elapsed sleep time on wake, rather than assuming tick-by-tick accumulation continued.
+- **Button-press wake:** resume normal operation and let the existing manual power-on path decide the outcome — the Button FSM's short-press safety check (Behavior Spec Section 5.4: power on only if battery voltage is above the protection threshold) governs whether the RPi actually powers up. No new safety logic is needed here; this just reuses the existing `RPI_OFF`/`PROTECTION_LATCHED` short-press handling.
+
+This is a candidate future phase beyond Section 1–3 above; it has not yet been scoped into implementation steps (wake source, e.g. RTC vs. a slow-counted SysTick; how deep a sleep mode the STM32F0 can safely use while still recovering state on wake).
+
+---
+
 ## Recommended Order of Work
 
 | Phase | Task | Risk |
