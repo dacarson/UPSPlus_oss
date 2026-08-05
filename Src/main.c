@@ -49,7 +49,7 @@ __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
 /* Timing/button helpers (canonical 10 ms tick/EXTI). Authoritative state is state/sys_state only;
  * no shadow globals (uXXXVolt, counters, mode flags) remain as authoritative. */
 __IO uint8_t sKeyFlag = 0;         /* Button activity (EXTI edge) */
-__IO uint16_t sIPIdleTicks = 0;
+__IO uint16_t sVddRefreshTicks = 0;
 __IO uint8_t MustRefreshVDD = 1;
 /* Countdowns decremented in main loop on tick_1s (removed from ISR) */
 
@@ -2169,16 +2169,19 @@ static void ChargerStateMachine_Step(void)
         }
     }
 
-    if (sys_state.charger_state != CHARGER_STATE_ABSENT || sys_state.power_state == POWER_STATE_RPI_ON)
-        sIPIdleTicks = 0;
-    else
+    /* Periodic VDDA (mcu_voltage_mv) recalibration: the pogopin/battery/USB voltage ADC
+     * conversions are ratiometric against VDDA (see __LL_ADC_CALC_DATA_TO_VOLTAGE call sites), so
+     * a stale VDDA estimate biases every voltage they report. Must tick regardless of charger/
+     * power state -- the original firmware refreshed VDDA opportunistically while active too
+     * (piggybacked on its periodic IP_EN pulse), but that path was dropped when IP_EN pulsing was
+     * reworked for Section 9.1/9.3, leaving VDDA frozen at its boot-time value for the entire
+     * RPI_ON session. Left unfixed, VDDA drift (e.g. sag as the battery nears empty) reads back as
+     * spurious voltage drift on every ratiometric channel even though the physical rails are fine. */
+    sVddRefreshTicks++;
+    if (sVddRefreshTicks > 0x1000u)
     {
-        sIPIdleTicks++;
-        if (sIPIdleTicks > 0x1000u)
-        {
-            sIPIdleTicks = 0;
-            MustRefreshVDD = 1;
-        }
+        sVddRefreshTicks = 0;
+        MustRefreshVDD = 1;
     }
 }
 
