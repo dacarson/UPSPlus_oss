@@ -49,8 +49,6 @@ __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
 /* Timing/button helpers (canonical 10 ms tick/EXTI). Authoritative state is state/sys_state only;
  * no shadow globals (uXXXVolt, counters, mode flags) remain as authoritative. */
 __IO uint8_t sKeyFlag = 0;         /* Button activity (EXTI edge) */
-__IO uint16_t sVddRefreshTicks = 0;
-__IO uint8_t MustRefreshVDD = 1;
 /* Countdowns decremented in main loop on tick_1s (removed from ISR) */
 
 #define BL_START_ADDRESS 0x8000000
@@ -1136,11 +1134,14 @@ int main(void)
         /* ADC processing in main loop (DMA sets adc_ready only) */
         if (adc_ready)
         {
-            if (MustRefreshVDD)
-            {
-                state.mcu_voltage_mv = (__LL_ADC_CALC_VREFANALOG_VOLTAGE(aADCxConvertedData[5], LL_ADC_RESOLUTION_12B) + state.mcu_voltage_mv) / 2;
-                MustRefreshVDD = 0;
-            }
+            /* VREFINT is sampled every ADC round-robin scan (~500ms, see LL_ADC_REG_SetSequencerChAdd
+             * call for LL_ADC_CHANNEL_VREFINT), so recalibrate VDDA every cycle rather than on a slow
+             * timer: the pogopin/battery/USB voltage conversions below are ratiometric against it, and
+             * a stale VDDA estimate biases every one of them. The blend below still smooths single-
+             * sample ADC noise, but now settles in ~1-2s instead of tens of seconds, fast enough to
+             * track a real VDDA sag (e.g. as the battery nears empty) instead of reading back as
+             * spurious voltage growth on those channels. */
+            state.mcu_voltage_mv = (__LL_ADC_CALC_VREFANALOG_VOLTAGE(aADCxConvertedData[5], LL_ADC_RESOLUTION_12B) + state.mcu_voltage_mv) / 2;
             state.pogopin_voltage_mv = __LL_ADC_CALC_DATA_TO_VOLTAGE(state.mcu_voltage_mv * 2, aADCxConvertedData[0], LL_ADC_RESOLUTION_12B);
             state.battery_voltage_mv = __LL_ADC_CALC_DATA_TO_VOLTAGE(state.mcu_voltage_mv * 2, aADCxConvertedData[1], LL_ADC_RESOLUTION_12B);
             state.usbc_voltage_mv = __LL_ADC_CALC_DATA_TO_VOLTAGE(state.mcu_voltage_mv * 4, aADCxConvertedData[2], LL_ADC_RESOLUTION_12B);
@@ -2167,21 +2168,6 @@ static void ChargerStateMachine_Step(void)
             else
                 charger_physical.charger_stability_count = 0;
         }
-    }
-
-    /* Periodic VDDA (mcu_voltage_mv) recalibration: the pogopin/battery/USB voltage ADC
-     * conversions are ratiometric against VDDA (see __LL_ADC_CALC_DATA_TO_VOLTAGE call sites), so
-     * a stale VDDA estimate biases every voltage they report. Must tick regardless of charger/
-     * power state -- the original firmware refreshed VDDA opportunistically while active too
-     * (piggybacked on its periodic IP_EN pulse), but that path was dropped when IP_EN pulsing was
-     * reworked for Section 9.1/9.3, leaving VDDA frozen at its boot-time value for the entire
-     * RPI_ON session. Left unfixed, VDDA drift (e.g. sag as the battery nears empty) reads back as
-     * spurious voltage drift on every ratiometric channel even though the physical rails are fine. */
-    sVddRefreshTicks++;
-    if (sVddRefreshTicks > 0x1000u)
-    {
-        sVddRefreshTicks = 0;
-        MustRefreshVDD = 1;
     }
 }
 
