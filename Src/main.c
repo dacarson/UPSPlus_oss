@@ -49,8 +49,6 @@ __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
 /* Timing/button helpers (canonical 10 ms tick/EXTI). Authoritative state is state/sys_state only;
  * no shadow globals (uXXXVolt, counters, mode flags) remain as authoritative. */
 __IO uint8_t sKeyFlag = 0;         /* Button activity (EXTI edge) */
-__IO uint16_t sIPIdleTicks = 0;
-__IO uint8_t MustRefreshVDD = 1;
 /* Countdowns decremented in main loop on tick_1s (removed from ISR) */
 
 #define BL_START_ADDRESS 0x8000000
@@ -1136,11 +1134,14 @@ int main(void)
         /* ADC processing in main loop (DMA sets adc_ready only) */
         if (adc_ready)
         {
-            if (MustRefreshVDD)
-            {
-                state.mcu_voltage_mv = (__LL_ADC_CALC_VREFANALOG_VOLTAGE(aADCxConvertedData[5], LL_ADC_RESOLUTION_12B) + state.mcu_voltage_mv) / 2;
-                MustRefreshVDD = 0;
-            }
+            /* VREFINT is sampled every ADC round-robin scan (~500ms, see LL_ADC_REG_SetSequencerChAdd
+             * call for LL_ADC_CHANNEL_VREFINT), so recalibrate VDDA every cycle rather than on a slow
+             * timer: the pogopin/battery/USB voltage conversions below are ratiometric against it, and
+             * a stale VDDA estimate biases every one of them. The blend below still smooths single-
+             * sample ADC noise, but now settles in ~1-2s instead of tens of seconds, fast enough to
+             * track a real VDDA sag (e.g. as the battery nears empty) instead of reading back as
+             * spurious voltage growth on those channels. */
+            state.mcu_voltage_mv = (__LL_ADC_CALC_VREFANALOG_VOLTAGE(aADCxConvertedData[5], LL_ADC_RESOLUTION_12B) + state.mcu_voltage_mv) / 2;
             state.pogopin_voltage_mv = __LL_ADC_CALC_DATA_TO_VOLTAGE(state.mcu_voltage_mv * 2, aADCxConvertedData[0], LL_ADC_RESOLUTION_12B);
             state.battery_voltage_mv = __LL_ADC_CALC_DATA_TO_VOLTAGE(state.mcu_voltage_mv * 2, aADCxConvertedData[1], LL_ADC_RESOLUTION_12B);
             state.usbc_voltage_mv = __LL_ADC_CALC_DATA_TO_VOLTAGE(state.mcu_voltage_mv * 4, aADCxConvertedData[2], LL_ADC_RESOLUTION_12B);
@@ -2168,18 +2169,6 @@ static void ChargerStateMachine_Step(void)
                 charger_physical.charger_stability_count = 0;
         }
     }
-
-    if (sys_state.charger_state != CHARGER_STATE_ABSENT || sys_state.power_state == POWER_STATE_RPI_ON)
-        sIPIdleTicks = 0;
-    else
-    {
-        sIPIdleTicks++;
-        if (sIPIdleTicks > 0x1000u)
-        {
-            sIPIdleTicks = 0;
-            MustRefreshVDD = 1;
-        }
-    }
 }
 
 /**
@@ -2489,9 +2478,15 @@ static void Button_DispatchActions(void)
             sys_state.power_state == POWER_STATE_PROTECTION_LATCHED ||
             sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
         {
-            uint8_t allow_power_on = 1;
-            if (state.battery_voltage_mv <= state.protection_voltage_mv)
-                allow_power_on = 0;
+            /* A button press is the user explicitly asking to power on now, so it deliberately
+             * does NOT gate on low_battery_percent (default 10%) the way automatic power-on does
+             * -- that's a "time to shut down soon" warning threshold, not a safety limit, and a
+             * user should be able to manually power on at e.g. 5% if they want to. It DOES still
+             * require the same protection-voltage+hysteresis margin as the automatic path
+             * (CheckPowerOnConditions): a bare battery_voltage_mv > protection_voltage_mv check
+             * with no hysteresis let a press power back on right at the empty threshold with no
+             * source attached, driving the battery straight back into protection cutoff. */
+            uint8_t allow_power_on = (state.battery_voltage_mv > (uint16_t)(state.protection_voltage_mv + PROTECTION_HYSTERESIS_MV));
             if (allow_power_on)
             {
                 sys_state.power_state = POWER_STATE_RPI_ON;

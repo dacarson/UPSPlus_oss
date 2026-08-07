@@ -48,6 +48,8 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 4K
+  /* 0x08000000 to 0x08000800 (2KB) is reserved for the bootloader and
+   * intentionally excluded here; see documents/bootloader_src/STM32F030F4_BOOT.ld */
   /* Application flash: 0x08000800 to 0x08003C00 (13KB) */
   FLASH         (rx)    : ORIGIN = 0x08000800,   LENGTH = 13K
   /* Flash storage reserved: 0x08003C00 to 0x08004000 (1KB for persistence) */
@@ -145,13 +147,14 @@ SECTIONS
     . = ALIGN(4);
   } >FLASH
 
-  /* Reserved space for vector table remapping (192 bytes = 0xC0)
+  /* Reserved space for vector table remapping, sized to match the actual
+   * .isr_vector table (g_pfnVectors) built by the startup file.
    * NVIC_SetVectorTable() copies vector table from flash to 0x20000000
    * This section reserves that space to prevent linker from placing data there */
-  .vector_table_ram 0x20000000 (NOLOAD) :
+  .vector_table_ram ORIGIN(RAM) (NOLOAD) :
   {
     . = ALIGN(4);
-    . = . + 0xC0;  /* Reserve 192 bytes for vector table */
+    . = . + SIZEOF(.isr_vector);
     . = ALIGN(4);
   } >RAM
 
@@ -159,8 +162,8 @@ SECTIONS
   _sidata = LOADADDR(.data);
 
   /* Initialized data sections into "RAM" Ram type memory
-   * Start at 0x200000C0 (after vector table reservation) */
-  .data 0x200000C0 :
+   * Starts immediately after the vector table reservation */
+  .data ORIGIN(RAM) + SIZEOF(.vector_table_ram) :
   {
     . = ALIGN(4);
     _sdata = .;        /* create a global symbol at data start */
