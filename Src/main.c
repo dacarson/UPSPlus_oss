@@ -2478,9 +2478,15 @@ static void Button_DispatchActions(void)
             sys_state.power_state == POWER_STATE_PROTECTION_LATCHED ||
             sys_state.power_state == POWER_STATE_LOAD_ON_DELAY)
         {
-            uint8_t allow_power_on = 1;
-            if (state.battery_voltage_mv <= state.protection_voltage_mv)
-                allow_power_on = 0;
+            /* A button press is the user explicitly asking to power on now, so it deliberately
+             * does NOT gate on low_battery_percent (default 10%) the way automatic power-on does
+             * -- that's a "time to shut down soon" warning threshold, not a safety limit, and a
+             * user should be able to manually power on at e.g. 5% if they want to. It DOES still
+             * require the same protection-voltage+hysteresis margin as the automatic path
+             * (CheckPowerOnConditions): a bare battery_voltage_mv > protection_voltage_mv check
+             * with no hysteresis let a press power back on right at the empty threshold with no
+             * source attached, driving the battery straight back into protection cutoff. */
+            uint8_t allow_power_on = (state.battery_voltage_mv > (uint16_t)(state.protection_voltage_mv + PROTECTION_HYSTERESIS_MV));
             if (allow_power_on)
             {
                 sys_state.power_state = POWER_STATE_RPI_ON;
