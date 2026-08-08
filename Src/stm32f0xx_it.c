@@ -182,13 +182,8 @@ void PendSV_Handler(void)
  void SysTick_Handler(void)
  {
    /* USER CODE BEGIN SysTick_IRQn 0 */
-   static uint8_t div10 = 0;
-   div10++;
-   if (div10 >= 10)
-   {
-     div10 = 0;
-     Scheduler_ISR_Tick10ms();
-   }
+   /* SysTick now fires every 10 ms directly (see SystemClock_Config in main.c); no divider needed. */
+   Scheduler_ISR_Tick10ms();
    /* USER CODE END SysTick_IRQn 0 */
  
    /* USER CODE BEGIN SysTick_IRQn 1 */

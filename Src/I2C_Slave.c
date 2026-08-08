@@ -108,6 +108,20 @@ static uint8_t I2C1_CheckAndClearErrors(void)
     return 0u;
 }
 
+/* Busy-wait milliseconds via TIM3 (1 MHz, 1 us/tick); same idiom as main.c's WaitUs(),
+ * duplicated here since that one is static to main.c. Startup/recovery/probe delays only --
+ * do not call from periodic runtime paths. */
+static void WaitMs(uint16_t ms)
+{
+    while (ms--)
+    {
+        uint16_t start = (uint16_t)LL_TIM_GetCounter(TIM3);
+        while ((uint16_t)(LL_TIM_GetCounter(TIM3) - start) < 1000u)
+        {
+        }
+    }
+}
+
 static void I2C1_ClearAllFlags(void)
 {
     if (LL_I2C_IsActiveFlag_STOP(I2C1))
@@ -161,15 +175,15 @@ static void I2C1_BusRecovery(void)
 
     /* Ensure SCL high, SDA released before clocking. */
     LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_9);
-    LL_mDelay(I2C_RECOVERY_DELAY_MS);
+    WaitMs(I2C_RECOVERY_DELAY_MS);
 
     /* Clock SCL low->high to free a stuck slave. */
     for (pulse = 0u; pulse < I2C_RECOVERY_PULSES; pulse++)
     {
         LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_9);
-        LL_mDelay(I2C_RECOVERY_DELAY_MS);
+        WaitMs(I2C_RECOVERY_DELAY_MS);
         LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_9);
-        LL_mDelay(I2C_RECOVERY_DELAY_MS);
+        WaitMs(I2C_RECOVERY_DELAY_MS);
     }
 
     /* Generate STOP: drive SDA low (open-drain), then release high while SCL high. */
@@ -177,12 +191,12 @@ static void I2C1_BusRecovery(void)
     LL_GPIO_SetPinOutputType(GPIOA, LL_GPIO_PIN_10, LL_GPIO_OUTPUT_OPENDRAIN);
     LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_10, LL_GPIO_SPEED_FREQ_LOW);
     LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_10);
-    LL_mDelay(I2C_RECOVERY_DELAY_MS);
+    WaitMs(I2C_RECOVERY_DELAY_MS);
     LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_9);
-    LL_mDelay(I2C_RECOVERY_DELAY_MS);
+    WaitMs(I2C_RECOVERY_DELAY_MS);
     LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_10, LL_GPIO_MODE_INPUT);
     LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_10, LL_GPIO_PULL_UP);
-    LL_mDelay(I2C_RECOVERY_DELAY_MS);
+    WaitMs(I2C_RECOVERY_DELAY_MS);
 
     /* Restore AF4 I2C pins. */
     LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_9, LL_GPIO_MODE_ALTERNATE);
@@ -406,7 +420,7 @@ static uint8_t I2C1_BusIdleBrief(void)
     if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
         !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
         return 0u;
-    LL_mDelay(1u);
+    WaitMs(1u);
     if (!LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_9) ||
         !LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_10))
         return 0u;
@@ -582,7 +596,7 @@ static uint8_t I2C1_ProbeConfigureIna219(uint8_t addr)
         I2C1_BootEnsureEnabled();
         if (!I2C1_WaitForBusIdle(I2C_PROBE_IDLE_CYCLES))
         {
-            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
+            WaitMs(I2C_PROBE_RETRY_DELAY_MS);
             continue;
         }
         ok = I2C1_MasterWriteReg16(addr, INA219_REG_CONFIG, INA219_CONFIG_VALUE);
@@ -607,7 +621,7 @@ static uint8_t I2C1_ProbeConfigureIna219(uint8_t addr)
             ok = 0u;
         }
         if (ok == 0u)
-            LL_mDelay(I2C_PROBE_RETRY_DELAY_MS);
+            WaitMs(I2C_PROBE_RETRY_DELAY_MS);
     }
     return ok;
 }
@@ -650,7 +664,7 @@ void MX_I2C1_ProbeMasterSetup(void)
     timing_100k = I2C1_TIMING_100KHZ_HSI8MHZ;
     LL_I2C_SetTiming(I2C1, timing_100k);
     LL_I2C_Enable(I2C1);
-    LL_mDelay(I2C_PROBE_INITIAL_DELAY_MS);
+    WaitMs(I2C_PROBE_INITIAL_DELAY_MS);
 
     /* Configure INA219s and verify with a readback for probe presence. */
     ina_probe_present_output = I2C1_ProbeConfigureIna219(INA219_ADDR_OUTPUT);

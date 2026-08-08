@@ -135,6 +135,7 @@ static void MX_TIM3_Init(void);
 static uint8_t I2C1_GuardWindowReady(void);
 static uint8_t I2C1_BusIdleStable500us(void);
 static void WaitUs(uint16_t us);
+static void WaitMs(uint16_t ms);
 
 /* Battery plateau full detection (self-programming enabled) */
 static uint16_t filtered_vbat_mv = 0;
@@ -924,7 +925,7 @@ int main(void)
     sys_state.factory_reset_requested = 0;
 
     /* Allow power rails / I2C pull-ups to settle before main loop; remove or reduce if not required on target hardware. */
-    LL_mDelay(100);
+    WaitMs(100);
 
     while (1)
     {
@@ -1166,6 +1167,26 @@ int main(void)
 
         /* IWDG: single refresh per loop, after all critical work (scheduler, I2C, INA, flash, protection, GPIO). */
         IWDG->KR = 0xAAAAu;   /* Key: reload watchdog counter */
+
+        /* Idle path: sleep when there is no pending work. Flash is eligible to idle
+         * even while flash_save_requested is set, as long as its retry backoff hasn't
+         * elapsed yet (now_sec < flash_next_retry_sec) -- that wait is intentional. */
+        if (!sched_flags.tick_10ms && !sched_flags.tick_100ms && !sched_flags.tick_500ms && !sched_flags.tick_1s &&
+            !adc_ready &&
+            !(flash_save_requested && state.cumulative_runtime_sec >= flash_next_retry_sec) &&
+            !i2c_pending_write.pending &&
+            !ina_probe_requested &&
+            !sys_state.factory_reset_requested &&
+            I2C1_GetSlaveTxnActive() == 0 &&
+            sKeyFlag == 0 && button_handler.pending_click == BUTTON_CLICK_NONE)
+        {
+            /* Event-safe sleep: SEV then WFE/WFE clears any stale event before waiting,
+             * avoiding the race where an interrupt sets pending work between the idle
+             * check above and entering sleep. Wakes on SysTick/DMA/I2C/EXTI. */
+            __SEV();
+            __WFE();
+            __WFE();
+        }
     }
 }
 
@@ -1631,7 +1652,13 @@ void SystemClock_Config(void)
     while (LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL)
     {
     }
-    LL_Init1msTick(48000000);
+    /* SysTick at 10 ms (not LL_Init1msTick's 1 ms): scheduler runs directly off SysTick,
+     * see SysTick_Handler in stm32f0xx_it.c. Reload computed from the 48 MHz HCLK configured
+     * above (AHB prescaler DIV_1, so HCLK == SYSCLK == 48 MHz). CLKSOURCE_Msk selects the
+     * processor clock (HCLK), not HCLK/8. */
+    SysTick->LOAD = (48000000UL / 100UL) - 1UL;
+    SysTick->VAL  = 0UL;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
     LL_SYSTICK_EnableIT();
     LL_SetSystemCoreClock(48000000);
     LL_RCC_HSI14_EnableADCControl();
@@ -1786,6 +1813,11 @@ static void WaitUs(uint16_t us)
     while ((uint16_t)(LL_TIM_GetCounter(TIM3) - start) < us)
     {
     }
+}
+
+static void WaitMs(uint16_t ms)
+{
+    while (ms--) WaitUs(1000);
 }
 
 static uint8_t I2C1_BusIdleStable500us(void)

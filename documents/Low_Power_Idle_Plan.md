@@ -169,6 +169,16 @@ In `stm32f0xx_it.c`, remove the 0..9 divider. Call `Scheduler_ISR_Tick10ms()` ev
 - **Realism note:** If 3.3 V rail current is dominated by regulators, pullups, IP5328, etc., sleep may show only a modest improvement. The MCU improvement can be real but masked by board-level quiescent current.
 - Record whether pullups / I2C host / regulator enable states are unchanged between runs to keep comparisons honest.
 
+**Step 3.4 – Measurements Log**
+
+| Date | Phase | Firmware | Conditions | Current | Time-Avg (approx) |
+|------|-------|----------|------------|---------|--------------------|
+| 2026-08-07 | 0 (baseline) | Pre-idle-path (busy `while(1)`, 1 ms SysTick) | RPi HAT physically detached, charger absent, single battery in series with multimeter | Not flat: **18 mA for ~24-25s, dips to 17 mA for ~6-7s**, repeats. Confirmed present without Phase 1 (idle path was `#if 0`'d out for this run), so the cyclic dip predates this plan and is not caused by it -- likely a PMIC/regulator burst-mode effect, not firmware. | **≈17.8 mA** ((18×24.5 + 17×6.5)/31s) |
+| 2026-08-07 | 1 (idle path) | Idle path enabled (event-safe WFE sleep, 1 ms SysTick) | Same conditions | Not flat: **17 mA for ~15s, ramps down over ~3s to 13 mA, holds ~2s, ramps back up**, repeats (~20s cycle). Same underlying dip as baseline, but larger amplitude (18→17 baseline vs. 17→13 here) -- interaction not yet understood, doesn't block proceeding. | **≈16.3 mA** ((15×17 + 3×15 + 2×13)/20s) -- ≈1.5 mA (~8%) below baseline |
+| 2026-08-07 | 1 (idle path) | Same build as above (idle path + VDDA refresh cadence fix + protection-voltage hysteresis, commit `1451f0b`) -- these were already present in the prior row's build, not new since | Same conditions | Not flat: **8s at 17 mA, ramps down over ~3s to 13 mA, holds ~8s, ramps back up over ~3s**, repeats (~22s cycle). Same 17/13 mA dip, but duty cycle is now roughly symmetric (8s/8s) vs. the prior run's mostly-high/brief-low (15s/2s) split. No idle-path or sleep-timing code changed between these two runs, so this looks like run-to-run variability in the underlying PMIC/regulator burst-mode effect, not a firmware-driven change. | **≈15.0 mA** ((8×17 + 3×15 + 8×13 + 3×15)/22s) -- ≈2.8 mA (~16%) below baseline |
+
+*Time-Avg method: duration-weighted mean over one observed cycle, using visually estimated segment lengths from the multimeter reading. Ramp segments (current transitioning between two levels) are approximated at their midpoint value (e.g. a 17→13 mA ramp ≈ 15 mA for its duration). These are rough estimates from eyeballing the display, not logged/integrated samples -- good enough to see the trend, not precise enough to treat individual tenths of a mA as meaningful.*
+
 ---
 
 ## 4. Deeper Sleep When RPi Power Is Off and Running on Battery (Future Enhancement)
