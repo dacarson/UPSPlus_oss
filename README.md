@@ -22,6 +22,7 @@ Open-source firmware for the UPSPlus uninterruptible power supply (UPS) module (
 - OTA firmware update support (see [Firmware Update](#firmware-update-ota---legacy-bootloader)).
 - Periodic IP5328 reset while charging, to avoid a rare charger-stall condition (see [IP5328 Periodic Reset](#ip5328-periodic-reset)).
 - On-demand and periodic battery-level LED indication while running on battery (see [Battery-Level LED Check](#battery-level-led-check)).
+- Deep sleep (MCU Stop mode) when the load is off and no charger is connected, to minimize battery drain (see [Deep Sleep When the Load Is Off](#deep-sleep-when-the-load-is-off)).
 
 ## Button Behavior
 
@@ -63,6 +64,14 @@ Either trigger lights the LED bar for roughly 16–32 seconds, after which it tu
 The IP5328 chip has an internal charge safety timer that, on rare occasions with this board's wiring, can fail to reset itself once a charge cycle finishes — leaving the charger connected but silently no longer charging. To guard against this, the firmware resets the IP5328 chip every 20 hours while a charger has been continuously connected. The reset is quick (about 10 seconds) and does not power-cycle the Raspberry Pi; you may briefly see the battery-level LEDs glitch or blink during the reset — this is expected and stops as soon as the reset completes.
 
 While the reset is in progress, register `0x17` bit1 reads `1` (it reads `0` the rest of the time, including during a battery-level LED check). You may also see `battery_current` (register `0x30–0x31`) briefly read as a discharge value during the reset, even though the charger is still connected — the reset can momentarily interrupt the chip's internal charge path, so the Raspberry Pi's power draw is briefly sourced from the battery instead. This reading is real, not a fault or a stale sample, and bit1 lets anything monitoring battery current attribute the blip to the reset rather than an actual loss of charging.
+
+## Deep Sleep When the Load Is Off
+
+When the load is off (Raspberry Pi powered off, or protection-latched) **and** no charger is connected — i.e. running on battery alone with nothing to power — the firmware drops the MCU into Stop mode to minimize battery drain. It wakes briefly about every 5 seconds to check whether a charger has been connected, and immediately on a button press; either wake resumes normal operation automatically.
+
+**While in this state, the I2C port to the MCU does not respond** — its clock is disabled along with the rest of the MCU's peripherals to save power. This doesn't affect normal use, since the Raspberry Pi that would otherwise be the I2C host is powered off in this state anyway; it only matters if something else (e.g. an external diagnostic tool) tries to poll the bus while the unit is in this state — it will see no response until the unit wakes.
+
+The INA219 current sensor and the RTC continue to operate independently of the MCU during this time: INA219 keeps measuring current on its own, and the RTC is what drives the periodic wake.
 
 ## Firmware Update (OTA - Legacy Bootloader)
 
