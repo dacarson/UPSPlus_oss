@@ -8,6 +8,7 @@
 #include "stm32f0xx_ll_exti.h"
 #include "stm32f0xx_ll_gpio.h"
 #include "stm32f0xx_ll_i2c.h"
+#include "stm32f0xx_ll_iwdg.h"
 #include "stm32f0xx_ll_pwr.h"
 #include "stm32f0xx_ll_rcc.h"
 #include "stm32f0xx_ll_rtc.h"
@@ -55,8 +56,7 @@ volatile uint8_t rtc_wake_pending = 0;  /* Set by RTC_IRQHandler on Alarm A (dee
 
 #define BL_START_ADDRESS 0x8000000
 
-/* IWDG: PR=6 (÷256), RLR chosen for ~8 s minimum at 56 kHz LSI (~17 s at 26 kHz). Main loop must complete within timeout. */
-#define IWDG_PR_256   6u
+/* IWDG: LL_IWDG_PRESCALER_256 (÷256), RLR chosen for ~8 s minimum at 56 kHz LSI (~17 s at 26 kHz). Main loop must complete within timeout. */
 #define IWDG_RLR_VAL  1748u
 
 /* Deep-sleep periodic wake (RTC Alarm A, all fields masked -- see Section 4 of
@@ -907,16 +907,16 @@ int main(void)
      * Option bytes: verify SW-start mode and IWDG not frozen in documentation/manufacturing; do not program to disable.
      * Starting here puts init under the watchdog; if init grows, consider moving start to just before while(1). */
     LL_RCC_LSI_Enable();
-    IWDG->KR = 0x5555u;   /* Key: unlock PR and RLR for write */
-    IWDG->PR = IWDG_PR_256;
-    IWDG->RLR = IWDG_RLR_VAL;
+    LL_IWDG_EnableWriteAccess(IWDG);
+    LL_IWDG_SetPrescaler(IWDG, LL_IWDG_PRESCALER_256);
+    LL_IWDG_SetReloadCounter(IWDG, IWDG_RLR_VAL);
     {
         uint32_t sr_wait = 0xFFFFu;
-        while ((IWDG->SR & (IWDG_SR_PVU | IWDG_SR_RVU)) != 0u && sr_wait != 0u)   /* Wait for PR/RLR latch */
+        while ((LL_IWDG_IsActiveFlag_PVU(IWDG) || LL_IWDG_IsActiveFlag_RVU(IWDG)) && sr_wait != 0u)   /* Wait for PR/RLR latch */
             sr_wait--;
         /* If SR doesn't clear, start anyway; timeout may be shorter than expected. */
     }
-    IWDG->KR = 0xCCCCu;   /* Key: start watchdog */
+    LL_IWDG_Enable(IWDG);
 
     /* RTC Alarm A, all fields masked, as a free-running ~5 s periodic wake source for
      * deep sleep (see Section 4 of Low_Power_Idle_Plan.md). This part (STM32F030x6) has
@@ -1199,7 +1199,7 @@ int main(void)
         Button_DispatchActions();
 
         /* IWDG: single refresh per loop, after all critical work (scheduler, I2C, INA, flash, protection, GPIO). */
-        IWDG->KR = 0xAAAAu;   /* Key: reload watchdog counter */
+        LL_IWDG_ReloadCounter(IWDG);   /* Reload watchdog counter */
 
         /* Idle path: sleep when there is no pending work. Flash is eligible to idle
          * even while flash_save_requested is set, as long as its retry backoff hasn't
