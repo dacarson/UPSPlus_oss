@@ -689,6 +689,7 @@ typedef struct {
 extern volatile uint8_t adc_ready;                    /* Set by DMA ISR, cleared by main loop */
 extern volatile uint32_t adc_sample_seq;             /* Monotonic sequence, incremented AFTER processing */
 extern volatile uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]; /* Raw ADC DMA buffer */
+extern volatile uint8_t rtc_wake_pending;             /* Set by RTC_IRQHandler (Alarm A), cleared by main loop */
 
 /*===========================================================================*/
 /*                         REGISTER MAP DEFINITIONS                           */

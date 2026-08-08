@@ -10,6 +10,7 @@
 #include "stm32f0xx_ll_i2c.h"
 #include "stm32f0xx_ll_pwr.h"
 #include "stm32f0xx_ll_rcc.h"
+#include "stm32f0xx_ll_rtc.h"
 #include "stm32f0xx_ll_system.h"
 #include "stm32f0xx_ll_tim.h"
 #include "stm32f0xx_ll_utils.h"
@@ -49,6 +50,7 @@ __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
 /* Timing/button helpers (canonical 10 ms tick/EXTI). Authoritative state is state/sys_state only;
  * no shadow globals (uXXXVolt, counters, mode flags) remain as authoritative. */
 __IO uint8_t sKeyFlag = 0;         /* Button activity (EXTI edge) */
+volatile uint8_t rtc_wake_pending = 0;  /* Set by RTC_IRQHandler on Alarm A (deep-sleep periodic wake) */
 /* Countdowns decremented in main loop on tick_1s (removed from ISR) */
 
 #define BL_START_ADDRESS 0x8000000
@@ -56,6 +58,12 @@ __IO uint8_t sKeyFlag = 0;         /* Button activity (EXTI edge) */
 /* IWDG: PR=6 (÷256), RLR chosen for ~8 s minimum at 56 kHz LSI (~17 s at 26 kHz). Main loop must complete within timeout. */
 #define IWDG_PR_256   6u
 #define IWDG_RLR_VAL  1748u
+
+/* Deep-sleep periodic wake (RTC Alarm A, all fields masked -- see Section 4 of
+ * documents/Low_Power_Idle_Plan.md). Nominal period at 40 kHz LSI; actual varies
+ * ~3.57-7.14 s across the documented 28-56 kHz LSI tolerance (same imprecision
+ * already accepted for IWDG above). Used only to catch up cumulative_runtime_sec. */
+#define DEEP_SLEEP_PERIOD_SEC  5u
 
 /* I2C stuck-bus recovery: if ADDR flag set for this many seconds, re-init slave (clock-stretch watchdog).
  * Keep this at 1s so the master (RPi bcm2835) gets a bus error promptly rather than waiting
@@ -910,6 +918,31 @@ int main(void)
     }
     IWDG->KR = 0xCCCCu;   /* Key: start watchdog */
 
+    /* RTC Alarm A, all fields masked, as a free-running ~5 s periodic wake source for
+     * deep sleep (see Section 4 of Low_Power_Idle_Plan.md). This part (STM32F030x6) has
+     * no RTC Wakeup Timer block -- an all-masked Alarm A compare against a slowed ck_spre
+     * is the equivalent: fires every ck_spre tick forever, no rearm needed after this. */
+    LL_PWR_EnableBkUpAccess();                          /* unlock backup domain writes */
+    {
+        uint32_t lsi_wait = 100000u;                    /* bounded; proceed regardless, same idiom as IWDG start above */
+        while (!LL_RCC_LSI_IsReady() && --lsi_wait) { }
+    }
+    LL_RCC_SetRTCClockSource(LL_RCC_RTC_CLKSOURCE_LSI);
+    LL_RCC_EnableRTC();
+    LL_RTC_DisableWriteProtection(RTC);
+    LL_RTC_EnterInitMode(RTC);                          /* polls RTC->ISR INITF with a bounded internal timeout */
+    LL_RTC_SetAsynchPrescaler(RTC, 127u);
+    LL_RTC_SetSynchPrescaler(RTC, 1561u);               /* PREDIV_A=127, PREDIV_S=1561 -> ck_spre ~5s @ 40kHz LSI */
+    LL_RTC_ALMA_SetMask(RTC, LL_RTC_ALMA_MASK_ALL);     /* ignore date/hr/min/sec: fire every ck_spre tick */
+    LL_RTC_ExitInitMode(RTC);
+    LL_RTC_ALMA_Enable(RTC);
+    LL_RTC_EnableIT_ALRA(RTC);
+    LL_RTC_EnableWriteProtection(RTC);                  /* re-lock */
+    LL_EXTI_EnableRisingTrig_0_31(LL_EXTI_LINE_17);
+    LL_EXTI_EnableIT_0_31(LL_EXTI_LINE_17);
+    NVIC_EnableIRQ(RTC_IRQn);
+    NVIC_SetPriority(RTC_IRQn, 0);
+
     MX_TIM3_Init();
     MX_GPIO_Init();
     MX_DMA_Init();
@@ -1180,12 +1213,39 @@ int main(void)
             I2C1_GetSlaveTxnActive() == 0 &&
             sKeyFlag == 0 && button_handler.pending_click == BUTTON_CLICK_NONE)
         {
-            /* Event-safe sleep: SEV then WFE/WFE clears any stale event before waiting,
-             * avoiding the race where an interrupt sets pending work between the idle
-             * check above and entering sleep. Wakes on SysTick/DMA/I2C/EXTI. */
-            __SEV();
-            __WFE();
-            __WFE();
+            if ((sys_state.power_state == POWER_STATE_RPI_OFF || sys_state.power_state == POWER_STATE_PROTECTION_LATCHED) &&
+                sys_state.charger_state == CHARGER_STATE_ABSENT)
+            {
+                /* Deep sleep: Stop mode. Only RTC Alarm A (~5s, see DEEP_SLEEP_PERIOD_SEC) and the
+                 * button EXTI can wake the core here -- ADC/I2C/DMA clocks (HSI/HSI14) stop, but
+                 * that's fine: the RPi is off in this state so there's no I2C host and nothing
+                 * pending (guaranteed by the outer idle check above). */
+                LL_PWR_SetPowerMode(LL_PWR_MODE_STOP_LPREGU);  /* Stop mode, low-power regulator */
+                LL_LPM_EnableDeepSleep();
+                __SEV();
+                __WFE();
+                __WFE();
+                LL_LPM_EnableSleep();   /* clear SLEEPDEEP before any later shallow WFE below */
+
+                SystemClock_Config();   /* Stop always resumes on un-multiplied HSI; restore 48MHz
+                                            PLL, SysTick reload, I2C1 clock source */
+                if (rtc_wake_pending)
+                {
+                    rtc_wake_pending = 0;
+                    state.cumulative_runtime_sec += DEEP_SLEEP_PERIOD_SEC;
+                }
+                /* sKeyFlag (button wake) needs no extra handling here: normal loop processing
+                 * on the next iteration dispatches it via the existing Button FSM. */
+            }
+            else
+            {
+                /* Event-safe sleep: SEV then WFE/WFE clears any stale event before waiting,
+                 * avoiding the race where an interrupt sets pending work between the idle
+                 * check above and entering sleep. Wakes on SysTick/DMA/I2C/EXTI. */
+                __SEV();
+                __WFE();
+                __WFE();
+            }
         }
     }
 }
