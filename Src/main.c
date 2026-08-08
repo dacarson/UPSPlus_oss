@@ -833,7 +833,7 @@ static void InitAuthoritativeStateFromDefaults(void)
     state.cumulative_runtime_sec = 0;
     state.charging_time_sec = 0;
     state.current_runtime_sec = 0;
-    state.version = 30;
+    state.version = 31;
     state.snapshot_tick = 0;
 
     sys_state.power_state = POWER_STATE_RPI_OFF;
