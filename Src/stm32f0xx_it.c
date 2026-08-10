@@ -26,6 +26,8 @@
 #include "ups_state.h"
 /* USER CODE END Includes */
 #include "stm32f0xx_ll_dma.h"
+#include "stm32f0xx_ll_rtc.h"
+#include "stm32f0xx_ll_exti.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
@@ -182,13 +184,8 @@ void PendSV_Handler(void)
  void SysTick_Handler(void)
  {
    /* USER CODE BEGIN SysTick_IRQn 0 */
-   static uint8_t div10 = 0;
-   div10++;
-   if (div10 >= 10)
-   {
-     div10 = 0;
-     Scheduler_ISR_Tick10ms();
-   }
+   /* SysTick now fires every 10 ms directly (see SystemClock_Config in main.c); no divider needed. */
+   Scheduler_ISR_Tick10ms();
    /* USER CODE END SysTick_IRQn 0 */
  
    /* USER CODE BEGIN SysTick_IRQn 1 */
@@ -224,6 +221,23 @@ void DMA1_CH1_IRQHandler(void)
     if (LL_DMA_IsActiveFlag_TE1(DMA1))
     {
         LL_DMA_ClearFlag_TE1(DMA1);
+    }
+}
+
+/**
+ * @brief RTC interrupt handler — fires on Alarm A (all fields masked, so it
+ * fires every ck_spre tick, ~DEEP_SLEEP_PERIOD_SEC apart -- see Section 4 of
+ * documents/Low_Power_Idle_Plan.md). Only used as a periodic wake source for
+ * deep sleep (Stop mode); clearing ISR flags does not require the RTC write-
+ * protection unlock sequence (that only gates CR/PRER/ALRMAR/init-mode writes).
+ */
+void RTC_IRQHandler(void)
+{
+    if (LL_RTC_IsActiveFlag_ALRA(RTC))
+    {
+        LL_RTC_ClearFlag_ALRA(RTC);          /* no WPR unlock needed for ISR flag clears */
+        LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_17);
+        rtc_wake_pending = 1;
     }
 }
 
