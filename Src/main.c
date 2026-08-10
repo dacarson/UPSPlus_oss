@@ -1214,12 +1214,13 @@ int main(void)
             sKeyFlag == 0 && button_handler.pending_click == BUTTON_CLICK_NONE)
         {
             if ((sys_state.power_state == POWER_STATE_RPI_OFF || sys_state.power_state == POWER_STATE_PROTECTION_LATCHED) &&
-                sys_state.charger_state == CHARGER_STATE_ABSENT)
+                sys_state.charger_state == CHARGER_STATE_ABSENT && !LL_ADC_REG_IsConversionOngoing(ADC1))
             {
                 /* Deep sleep: Stop mode. Only RTC Alarm A (~5s, see DEEP_SLEEP_PERIOD_SEC) and the
                  * button EXTI can wake the core here -- ADC/I2C/DMA clocks (HSI/HSI14) stop, but
                  * that's fine: the RPi is off in this state so there's no I2C host and nothing
-                 * pending (guaranteed by the outer idle check above). */
+                 * pending (guaranteed by the outer idle check above). The IsConversionOngoing check
+                 * keeps this from cutting HSI14 out from under a conversion started this iteration. */
                 LL_PWR_SetPowerMode(LL_PWR_MODE_STOP_LPREGU);  /* Stop mode, low-power regulator */
                 LL_LPM_EnableDeepSleep();
                 __SEV();
@@ -1234,6 +1235,15 @@ int main(void)
                     rtc_wake_pending = 0;
                     state.cumulative_runtime_sec += DEEP_SLEEP_PERIOD_SEC;
                 }
+                /* Force one fresh ADC round (and INA219 probe) on the very next loop iteration,
+                 * regardless of wake source. Without this, the loop falls straight back through
+                 * the idle checks with all sched_flags still 0 (no real time has passed) and
+                 * re-enters Stop mode before SysTick ever ticks -- charger_state and
+                 * battery_voltage_mv then stay frozen at whatever they were when deep sleep was
+                 * first entered, forever, so neither auto power-on nor a button-press power-on
+                 * can ever see a recovered charger/battery. The IsConversionOngoing check above
+                 * blocks re-entry to Stop mode until this sample completes. */
+                sched_flags.tick_500ms = 1;
                 /* sKeyFlag (button wake) needs no extra handling here: normal loop processing
                  * on the next iteration dispatches it via the existing Button FSM. */
             }
