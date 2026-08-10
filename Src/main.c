@@ -52,6 +52,7 @@ __IO uint16_t aADCxConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE];
  * no shadow globals (uXXXVolt, counters, mode flags) remain as authoritative. */
 __IO uint8_t sKeyFlag = 0;         /* Button activity (EXTI edge) */
 volatile uint8_t rtc_wake_pending = 0;  /* Set by RTC_IRQHandler on Alarm A (deep-sleep periodic wake) */
+
 /* Countdowns decremented in main loop on tick_1s (removed from ISR) */
 
 #define BL_START_ADDRESS 0x8000000
