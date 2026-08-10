@@ -142,7 +142,7 @@ I2C address: `0x17` on bus `1` (Raspberry Pi default). Multi-byte registers are 
 ## NUT Driver
 
 A pre-built Linux NUT driver for UPSPlus is available here:
-[https://github.com/dacarson/nut/releases#release-v2.8.5-upsplus](https://github.com/dacarson/nut/releases#release-v2.8.5-upsplus)
+[https://github.com/dacarson/nut/releases#release-v2.8.5.1-upsplus](https://github.com/dacarson/nut/releases#release-v2.8.5.1-upsplus)
 
 ## License
 
